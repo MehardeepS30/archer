@@ -297,7 +297,16 @@ impl<'a> RouteVisitor<'a> {
             return;
         }
 
-        let Some(path) = first_string_arg(&node.args) else {
+        // `cfg.route("/path", builder)` names its path; `web::resource("/path")
+        // .route(builder)` takes it from the resource the chain starts from.
+        let Some((path, path_line)) = first_string_arg(&node.args)
+            .zip(first_string_arg_line(&node.args))
+            .or_else(|| {
+                (name == "route")
+                    .then(|| resource_path(&node.receiver))
+                    .flatten()
+            })
+        else {
             return;
         };
 
@@ -335,8 +344,6 @@ impl<'a> RouteVisitor<'a> {
             }
         }
 
-        let line = first_string_arg_line(&node.args).unwrap_or_else(|| node.span().start().line);
-
         self.routes.push(Route {
             method: extract_http_method(node),
             path,
@@ -345,7 +352,7 @@ impl<'a> RouteVisitor<'a> {
             handler_path: target.as_ref().and_then(HandlerTarget::written),
             handler_resolution,
             authorization,
-            line,
+            line: path_line,
             file: self.file.clone(),
         });
     }
@@ -1798,6 +1805,26 @@ fn scope_prefix(expr: &Expr) -> String {
     }
 }
 
+/// The path and line of the `web::resource("/path")` call a builder chain
+/// starts from, as in `web::resource("/path").wrap(X).route(...)`.
+fn resource_path(expr: &Expr) -> Option<(String, usize)> {
+    match expr {
+        Expr::MethodCall(method) => resource_path(&method.receiver),
+        Expr::Paren(paren) => resource_path(&paren.expr),
+        Expr::Group(group) => resource_path(&group.expr),
+        Expr::Call(call)
+            if matches!(
+                &*call.func,
+                Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "resource")
+            ) =>
+        {
+            first_string_arg(&call.args).zip(first_string_arg_line(&call.args))
+        }
+        _ => None,
+    }
+}
+
 fn is_scope_call(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -2496,6 +2523,84 @@ mod tests {
         assert_eq!(details[0].suspicious_route.path, "/api/admin/payments");
         assert_eq!(details[0].authorized_peer_routes.len(), 3);
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn resource_routes_take_their_path_from_the_resource() {
+        let syntax: syn::File = syn::parse_str(
+            r#"
+            fn require_admin() {}
+            async fn users() { require_admin(); }
+            async fn orders() { require_admin(); }
+            async fn payments() {}
+            async fn h() {}
+            fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope("/admin")
+                    .service(web::resource("/users").route(web::get().to(users)))
+                    .service(web::resource("/orders").wrap(AdminMiddleware).route(web::get().to(orders)))
+                    .service(web::resource("/payments").route(web::get().to(payments)).route(web::post().to(h))));
+                cfg.service(web::resource("/health").route(web::get().to(h)));
+                cfg.route("/plain", web::get().to(h));
+            }
+            "#,
+        )
+        .unwrap();
+        let file = Path::new("resources.rs");
+        let index = HandlerIndex::single_file(file, &syntax);
+        let mut visitor = RouteVisitor::new(file.to_path_buf(), &index);
+        visitor.visit_file(&syntax);
+        let mut found: Vec<(&str, &str, &str)> = visitor
+            .routes
+            .iter()
+            .map(|route| {
+                (
+                    route.method.as_str(),
+                    route.path.as_str(),
+                    route.scope_prefix.as_str(),
+                )
+            })
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                ("GET", "/admin/orders", "/admin"),
+                ("GET", "/admin/payments", "/admin"),
+                ("GET", "/admin/users", "/admin"),
+                ("GET", "/health", "/"),
+                ("GET", "/plain", "/"),
+                ("POST", "/admin/payments", "/admin"),
+            ]
+        );
+        let orders = visitor
+            .routes
+            .iter()
+            .find(|route| route.path == "/admin/orders")
+            .unwrap();
+        let kinds: Vec<_> = orders
+            .authorization
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AuthEvidenceKind::AuthorizationMiddleware,
+                AuthEvidenceKind::RoleCheck
+            ]
+        );
+        let users = visitor
+            .routes
+            .iter()
+            .find(|route| route.path == "/admin/users")
+            .unwrap();
+        assert_eq!(users.line, 9);
+
+        let (_, _, details, _) = build_analysis_layers(&visitor.routes);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].suspicious_route.path, "/admin/payments");
+        assert_eq!(details[0].suspicious_route.method, "GET");
     }
 
     #[test]
