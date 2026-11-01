@@ -33,6 +33,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
         authorization,
         line: 1,
         file: PathBuf::from("fixture.rs"),
+        origin: RouteOrigin::default(),
     }
 }
 
@@ -751,6 +752,7 @@ fn access_token_and_access_log_helpers_are_not_authorization() {
         authorization: handlers.get("token_only").cloned().unwrap_or_default(),
         line: 1,
         file: PathBuf::from("access.rs"),
+        origin: RouteOrigin::default(),
     };
     assert!(!token_route.is_authorized());
 }
@@ -1179,6 +1181,7 @@ fn identity_extraction_is_not_authorization() {
         authorization: handlers["profile"].clone(),
         line: 1,
         file: PathBuf::from("identity.rs"),
+        origin: RouteOrigin::default(),
     };
     assert!(!route.is_authorized());
     assert!(route.strongest_evidence().is_none());
@@ -2534,4 +2537,27 @@ fn unreadable_file_is_reported_and_skipped() {
     assert!(report.parse_errors[0].contains("latin1.rs"));
     assert!(report.parse_errors[0].contains("failed to read"));
     assert_eq!(report.routes.len(), 1);
+}
+
+#[test]
+fn routes_are_reported_in_source_order() {
+    let repo = TempRepo::new(
+        "c5-order",
+        &[(
+            "main.rs",
+            "fn configure(cfg: &mut web::ServiceConfig) {
+                cfg.service(web::scope(\"/admin\")
+                    .route(\"/users\", web::get().to(users))
+                    .route(\"/orders\", web::get().to(orders)).route(\"/payments\", web::get().to(payments)));
+            }",
+        )],
+    );
+
+    let paths: Vec<_> = repo
+        .analyze()
+        .routes
+        .into_iter()
+        .map(|route| route.path)
+        .collect();
+    assert_eq!(paths, ["/admin/users", "/admin/orders", "/admin/payments"]);
 }

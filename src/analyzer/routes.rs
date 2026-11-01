@@ -180,6 +180,9 @@ impl<'a> RouteVisitor<'a> {
             authorization,
             line: path_line,
             file: self.file.clone(),
+            origin: RouteOrigin {
+                position: span_position(node.method.span()),
+            },
         });
     }
 }
@@ -341,6 +344,9 @@ impl RouteVisitor<'_> {
                 handler: Some(handler),
                 line: path_literal.span().start().line,
                 file: self.file.clone(),
+                origin: RouteOrigin {
+                    position: span_position(path_literal.span()),
+                },
             });
         }
     }
@@ -765,6 +771,12 @@ pub(crate) fn find_handler_in_expr(expr: &Expr) -> Option<HandlerTarget> {
         }
         _ => None,
     }
+}
+
+/// Line and column where a span starts.
+pub(crate) fn span_position(span: proc_macro2::Span) -> (usize, usize) {
+    let start = span.start();
+    (start.line, start.column)
 }
 
 pub(crate) fn join_paths(prefix: &str, path: &str) -> String {

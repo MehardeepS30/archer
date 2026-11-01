@@ -83,6 +83,16 @@ pub struct Route {
     pub authorization: Vec<AuthEvidence>,
     pub line: usize,
     pub file: PathBuf,
+    /// Extraction bookkeeping that is not part of the report.
+    #[serde(skip)]
+    pub(crate) origin: RouteOrigin,
+}
+
+/// Where a route was found, for ordering and for later extraction passes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteOrigin {
+    /// Line and column of the registering call or attribute, for source order.
+    pub(crate) position: (usize, usize),
 }
 
 #[derive(Debug, Clone, Serialize)]

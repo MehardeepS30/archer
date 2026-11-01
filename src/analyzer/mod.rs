@@ -98,6 +98,9 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
     }
+    // Builder chains are visited outermost call first; report routes in the
+    // order they are written.
+    routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
 
     let (peer_groups, invariants, finding_details, findings) = build_analysis_layers(&routes);
 
