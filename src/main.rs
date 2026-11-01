@@ -21,12 +21,44 @@ struct Cli {
     /// Also scan tests/, examples/, and benches/ directories
     #[arg(long)]
     include_tests: bool,
+
+    /// Minimum number of authorized peers before a peer group can produce findings
+    #[arg(long, default_value_t = analyzer::AnalysisOptions::DEFAULT_MIN_SUPPORT,
+          value_parser = parse_min_support)]
+    min_support: usize,
+
+    /// Minimum share of a peer group's routes that must be authorized, in (0, 1],
+    /// before its unauthorized routes are reported
+    #[arg(long, default_value_t = analyzer::AnalysisOptions::DEFAULT_DOMINANCE_THRESHOLD,
+          value_parser = parse_threshold)]
+    threshold: f64,
+}
+
+fn parse_min_support(value: &str) -> Result<usize, String> {
+    match value.parse() {
+        Ok(0) => Err("must be at least 1".into()),
+        Ok(count) => Ok(count),
+        Err(_) => Err(format!("`{value}` is not a whole number")),
+    }
+}
+
+fn parse_threshold(value: &str) -> Result<f64, String> {
+    let threshold: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number"))?;
+    if threshold > 0.0 && threshold <= 1.0 {
+        Ok(threshold)
+    } else {
+        Err("must be greater than 0 and at most 1".into())
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = analyzer::AnalysisOptions {
         include_tests: cli.include_tests,
+        min_support: cli.min_support,
+        dominance_threshold: cli.threshold,
     };
     let report = analyzer::analyze_repository_with(&cli.path, &options)?;
 

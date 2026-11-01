@@ -120,7 +120,8 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
 
-    let (peer_groups, invariants, finding_details, findings) = build_analysis_layers(&routes);
+    let (peer_groups, invariants, finding_details, findings) =
+        build_analysis_layers_with(&routes, options);
 
     Ok(Report {
         files_scanned,

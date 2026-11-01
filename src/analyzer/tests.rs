@@ -2511,7 +2511,6 @@ fn build_output_and_test_directories_are_not_scanned() {
     assert_eq!(report.files_scanned, 1);
     assert_eq!(report.routes.len(), 3);
 
-    #[allow(clippy::needless_update)] // AnalysisOptions gains inference fields in C2.
     let options = AnalysisOptions {
         include_tests: true,
         ..AnalysisOptions::default()
@@ -2887,4 +2886,54 @@ fn routes_under_an_auth_prefix_are_still_analysed() {
     let details = build_analysis_layers(&[users, orders, purge]).2;
     assert_eq!(details.len(), 1);
     assert_eq!(details[0].suspicious_route.path, "/auth/admin/purge");
+}
+
+fn options(min_support: usize, dominance_threshold: f64) -> AnalysisOptions {
+    AnalysisOptions {
+        min_support,
+        dominance_threshold,
+        ..AnalysisOptions::default()
+    }
+}
+
+#[test]
+fn minority_authorization_does_not_produce_findings() {
+    let repo = TempRepo::new(
+        "c2-minority",
+        &[(
+            "main.rs",
+            include_str!("../../tests/fixtures/probes/c2_minority_authorization.rs"),
+        )],
+    );
+
+    let report = repo.analyze();
+    assert!(report.finding_details.is_empty());
+    assert_eq!(report.invariants[0].strength, AuthStrength::Weak);
+
+    let report = analyze_repository_with(&repo.0, &options(2, 0.25)).unwrap();
+    assert_eq!(report.finding_details.len(), 5);
+}
+
+#[test]
+fn threshold_edges_do_not_panic() {
+    let routes = [
+        route("GET", "/admin/users", "/admin", "PRESENT"),
+        route("GET", "/admin/payments", "/admin", "NONE"),
+    ];
+    assert!(
+        build_analysis_layers_with(&routes, &options(1, 1.0))
+            .2
+            .is_empty()
+    );
+    assert_eq!(
+        build_analysis_layers_with(&routes, &options(1, 0.5))
+            .2
+            .len(),
+        1
+    );
+    assert!(
+        build_analysis_layers_with(&routes, &options(2, 0.5))
+            .2
+            .is_empty()
+    );
 }

@@ -2,8 +2,22 @@
 
 use super::{model::*, routes::has_unresolved_segment};
 
+/// Analysis layers with default options.
+#[cfg(test)]
 pub(crate) fn build_analysis_layers(
     routes: &[Route],
+) -> (
+    Vec<PeerGroup>,
+    Vec<AuthorizationInvariant>,
+    Vec<Finding>,
+    Vec<String>,
+) {
+    build_analysis_layers_with(routes, &AnalysisOptions::default())
+}
+
+pub(crate) fn build_analysis_layers_with(
+    routes: &[Route],
+    options: &AnalysisOptions,
 ) -> (
     Vec<PeerGroup>,
     Vec<AuthorizationInvariant>,
@@ -71,7 +85,7 @@ pub(crate) fn build_analysis_layers(
             .collect();
         evidence_patterns.sort();
         evidence_patterns.dedup();
-        let strength = invariant_strength(authorized, peers.len());
+        let strength = invariant_strength(authorized, peers.len(), options);
         let invariant = AuthorizationInvariant {
             peer_group_id: id.clone(),
             description: format!(
@@ -90,7 +104,7 @@ pub(crate) fn build_analysis_layers(
         };
         invariants.push(invariant.clone());
 
-        if authorized < 2 || unauthorized == 0 {
+        if unauthorized == 0 || !is_dominant(authorized, peers.len(), options) {
             continue;
         }
         for route in peers.iter().filter(|route| !route.is_authorized()) {
@@ -144,10 +158,26 @@ pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
     build_analysis_layers(routes).3
 }
 
-pub(crate) fn invariant_strength(authorized: usize, total: usize) -> AuthStrength {
-    if authorized == total || authorized >= 3 {
+/// Whether authorized routes are common enough in a group for its
+/// unauthorized routes to be reported: at least `min_support` of them, making
+/// up at least `dominance_threshold` of the group.
+pub(crate) fn is_dominant(authorized: usize, total: usize, options: &AnalysisOptions) -> bool {
+    total > 0
+        && authorized >= options.min_support
+        && authorized as f64 / total as f64 >= options.dominance_threshold
+}
+
+/// `Strong` for a unanimous group or a dominant one with three or more
+/// authorized routes, `Medium` for any other dominant group, `Weak` for a
+/// pattern too rare to report on.
+pub(crate) fn invariant_strength(
+    authorized: usize,
+    total: usize,
+    options: &AnalysisOptions,
+) -> AuthStrength {
+    if authorized == total || (authorized >= 3 && is_dominant(authorized, total, options)) {
         AuthStrength::Strong
-    } else if authorized >= 2 {
+    } else if is_dominant(authorized, total, options) {
         AuthStrength::Medium
     } else {
         AuthStrength::Weak

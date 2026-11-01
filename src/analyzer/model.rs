@@ -188,10 +188,35 @@ impl Route {
 }
 
 /// Settings that change what is scanned and how drift is inferred.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AnalysisOptions {
     /// Also scan `tests/`, `examples/`, and `benches/` directories.
     pub include_tests: bool,
+    /// Minimum number of authorized peers before a group's pattern can
+    /// produce findings.
+    pub min_support: usize,
+    /// Minimum share of a group's routes that must be authorized, in (0, 1],
+    /// before its unauthorized routes are reported.
+    pub dominance_threshold: f64,
+}
+
+impl AnalysisOptions {
+    /// Two authorized peers, as before thresholds were configurable.
+    pub const DEFAULT_MIN_SUPPORT: usize = 2;
+    /// Keeps the earlier 2-of-3 groups reportable while rejecting minority
+    /// patterns such as 2 of 7. A starting point for evaluation, not a
+    /// validated value.
+    pub const DEFAULT_DOMINANCE_THRESHOLD: f64 = 0.6;
+}
+
+impl Default for AnalysisOptions {
+    fn default() -> Self {
+        Self {
+            include_tests: false,
+            min_support: Self::DEFAULT_MIN_SUPPORT,
+            dominance_threshold: Self::DEFAULT_DOMINANCE_THRESHOLD,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
