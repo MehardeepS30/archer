@@ -256,12 +256,13 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
-        if let Some(evidence) = evidence_for_handler_method(
-            &method,
-            node.span().start().line,
-            &self.file,
-            &self.handler,
-        ) {
+        // A method call's span is computed from its whole token stream,
+        // receiver chain included, so it is only taken for a match: taking it
+        // for every call made a long builder chain quadratic.
+        if let Some(mut evidence) =
+            evidence_for_handler_method(&method, 0, &self.file, &self.handler)
+        {
+            evidence.line = node.span().start().line;
             self.evidence.push(evidence);
         }
         visit::visit_expr_method_call(self, node);

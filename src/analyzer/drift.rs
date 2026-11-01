@@ -1,5 +1,7 @@
 //! Peer grouping, invariant inference, and drift findings.
 
+use std::collections::{HashMap, HashSet};
+
 use super::{model::*, routes::has_unresolved_segment};
 
 /// Analysis layers with default options.
@@ -24,27 +26,27 @@ pub(crate) fn build_analysis_layers_with(
     Vec<Finding>,
     Vec<String>,
 ) {
-    let mut grouped_routes: Vec<Vec<&Route>> = Vec::new();
+    // `same_peer_group` is an equivalence on routes that are neither
+    // authentication endpoints nor unresolved, so peers are bucketed by its key
+    // in one pass, in order of first appearance. Comparing every pair made
+    // grouping cubic in the number of routes.
+    let mut buckets: Vec<Vec<&Route>> = Vec::new();
+    let mut bucket_of: HashMap<PeerKey, usize> = HashMap::new();
     for route in routes {
-        if is_authentication_route(route)
-            || has_unresolved_segment(&route.path)
-            || grouped_routes.iter().any(|group| {
-                group
-                    .iter()
-                    .any(|candidate| route_identity(candidate) == route_identity(route))
-            })
-        {
+        if is_authentication_route(route) || has_unresolved_segment(&route.path) {
             continue;
         }
-        let peers = unique_routes(
-            routes
-                .iter()
-                .filter(|candidate| same_peer_group(route, candidate)),
-        );
-        if peers.len() >= 2 && peers.iter().any(|peer| peer.is_authorized()) {
-            grouped_routes.push(peers);
-        }
+        let bucket = *bucket_of.entry(peer_key(route)).or_insert_with(|| {
+            buckets.push(Vec::new());
+            buckets.len() - 1
+        });
+        buckets[bucket].push(route);
     }
+    let grouped_routes: Vec<Vec<&Route>> = buckets
+        .into_iter()
+        .map(unique_routes)
+        .filter(|peers| peers.len() >= 2 && peers.iter().any(|peer| peer.is_authorized()))
+        .collect();
 
     let mut peer_groups = Vec::new();
     let mut invariants = Vec::new();
@@ -271,16 +273,26 @@ pub(crate) fn format_evidence(authorization: &[AuthEvidence]) -> String {
         .join("; ")
 }
 
+/// What two routes must share to be peers: declared scope prefix, structural
+/// prefix, method, and the static/dynamic shape of their path (which fixes
+/// the segment count).
+pub(crate) type PeerKey = (String, String, String, Vec<bool>);
+
+pub(crate) fn peer_key(route: &Route) -> PeerKey {
+    (
+        route.scope_prefix.clone(),
+        peer_prefix(route),
+        route.method.clone(),
+        dynamic_segment_shape(route),
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn same_peer_group(route: &Route, candidate: &Route) -> bool {
     if has_unresolved_segment(&route.path) || has_unresolved_segment(&candidate.path) {
         return false;
     }
-    if route.scope_prefix != candidate.scope_prefix
-        || peer_prefix(route) != peer_prefix(candidate)
-        || route.method != candidate.method
-        || route_segment_count(route) != route_segment_count(candidate)
-        || dynamic_segment_shape(route) != dynamic_segment_shape(candidate)
-    {
+    if peer_key(route) != peer_key(candidate) {
         return false;
     }
 
@@ -306,14 +318,6 @@ pub(crate) fn peer_prefix(route: &Route) -> String {
         .rposition(|segment| !is_dynamic_segment(segment))
         .unwrap_or(0);
     format!("/{}", segments[..end].join("/"))
-}
-
-pub(crate) fn route_segment_count(route: &Route) -> usize {
-    route
-        .path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
 }
 
 pub(crate) fn dynamic_segment_shape(route: &Route) -> Vec<bool> {
@@ -350,16 +354,11 @@ pub(crate) fn unique_routes<'a, I>(routes: I) -> Vec<&'a Route>
 where
     I: IntoIterator<Item = &'a Route>,
 {
-    let mut unique: Vec<&'a Route> = Vec::new();
-    for route in routes {
-        if !unique
-            .iter()
-            .any(|candidate| route_identity(candidate) == route_identity(route))
-        {
-            unique.push(route);
-        }
-    }
-    unique
+    let mut seen = HashSet::new();
+    routes
+        .into_iter()
+        .filter(|route| seen.insert(route_identity(route)))
+        .collect()
 }
 
 pub(crate) fn route_identity(route: &Route) -> (&str, &str, &str, Option<&str>) {

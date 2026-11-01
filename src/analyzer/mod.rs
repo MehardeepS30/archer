@@ -49,7 +49,24 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
     analyze_repository_with(root, &AnalysisOptions::default())
 }
 
+/// Stack for parsing and visiting. Parsing, visiting, and dropping a syntax
+/// tree recurse once per nested expression, and a builder chain is nested one
+/// level per call: a few hundred `.route(...)` calls exhaust a 1 MiB main
+/// thread stack. The stack is reserved, not committed, until it is used.
+const ANALYSIS_STACK_BYTES: usize = 512 * 1024 * 1024;
+
 pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result<Report> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("archer-analysis".into())
+            .stack_size(ANALYSIS_STACK_BYTES)
+            .spawn_scoped(scope, || analyze_on_current_thread(root, options))?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<Report> {
     if !root.exists() {
         anyhow::bail!("{} does not exist", root.display());
     }

@@ -3018,3 +3018,41 @@ fn different_privilege_mechanisms_are_not_weaker() {
     assert_eq!(details[0].category, FindingCategory::MissingAuthorization);
     assert_eq!(details[0].suspicious_route_tier, EvidenceTier::None);
 }
+
+fn fixture_report(name: &str, source: &str) -> Report {
+    TempRepo::new(name, &[("Cargo.toml", CARGO_TOML), ("src/main.rs", source)]).analyze()
+}
+#[test]
+fn deeply_nested_builder_chains_do_not_overflow_the_stack() {
+    let routes: String = (0..5000)
+        .map(|index| format!("\n.route(\"/r{index}\", web::get().to(h))"))
+        .collect();
+    let report = fixture_report(
+        "e1-deep-chain",
+        &format!(
+            "async fn h() {{}}\nfn main() {{ App::new().service(web::scope(\"/s\"){routes}); }}"
+        ),
+    );
+    assert_eq!(report.routes.len(), 5000);
+    assert_eq!(report.routes[0].path, "/s/r0");
+}
+
+#[test]
+fn large_peer_groups_are_grouped_without_pairwise_comparison() {
+    let routes: String = (0..10_000)
+        .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
+        .collect();
+    let report = fixture_report(
+        "e1-large-group",
+        &format!(
+            "async fn h() {{}}\nasync fn admin(_u: AdminUser) {{}}\n\
+             fn config(cfg: &mut ServiceConfig) {{\n    cfg.route(\"/a\", web::get().to(admin));\n    cfg.route(\"/b\", web::get().to(admin));{routes}\n}}"
+        ),
+    );
+    assert_eq!(report.routes.len(), 10_002);
+    assert_eq!(report.peer_groups.len(), 1);
+    assert!(
+        report.finding_details.is_empty(),
+        "2 of 10002 is not dominant"
+    );
+}

@@ -711,13 +711,17 @@ pub(crate) fn configuration_call_evidence(
     handler: Option<&str>,
     evidence: &mut Vec<AuthEvidence>,
 ) {
-    let (authorization_kind, authorization_strength) = match method.method.to_string().as_str() {
-        "guard" => (AuthEvidenceKind::AuthorizationGuard, AuthStrength::Strong),
-        "wrap" => (
+    // Compared without allocating: this runs for every call of every chain
+    // a route's receiver walk passes through.
+    let (authorization_kind, authorization_strength) = if method.method == "guard" {
+        (AuthEvidenceKind::AuthorizationGuard, AuthStrength::Strong)
+    } else if method.method == "wrap" {
+        (
             AuthEvidenceKind::AuthorizationMiddleware,
             AuthStrength::Medium,
-        ),
-        _ => return,
+        )
+    } else {
+        return;
     };
     for arg in &method.args {
         let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
@@ -859,30 +863,40 @@ impl RouteVisitor<'_> {
         Some((format!("<unresolved:{written}>"), line))
     }
 
+    /// The prefix a builder chain's `web::scope(...)` root and any `.scope(...)`
+    /// calls declare. Walked iteratively, allocating only at scope calls: it
+    /// runs once per route, over the route's whole receiver chain.
     pub(crate) fn scope_prefix(&mut self, expr: &Expr) -> String {
-        match expr {
-            Expr::MethodCall(method) => {
-                let prefix = if method.method == "scope" {
-                    first_string_arg(&method.args).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                join_paths(&self.scope_prefix(&method.receiver), &prefix)
+        let mut method_prefixes = Vec::new();
+        let mut expr = expr;
+        let root = loop {
+            match expr {
+                Expr::MethodCall(method) => {
+                    if method.method == "scope" {
+                        method_prefixes.push(first_string_arg(&method.args).unwrap_or_default());
+                    }
+                    expr = &method.receiver;
+                }
+                Expr::Paren(paren) => expr = &paren.expr,
+                Expr::Group(group) => expr = &group.expr,
+                Expr::Call(call) if is_scope_call(&call.func) => {
+                    break match call.args.first() {
+                        Some(arg) => self
+                            .path_argument(arg)
+                            .map(|(path, _)| path)
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                }
+                _ => break String::new(),
             }
-            Expr::Call(call) if is_scope_call(&call.func) => match call.args.first() {
-                Some(arg) => join_paths(
-                    "",
-                    &self
-                        .path_argument(arg)
-                        .map(|(path, _)| path)
-                        .unwrap_or_default(),
-                ),
-                None => String::new(),
-            },
-            Expr::Paren(paren) => self.scope_prefix(&paren.expr),
-            Expr::Group(group) => self.scope_prefix(&group.expr),
-            _ => String::new(),
-        }
+        };
+        method_prefixes
+            .iter()
+            .rev()
+            .fold(join_paths("", &root), |prefix, path| {
+                join_paths(&prefix, path)
+            })
     }
 
     /// The path and line of the `web::resource("/path")` call a builder chain
