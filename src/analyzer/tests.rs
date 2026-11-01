@@ -2956,3 +2956,17 @@ fn structured_findings_drive_text_and_json_omits_preformatted_findings() {
     assert!(json.get("findings").is_none());
     assert!(json.get("finding_details").is_some());
 }
+
+#[test]
+fn evidence_kinds_and_strengths_have_readable_names() {
+    assert_eq!(AuthEvidenceKind::RoleCheck.to_string(), "role check");
+    assert_eq!(
+        AuthEvidenceKind::AuthorizationMiddleware.to_string(),
+        "authorization middleware"
+    );
+    assert_eq!(
+        AuthEvidenceKind::IdentityExtraction.to_string(),
+        "identity extraction (not authorization)"
+    );
+    assert_eq!(AuthStrength::Strong.to_string(), "strong");
+}

@@ -23,6 +23,31 @@ pub enum AuthStrength {
     Weak,
 }
 
+impl std::fmt::Display for AuthEvidenceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RoleCheck => "role check",
+            Self::PermissionCheck => "permission check",
+            Self::AuthorizationGuard => "authorization guard",
+            Self::AuthorizationMiddleware => "authorization middleware",
+            Self::IdentityExtraction => "identity extraction (not authorization)",
+            Self::OwnershipCheck => "ownership check",
+            Self::ManualAuthorizationCheck => "manual authorization check",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+impl std::fmt::Display for AuthStrength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Strong => "strong",
+            Self::Medium => "medium",
+            Self::Weak => "weak",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AuthEvidence {
     pub kind: AuthEvidenceKind,

@@ -104,7 +104,7 @@ fn run(cli: &Cli) -> Result<bool> {
         } else {
             println!("  authorization:");
             for evidence in &route.authorization {
-                println!("    ✓ {:?}", evidence.kind);
+                println!("    ✓ {}", evidence.kind);
                 println!("      mechanism: {}", evidence.mechanism);
                 println!(
                     "      symbol: {}",
@@ -119,7 +119,7 @@ fn run(cli: &Cli) -> Result<bool> {
                     "      handler: {}",
                     evidence.handler.as_deref().unwrap_or("<none>")
                 );
-                println!("      strength: {:?}", evidence.strength);
+                println!("      strength: {}", evidence.strength);
             }
         }
     }
