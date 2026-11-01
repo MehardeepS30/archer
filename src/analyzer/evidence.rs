@@ -5,8 +5,9 @@ use quote::ToTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, GenericArgument, ImplItemFn, ItemFn,
-    PathArguments, TraitItemFn, Type,
+    BinOp, Expr, ExprAssign, ExprBinary, ExprCall, ExprField, ExprMethodCall, ExprPath, FnArg,
+    GenericArgument, ImplItemFn, ItemFn, Member, PathArguments, Token, TraitItemFn, Type, UnOp,
+    punctuated::Punctuated,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -256,6 +257,10 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
+        // `user.roles.contains(&Role::Admin)`, `role.eq(&Role::Admin)`.
+        if ["contains", "eq", "ne"].contains(&method.as_str()) {
+            self.record_comparison(std::iter::once(&*node.receiver).chain(&node.args));
+        }
         // A method call's span is computed from its whole token stream,
         // receiver chain included, so it is only taken for a match: taking it
         // for every call made a long builder chain quadratic.
@@ -286,6 +291,14 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     // are opaque, so calls written inside a macro (`assert!(is_admin(&user))`)
     // are not evidence.
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // `matches!(user.role, Role::Admin | Role::Owner)`: the pattern is
+        // read as an expression, which a path or `|` of paths parses as.
+        if node.path.is_ident("matches")
+            && let Ok(arguments) =
+                node.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        {
+            self.record_comparison(arguments.iter());
+        }
         let Some(name) = node
             .path
             .segments
@@ -309,6 +322,38 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         });
     }
 
+    /// `user.role != Role::Admin`, `claims.permission == Permission::Write`.
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        if matches!(node.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+            self.record_comparison([&*node.left, &*node.right]);
+        }
+        visit::visit_expr_binary(self, node);
+    }
+
+    /// A boolean flag such as `claims.is_admin`, read like a call to the
+    /// helper `is_admin`.
+    fn visit_expr_field(&mut self, node: &'ast ExprField) {
+        if let Member::Named(member) = &node.member
+            && let Some((kind, _)) = classify_check_name(&member.to_string())
+        {
+            self.evidence.push(AuthEvidence {
+                kind,
+                mechanism: member.to_string(),
+                symbol: Some(node.to_token_stream().to_string().replace(' ', "")),
+                file: self.file.clone(),
+                line: member.span().start().line,
+                handler: Some(self.handler.clone()),
+                strength: AuthStrength::Medium,
+            });
+        }
+        visit::visit_expr_field(self, node);
+    }
+
+    /// Assigning a flag (`user.is_admin = true`) does not check it.
+    fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
+        self.visit_expr(&node.right);
+    }
+
     // Functions declared inside the handler body, including methods of nested
     // `impl` and `trait` items, do not run as part of that body. Their
     // evidence belongs to them, not to the enclosing handler.
@@ -317,6 +362,90 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     fn visit_impl_item_fn(&mut self, _: &'ast ImplItemFn) {}
 
     fn visit_trait_item_fn(&mut self, _: &'ast TraitItemFn) {}
+}
+
+impl AuthEvidenceVisitor {
+    /// Records the first operand of a comparison that is a role or
+    /// permission: comparing one is a check, whatever the other side is.
+    fn record_comparison<'e>(&mut self, operands: impl IntoIterator<Item = &'e Expr>) {
+        let Some((kind, operand)) = operands
+            .into_iter()
+            .find_map(|operand| authorization_operand(operand).map(|kind| (kind, operand)))
+        else {
+            return;
+        };
+        let written = operand.to_token_stream().to_string().replace(' ', "");
+        self.evidence.push(AuthEvidence {
+            kind,
+            mechanism: written.clone(),
+            symbol: Some(written),
+            file: self.file.clone(),
+            line: operand.span().start().line,
+            handler: Some(self.handler.clone()),
+            strength: AuthStrength::Medium,
+        });
+    }
+}
+
+/// Whether an operand names a role or permission: a variant of a type named
+/// like one (`Role::Admin`, `UserRole::Admin`, `Permission::Write`), or a
+/// field whose name ends in one (`user.role`, `claims.permissions`), possibly
+/// behind a reference or a conversion such as `.as_str()`.
+fn authorization_operand(expr: &Expr) -> Option<AuthEvidenceKind> {
+    const ROLE_WORDS: [&str; 2] = ["role", "roles"];
+    const PERMISSION_WORDS: [&str; 2] = ["permission", "permissions"];
+    let kind_of = |word: &str| {
+        if ROLE_WORDS.contains(&word) {
+            Some(AuthEvidenceKind::RoleCheck)
+        } else if PERMISSION_WORDS.contains(&word) {
+            Some(AuthEvidenceKind::PermissionCheck)
+        } else {
+            None
+        }
+    };
+    match expr {
+        Expr::Paren(paren) => authorization_operand(&paren.expr),
+        Expr::Group(group) => authorization_operand(&group.expr),
+        Expr::Reference(reference) => authorization_operand(&reference.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+            authorization_operand(&unary.expr)
+        }
+        Expr::Binary(binary) if matches!(binary.op, BinOp::BitOr(_)) => {
+            authorization_operand(&binary.left).or_else(|| authorization_operand(&binary.right))
+        }
+        // A conversion keeps the value; `roles.len()` does not.
+        Expr::MethodCall(call)
+            if call.args.is_empty()
+                && [
+                    "as_str",
+                    "as_ref",
+                    "as_deref",
+                    "to_string",
+                    "to_owned",
+                    "to_lowercase",
+                    "to_uppercase",
+                    "clone",
+                    "unwrap",
+                ]
+                .iter()
+                .any(|conversion| call.method == conversion) =>
+        {
+            authorization_operand(&call.receiver)
+        }
+        Expr::Path(path) => {
+            let segments = &path.path.segments;
+            let owner = segments.iter().nth_back(1)?.ident.to_string();
+            camel_case_words(&owner)
+                .iter()
+                .rev()
+                .find_map(|word| kind_of(word))
+        }
+        Expr::Field(field) => match &field.member {
+            Member::Named(member) => kind_of(member.to_string().rsplit('_').next()?),
+            Member::Unnamed(_) => None,
+        },
+        _ => None,
+    }
 }
 
 pub(crate) fn evidence_for_handler_method(

@@ -3171,6 +3171,41 @@ fn method_guards_set_the_route_method() {
 }
 
 #[test]
+fn role_comparisons_in_handler_bodies_are_evidence() {
+    let report = fixture_report(
+        "e7-role-comparisons",
+        include_str!("../../tests/fixtures/probes/e7_role_comparisons.rs"),
+    );
+    for path in ["/admin/a", "/admin/b", "/admin/c", "/admin/d"] {
+        assert_eq!(
+            route_at(&report, path).best_tier(),
+            EvidenceTier::Privilege,
+            "{path}"
+        );
+    }
+    assert_eq!(finding_paths(&report), ["/admin/e"]);
+}
+
+#[test]
+fn comparisons_with_non_authorization_values_are_not_evidence() {
+    let report = fixture_report(
+        "e7-non-role-comparisons",
+        "async fn a(order: Order) { if order.status != Status::Paid { return; } }
+         async fn b(user: User) { if user.name == \"admin\" { return; } }
+         async fn c(user: User) { let _ = user.roles.len() == 2; set_role(Role::Admin); }
+         fn main() { App::new().route(\"/a\", web::get().to(a)).route(\"/b\", web::get().to(b)).route(\"/c\", web::get().to(c)); }",
+    );
+    for route in &report.routes {
+        assert!(
+            route.authorization.is_empty(),
+            "{}: {:?}",
+            route.path,
+            route.authorization
+        );
+    }
+}
+
+#[test]
 fn large_peer_groups_are_grouped_without_pairwise_comparison() {
     let routes: String = (0..10_000)
         .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
