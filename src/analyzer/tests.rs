@@ -2488,3 +2488,32 @@ fn macro_handler_and_middleware_evidence_are_kept_once_each() {
     assert_eq!(details[0].suspicious_route.path, "/admin/payments");
     assert_eq!(details[0].authorized_peer_routes.len(), 3);
 }
+
+const A6_PROBE: &str = include_str!("../../tests/fixtures/probes/a6_target_dir_scanned.rs");
+
+#[test]
+fn build_output_and_test_directories_are_not_scanned() {
+    let repo = TempRepo::new(
+        "a6-skip-dirs",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            ("src/main.rs", A6_PROBE),
+            ("target/debug/build/gen.rs", A6_PROBE),
+            (".git/hooks/gen.rs", A6_PROBE),
+            ("tests/it.rs", A6_PROBE),
+        ],
+    );
+
+    let report = repo.analyze();
+    assert_eq!(report.files_scanned, 1);
+    assert_eq!(report.routes.len(), 3);
+
+    #[allow(clippy::needless_update)] // AnalysisOptions gains inference fields in C2.
+    let options = AnalysisOptions {
+        include_tests: true,
+        ..AnalysisOptions::default()
+    };
+    let report = analyze_repository_with(&repo.0, &options).unwrap();
+    assert_eq!(report.files_scanned, 2);
+    assert_eq!(report.routes.len(), 6);
+}

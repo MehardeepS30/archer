@@ -17,11 +17,18 @@ struct Cli {
     /// Emit the report as JSON for programmatic consumers
     #[arg(long)]
     json: bool,
+
+    /// Also scan tests/, examples/, and benches/ directories
+    #[arg(long)]
+    include_tests: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let report = analyzer::analyze_repository(&cli.path)?;
+    let options = analyzer::AnalysisOptions {
+        include_tests: cli.include_tests,
+    };
+    let report = analyzer::analyze_repository_with(&cli.path, &options)?;
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);

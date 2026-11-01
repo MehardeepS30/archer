@@ -169,6 +169,13 @@ impl Route {
     }
 }
 
+/// Settings that change what is scanned and how drift is inferred.
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisOptions {
+    /// Also scan `tests/`, `examples/`, and `benches/` directories.
+    pub include_tests: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub files_scanned: usize,

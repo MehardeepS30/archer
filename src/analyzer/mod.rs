@@ -20,13 +20,41 @@ use walkdir::WalkDir;
 
 use self::{drift::*, handlers::*, routes::*};
 
+/// Hidden directories, and at the scan root or beside a `Cargo.toml`, the
+/// `target` build directory and, unless requested, `tests`, `examples`, and
+/// `benches`. A `target` or `tests` directory inside `src/` is a module and is
+/// scanned.
+fn is_skipped_directory(root: &Path, entry: &walkdir::DirEntry, options: &AnalysisOptions) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if name.starts_with('.') {
+        return true;
+    }
+    let crate_level = entry
+        .path()
+        .parent()
+        .is_some_and(|parent| parent == root || parent.join("Cargo.toml").is_file());
+    crate_level
+        && (name == "target"
+            || (!options.include_tests && ["tests", "examples", "benches"].contains(&&*name)))
+}
+
+/// Analysis with default options; the binary passes CLI options instead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn analyze_repository(root: &Path) -> Result<Report> {
+    analyze_repository_with(root, &AnalysisOptions::default())
+}
+
+pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result<Report> {
     let mut files_scanned = 0;
     let mut parse_errors = Vec::new();
     let mut routes = Vec::new();
 
     let mut rust_files: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_skipped_directory(root, entry, options))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
