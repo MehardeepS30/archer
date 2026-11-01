@@ -54,6 +54,7 @@ pub(crate) fn build_analysis_layers(
         peer_groups.push(PeerGroup {
             id: id.clone(),
             description: description.clone(),
+            prefix: peer_prefix(first),
             routes: references.clone(),
         });
 
@@ -187,6 +188,7 @@ pub(crate) fn same_peer_group(route: &Route, candidate: &Route) -> bool {
         return false;
     }
     if route.scope_prefix != candidate.scope_prefix
+        || peer_prefix(route) != peer_prefix(candidate)
         || route.method != candidate.method
         || route_segment_count(route) != route_segment_count(candidate)
         || dynamic_segment_shape(route) != dynamic_segment_shape(candidate)
@@ -199,6 +201,23 @@ pub(crate) fn same_peer_group(route: &Route, candidate: &Route) -> bool {
     }
 
     true
+}
+
+/// The segments of a route's full path before its last static segment:
+/// `/admin` for `/admin/users` and `/admin/users/{id}`. Routes written with
+/// full paths outside any scope (`/admin/users`, `/public/docs`) are only
+/// peers when this prefix matches.
+pub(crate) fn peer_prefix(route: &Route) -> String {
+    let segments: Vec<&str> = route
+        .path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let end = segments
+        .iter()
+        .rposition(|segment| !is_dynamic_segment(segment))
+        .unwrap_or(0);
+    format!("/{}", segments[..end].join("/"))
 }
 
 pub(crate) fn route_segment_count(route: &Route) -> usize {

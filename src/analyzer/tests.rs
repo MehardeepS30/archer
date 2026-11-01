@@ -2841,3 +2841,26 @@ fn authorization_attribute_macros_are_evidence() {
     let evidence = handler_evidence(Path::new("attributes.rs"), &item);
     assert_eq!(evidence[0].kind, AuthEvidenceKind::RoleCheck);
 }
+
+#[test]
+fn unscoped_routes_with_different_leading_segments_are_not_peers() {
+    let repo = TempRepo::new(
+        "c1-unscoped",
+        &[(
+            "main.rs",
+            include_str!("../../tests/fixtures/probes/c1_unscoped_prefixes.rs"),
+        )],
+    );
+
+    let report = repo.analyze();
+    assert!(report.finding_details.is_empty());
+    assert_eq!(report.peer_groups.len(), 1);
+    assert_eq!(report.peer_groups[0].prefix, "/admin");
+    let mut paths: Vec<_> = report.peer_groups[0]
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, ["/admin/orders", "/admin/users"]);
+}

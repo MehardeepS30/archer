@@ -130,6 +130,8 @@ impl From<&Route> for RouteReference {
 pub struct PeerGroup {
     pub id: String,
     pub description: String,
+    /// The full-path prefix the group's routes share; see `peer_prefix`.
+    pub prefix: String,
     pub routes: Vec<RouteReference>,
 }
 
