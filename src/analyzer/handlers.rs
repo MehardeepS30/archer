@@ -62,6 +62,8 @@ pub(crate) struct HandlerIndex<'a> {
     /// The syntax of each definition, parallel to `definitions`, so that
     /// `.configure(f)` can visit `f`'s body.
     pub(crate) items: Vec<&'a ItemFn>,
+    /// `const NAME: &str = "..."` items, keyed by crate, module, and name.
+    pub(crate) consts: HashMap<(PathBuf, Vec<String>, String), String>,
     pub(crate) by_name: HashMap<String, Vec<usize>>,
     pub(crate) scopes: HashMap<ModuleKey, ModuleScope>,
     pub(crate) modules: HashSet<ModuleKey>,
@@ -125,6 +127,22 @@ impl<'a> HandlerIndex<'a> {
                     }
                     module.pop();
                 }
+                Item::Const(item_const) => {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(value),
+                        ..
+                    }) = &*item_const.expr
+                    {
+                        self.consts.insert(
+                            (
+                                crate_key.to_path_buf(),
+                                module.clone(),
+                                item_const.ident.to_string(),
+                            ),
+                            value.value(),
+                        );
+                    }
+                }
                 Item::Use(item_use) => {
                     let scope = self
                         .scopes
@@ -173,6 +191,42 @@ impl<'a> HandlerIndex<'a> {
     ) -> (Option<&HandlerDefinition>, HandlerResolution) {
         let (index, resolution) = self.resolve_handler_index(crate_key, module, target);
         (index.map(|index| &self.definitions[index]), resolution)
+    }
+
+    /// The value of a string constant named by `segments` as written in
+    /// `module`: defined there, brought in by one explicit `use`, or
+    /// module-qualified.
+    pub(crate) fn resolve_const(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        segments: &[String],
+    ) -> Option<String> {
+        let (name, qualifier) = segments.split_last()?;
+        let lookup = |module: &[String]| {
+            self.consts
+                .get(&(crate_key.to_path_buf(), module.to_vec(), name.clone()))
+                .cloned()
+        };
+        if !qualifier.is_empty() {
+            let qualifier = UsePath {
+                segments: qualifier.to_vec(),
+                leading_colon: false,
+            };
+            return lookup(&self.resolve_module(crate_key, module, &qualifier, 0)?);
+        }
+        if let Some(value) = lookup(module) {
+            return Some(value);
+        }
+        let [import] = self.scope(crate_key, module)?.imports.get(name)?.as_slice() else {
+            return None;
+        };
+        let (_, prefix) = import.segments.split_last()?;
+        let prefix = UsePath {
+            segments: prefix.to_vec(),
+            leading_colon: import.leading_colon,
+        };
+        lookup(&self.resolve_module(crate_key, module, &prefix, 0)?)
     }
 
     /// The top-level function `name` defined directly in `module`, if exactly one is.

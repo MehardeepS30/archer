@@ -1,6 +1,6 @@
 //! Peer grouping, invariant inference, and drift findings.
 
-use super::model::*;
+use super::{model::*, routes::has_unresolved_segment};
 
 pub(crate) fn build_analysis_layers(
     routes: &[Route],
@@ -13,6 +13,7 @@ pub(crate) fn build_analysis_layers(
     let mut grouped_routes: Vec<Vec<&Route>> = Vec::new();
     for route in routes {
         if is_authentication_route(route)
+            || has_unresolved_segment(&route.path)
             || grouped_routes.iter().any(|group| {
                 group
                     .iter()
@@ -182,6 +183,9 @@ pub(crate) fn format_evidence(route: &Route) -> String {
 }
 
 pub(crate) fn same_peer_group(route: &Route, candidate: &Route) -> bool {
+    if has_unresolved_segment(&route.path) || has_unresolved_segment(&candidate.path) {
+        return false;
+    }
     if route.scope_prefix != candidate.scope_prefix
         || route.method != candidate.method
         || route_segment_count(route) != route_segment_count(candidate)

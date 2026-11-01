@@ -2714,3 +2714,59 @@ fn resource_to_registers_an_any_method_route() {
             .any(|evidence| evidence.mechanism == "AdminGuard")
     );
 }
+
+#[test]
+fn const_paths_resolve_and_unresolved_paths_are_kept_with_a_warning() {
+    let repo = TempRepo::new(
+        "a5-const-paths",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/main.rs",
+                "mod paths;
+                 use paths::ORDERS;
+                 const ADMIN: &str = \"/admin\";
+                 const USERS: &str = \"/users\";
+                 async fn a() { require_admin(); } async fn b() { require_admin(); } async fn c() {}
+                 fn main() {
+                     App::new().service(web::scope(ADMIN)
+                         .route(USERS, web::get().to(a))
+                         .route(ORDERS, web::get().to(b))
+                         .route(paths::REPORTS, web::get().to(a))
+                         .route(MISSING, web::get().to(c)));
+                 }",
+            ),
+            (
+                "src/paths.rs",
+                "pub const ORDERS: &str = \"/orders\"; pub const REPORTS: &str = \"/reports\";",
+            ),
+        ],
+    );
+
+    let report = repo.analyze();
+    let paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/admin/users",
+            "/admin/orders",
+            "/admin/reports",
+            "/admin/<unresolved:MISSING>"
+        ]
+    );
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("MISSING"));
+    // A route whose path is unknown is not compared with peers.
+    assert!(report.finding_details.is_empty());
+    assert!(
+        report
+            .peer_groups
+            .iter()
+            .flat_map(|group| &group.routes)
+            .all(|route| !route.path.contains("unresolved"))
+    );
+}

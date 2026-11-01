@@ -196,6 +196,9 @@ pub struct AnalysisOptions {
 pub struct Report {
     pub files_scanned: usize,
     pub parse_errors: Vec<String>,
+    /// Extraction problems that did not stop analysis, such as route paths
+    /// that are neither string literals nor resolvable constants.
+    pub warnings: Vec<String>,
     pub routes: Vec<Route>,
     pub peer_groups: Vec<PeerGroup>,
     pub invariants: Vec<AuthorizationInvariant>,

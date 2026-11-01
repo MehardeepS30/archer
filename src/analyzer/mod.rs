@@ -95,6 +95,7 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
     );
     let mut registrations = Vec::new();
+    let mut warnings = Vec::new();
     let mut configured = HashSet::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
@@ -102,7 +103,11 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
         routes.extend(visitor.routes);
         registrations.extend(visitor.registrations);
         configured.extend(visitor.configured);
+        warnings.extend(visitor.warnings);
     }
+    // A scope's prefix is read once per route registered under it.
+    warnings.sort();
+    warnings.dedup();
     // A function passed to `.configure(f)` registers its routes where it is
     // called; its own top-level visit, with no caller scope, is discarded.
     let outside_configured = |enclosing: Option<usize>| {
@@ -120,6 +125,7 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
     Ok(Report {
         files_scanned,
         parse_errors,
+        warnings,
         routes,
         peer_groups,
         invariants,

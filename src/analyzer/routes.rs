@@ -7,6 +7,7 @@ use std::{
 use syn::{
     Arm, BinOp, Block, Expr, ExprClosure, ExprForLoop, ExprIf, ExprLit, ExprMethodCall, ExprWhile,
     FnArg, ImplItemFn, Item, ItemFn, ItemMod, Lit, Pat, Signature, Stmt, TraitItemFn,
+    spanned::Spanned,
     visit::{self, Visit},
 };
 
@@ -48,6 +49,7 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) scope_context: String,
     pub(crate) routes: Vec<Route>,
     pub(crate) registrations: Vec<Registration>,
+    pub(crate) warnings: Vec<String>,
     /// Definitions named by a `.configure(f)` call. Routes found while
     /// visiting such a function on its own are replaced by its expansions.
     pub(crate) configured: Vec<usize>,
@@ -84,6 +86,7 @@ impl<'a> RouteVisitor<'a> {
             scope_context: String::new(),
             routes: Vec::new(),
             registrations: Vec::new(),
+            warnings: Vec::new(),
             configured: Vec::new(),
             enclosing: None,
             expanding: Vec::new(),
@@ -208,21 +211,19 @@ impl<'a> RouteVisitor<'a> {
         // .route(builder)` and `web::resource("/path").to(handler)` take it
         // from the resource the chain starts from.
         let path = if name == "to" {
-            resource_path(&node.receiver)
+            self.resource_path(&node.receiver)
+        } else if name == "route" && node.args.len() == 2 {
+            self.path_argument(&node.args[0])
+        } else if name == "route" {
+            self.resource_path(&node.receiver)
         } else {
-            first_string_arg(&node.args)
-                .zip(first_string_arg_line(&node.args))
-                .or_else(|| {
-                    (name == "route")
-                        .then(|| resource_path(&node.receiver))
-                        .flatten()
-                })
+            first_string_arg(&node.args).zip(first_string_arg_line(&node.args))
         };
         let Some((path, path_line)) = path else {
             return;
         };
 
-        let local_prefix = scope_prefix(&node.receiver);
+        let local_prefix = self.scope_prefix(&node.receiver);
         let prefix = join_paths(&self.scope_context, &local_prefix);
         let path = join_paths(&prefix, &path);
         // A resource's own `.to(handler)` answers every method.
@@ -404,7 +405,7 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
 
         if node.method == "service" || node.method == "configure" {
             let previous_context = self.scope_context.clone();
-            self.scope_context = join_paths(&previous_context, &scope_prefix(&node.receiver));
+            self.scope_context = join_paths(&previous_context, &self.scope_prefix(&node.receiver));
             for arg in &node.args {
                 if node.method == "service" {
                     self.add_registration(arg);
@@ -821,43 +822,94 @@ pub(crate) fn signature_bindings(signature: &Signature) -> HashSet<String> {
     names
 }
 
-pub(crate) fn scope_prefix(expr: &Expr) -> String {
-    match expr {
-        Expr::MethodCall(method) => {
-            let prefix = if method.method == "scope" {
-                first_string_arg(&method.args).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            join_paths(&scope_prefix(&method.receiver), &prefix)
+impl RouteVisitor<'_> {
+    /// A path argument and its line: a string literal, or a string constant
+    /// resolved through the index. Anything else becomes an
+    /// `<unresolved:...>` segment, with a warning, so the route is kept.
+    pub(crate) fn path_argument(&mut self, expr: &Expr) -> Option<(String, usize)> {
+        let line = expr.span().start().line;
+        let written = match expr {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => return Some((value.value(), line)),
+            Expr::Path(path) if path.qself.is_none() => {
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                if let Some(value) =
+                    self.index
+                        .resolve_const(&self.crate_key, &self.module, &segments)
+                {
+                    return Some((value, line));
+                }
+                segments.join("::")
+            }
+            _ => "expression".to_owned(),
+        };
+        self.warnings.push(format!(
+            "{}:{}: path `{}` is not a string literal or resolvable const",
+            self.file.display(),
+            line,
+            written
+        ));
+        Some((format!("<unresolved:{written}>"), line))
+    }
+
+    pub(crate) fn scope_prefix(&mut self, expr: &Expr) -> String {
+        match expr {
+            Expr::MethodCall(method) => {
+                let prefix = if method.method == "scope" {
+                    first_string_arg(&method.args).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                join_paths(&self.scope_prefix(&method.receiver), &prefix)
+            }
+            Expr::Call(call) if is_scope_call(&call.func) => match call.args.first() {
+                Some(arg) => join_paths(
+                    "",
+                    &self
+                        .path_argument(arg)
+                        .map(|(path, _)| path)
+                        .unwrap_or_default(),
+                ),
+                None => String::new(),
+            },
+            Expr::Paren(paren) => self.scope_prefix(&paren.expr),
+            Expr::Group(group) => self.scope_prefix(&group.expr),
+            _ => String::new(),
         }
-        Expr::Call(call) if call.args.first().is_some() && is_scope_call(&call.func) => {
-            join_paths("", &first_string_arg(&call.args).unwrap_or_default())
+    }
+
+    /// The path and line of the `web::resource("/path")` call a builder chain
+    /// starts from, as in `web::resource("/path").wrap(X).route(...)`.
+    pub(crate) fn resource_path(&mut self, expr: &Expr) -> Option<(String, usize)> {
+        match expr {
+            Expr::MethodCall(method) => self.resource_path(&method.receiver),
+            Expr::Paren(paren) => self.resource_path(&paren.expr),
+            Expr::Group(group) => self.resource_path(&group.expr),
+            Expr::Call(call)
+                if matches!(
+                    &*call.func,
+                    Expr::Path(path)
+                        if path.path.segments.last().is_some_and(|segment| segment.ident == "resource")
+                ) =>
+            {
+                self.path_argument(call.args.first()?)
+            }
+            _ => None,
         }
-        Expr::Paren(paren) => scope_prefix(&paren.expr),
-        Expr::Group(group) => scope_prefix(&group.expr),
-        _ => String::new(),
     }
 }
 
-/// The path and line of the `web::resource("/path")` call a builder chain
-/// starts from, as in `web::resource("/path").wrap(X).route(...)`.
-pub(crate) fn resource_path(expr: &Expr) -> Option<(String, usize)> {
-    match expr {
-        Expr::MethodCall(method) => resource_path(&method.receiver),
-        Expr::Paren(paren) => resource_path(&paren.expr),
-        Expr::Group(group) => resource_path(&group.expr),
-        Expr::Call(call)
-            if matches!(
-                &*call.func,
-                Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "resource")
-            ) =>
-        {
-            first_string_arg(&call.args).zip(first_string_arg_line(&call.args))
-        }
-        _ => None,
-    }
+/// Whether a path contains a segment that could not be resolved statically.
+pub(crate) fn has_unresolved_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment.starts_with("<unresolved:"))
 }
 
 pub(crate) fn is_scope_call(expr: &Expr) -> bool {
