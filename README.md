@@ -98,8 +98,10 @@ cargo run --locked -- /path/to/actix-web-project
 To analyze the bundled test fixture:
 
 ```bash
-cargo run --locked -- tests/fixtures
+cargo run --locked -- tests/fixtures/demo.rs
 ```
+
+(`tests/fixtures/probes/` holds one small regression fixture per problem in `docs/improvement-plan.md`; analyzing all of `tests/fixtures` includes them.)
 
 The bundled fixture yields five `/admin/*` routes and one potential drift finding for `GET /admin/payments`, supported by guard, middleware, and `require_admin` evidence on three GET peers; `POST /admin/audit` is not a peer.
 
@@ -112,6 +114,17 @@ cargo run --locked -- /path/to/actix-web-project --json
 ```
 
 The JSON report can be consumed by a backend or other programmatic workflow.
+
+### Options
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--include-tests` | off | Also scan `tests/`, `examples/`, and `benches/`. `target/` and hidden directories are never scanned. |
+| `--min-support <N>` | 2 | Authorized peers a group needs before its unauthorized routes are reported. |
+| `--threshold <F>` | 0.6 | Share of a group's routes, in (0, 1], that must be authorized before its unauthorized routes are reported. |
+| `--fail-on-findings` | off | Exit with status 1 when findings are reported. Status 2 always means the analysis failed. |
+
+The two inference defaults reproduce the earlier behaviour on small groups (two authorized peers out of three) and reject minority patterns (two out of seven). They are starting points for evaluation, not validated values.
 
 ## Understanding the Results
 

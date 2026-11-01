@@ -159,3 +159,17 @@ Needs an architectural decision (definition of "weaker"); options go to the user
 ### Task 18: Benchmark and docs
 
 Re-run the 20-repo benchmark (dataset location pending from the user), update `docs/evaluation/benchmark-results.md` and `docs/development-log.md`.
+
+---
+
+## Implementation Notes
+
+Status: every task except Task 15 (C3) and Task 18's benchmark run is done; Task 15 waits for the design choice described in the thread, and the benchmark dataset is not in the repository.
+
+Deviations from the steps above, each kept within the spec:
+
+- **C2 strength.** The plan's `Strong` at ratio ≥ 0.9 would have turned an existing test's 3-of-4 group from `Strong` into `Medium`. Strength is instead `Strong` for a unanimous group or a dominant one with at least three authorized routes, `Medium` for other dominant groups, `Weak` otherwise. The 3-of-20 case the spec names is now `Weak`.
+- **C1.** Peers must match on both the declared scope prefix and `peer_prefix`, so groups can only get smaller than before; no existing grouping test changed.
+- **D2.** `Report.findings` stays in the struct (tests and the CLI use the text) but is `#[serde(skip)]`; both it and the CLI output come from `format_finding(&Finding)`.
+- **D1.** A nonexistent path is now an error (exit 2) rather than an empty report, so the runtime-error exit code is reachable.
+- **README.** The fixture command now points at `tests/fixtures/demo.rs`, since `tests/fixtures` also holds the probe fixtures.

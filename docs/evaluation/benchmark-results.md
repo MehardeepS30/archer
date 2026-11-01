@@ -43,3 +43,6 @@ The evaluation covers a small, purpose-built controlled benchmark. It does not e
 
 ## Next Experiment
 Investigate whether stronger structural evidence can support single-peer inference without sacrificing the current zero-false-positive behavior. Rerun the same 20 repositories after any change and compare precision, recall, F1, and false positives.
+
+## Status After Analyzer Hardening (November 2026)
+Not re-run. The 20 benchmark repositories and their `expected.json` files are not in this repository or its history, so the results above still describe the earlier engine. The hardening changes (see `docs/development-log.md`, section 9) alter route extraction, peer grouping, and the finding threshold, so these numbers should not be read as describing the current version. To compare, rerun the same repositories with the defaults (`--min-support 2 --threshold 0.6`) and record the same metrics here.
