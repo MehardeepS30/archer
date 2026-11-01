@@ -2816,3 +2816,28 @@ fn authorization_extractors_in_handler_signatures_are_evidence() {
     assert!(route_at(&report, "/admin/users").is_authorized());
     assert!(route_at(&report, "/admin/orders").is_authorized());
 }
+
+#[test]
+fn authorization_attribute_macros_are_evidence() {
+    let item: syn::ItemFn = syn::parse_str(
+        "#[protect(\"ROLE_ADMIN\")] #[get(\"/r\")] #[instrument] async fn reports() {}",
+    )
+    .unwrap();
+    let evidence = handler_evidence(Path::new("attributes.rs"), &item);
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].kind, AuthEvidenceKind::PermissionCheck);
+    assert_eq!(evidence[0].mechanism, "protect");
+    assert!(
+        evidence[0]
+            .symbol
+            .as_deref()
+            .unwrap()
+            .contains("ROLE_ADMIN")
+    );
+    assert_eq!(evidence[0].strength, AuthStrength::Strong);
+
+    let item: syn::ItemFn =
+        syn::parse_str("#[actix_web_grants::has_roles(\"ADMIN\")] async fn users() {}").unwrap();
+    let evidence = handler_evidence(Path::new("attributes.rs"), &item);
+    assert_eq!(evidence[0].kind, AuthEvidenceKind::RoleCheck);
+}

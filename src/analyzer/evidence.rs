@@ -15,7 +15,11 @@ use super::model::*;
 
 pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> {
     let handler = item.sig.ident.to_string();
-    let mut evidence = Vec::new();
+    let mut evidence: Vec<AuthEvidence> = item
+        .attrs
+        .iter()
+        .filter_map(|attribute| attribute_evidence(attribute, file, &handler))
+        .collect();
     for input in &item.sig.inputs {
         if let FnArg::Typed(argument) = input {
             extractor_evidence(&argument.ty, file, &handler, &mut evidence);
@@ -25,6 +29,38 @@ pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> 
     visitor.visit_block(&item.block);
     evidence.extend(visitor.evidence);
     evidence
+}
+
+/// An authorization attribute macro on a handler, such as actix-web-grants'
+/// `#[protect("ROLE_ADMIN")]` or `#[has_roles("ADMIN")]`, which rejects the
+/// request before the handler body runs.
+fn attribute_evidence(
+    attribute: &syn::Attribute,
+    file: &Path,
+    handler: &str,
+) -> Option<AuthEvidence> {
+    let name = attribute.path().segments.last()?.ident.to_string();
+    let (kind, strength) = match name.as_str() {
+        "protect" | "has_permissions" | "has_any_permission" => {
+            (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
+        }
+        "has_role" | "has_roles" | "has_any_role" => {
+            (AuthEvidenceKind::RoleCheck, AuthStrength::Strong)
+        }
+        _ => match classify_check_name(&name)? {
+            (AuthEvidenceKind::IdentityExtraction, _) => return None,
+            (kind, _) => (kind, AuthStrength::Strong),
+        },
+    };
+    Some(AuthEvidence {
+        kind,
+        mechanism: name,
+        symbol: Some(attribute.meta.to_token_stream().to_string()),
+        file: file.to_path_buf(),
+        line: attribute.span().start().line,
+        handler: Some(handler.into()),
+        strength,
+    })
 }
 
 /// Extractors whose type parameter is request data or application state,
