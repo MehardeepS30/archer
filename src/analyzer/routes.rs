@@ -416,14 +416,7 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
 
 impl RouteVisitor<'_> {
     pub(crate) fn add_attribute_routes(&mut self, node: &ItemFn) {
-        for attribute in &node.attrs {
-            let Some(method) = attribute_route_method(attribute) else {
-                continue;
-            };
-            let Ok(path_literal) = attribute.parse_args::<syn::LitStr>() else {
-                continue;
-            };
-
+        for (method, path_literal) in node.attrs.iter().flat_map(attribute_routes) {
             let prefix = self.scope_context.clone();
             let path = join_paths(&prefix, &path_literal.value());
             let handler = node.sig.ident.to_string();
@@ -437,7 +430,7 @@ impl RouteVisitor<'_> {
             };
 
             self.routes.push(Route {
-                method: method.into(),
+                method,
                 path,
                 scope_prefix: prefix,
                 authorization,
@@ -456,20 +449,67 @@ impl RouteVisitor<'_> {
     }
 }
 
-pub(crate) fn attribute_route_method(attribute: &syn::Attribute) -> Option<&'static str> {
-    for (name, method) in [
-        ("get", "GET"),
-        ("post", "POST"),
-        ("put", "PUT"),
-        ("patch", "PATCH"),
-        ("delete", "DELETE"),
-        ("head", "HEAD"),
-    ] {
-        if attribute.path().is_ident(name) {
-            return Some(method);
-        }
-    }
-    None
+/// The routes an Actix route attribute declares, as `(method, path)`:
+/// `#[get("/p")]`, `#[actix_web::get("/p", wrap = "...")]`, or
+/// `#[route("/p", method = "GET", method = "POST")]` (one route per method).
+pub(crate) fn attribute_routes(attribute: &syn::Attribute) -> Vec<(String, syn::LitStr)> {
+    let segments: Vec<String> = attribute
+        .path()
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let name = match segments.as_slice() {
+        [name] => name,
+        [krate, name] if krate == "actix_web" => name,
+        _ => return Vec::new(),
+    };
+    let fixed_method = match name.as_str() {
+        "get" => Some("GET"),
+        "post" => Some("POST"),
+        "put" => Some("PUT"),
+        "patch" => Some("PATCH"),
+        "delete" => Some("DELETE"),
+        "head" => Some("HEAD"),
+        "route" => None,
+        _ => return Vec::new(),
+    };
+    let Ok(args) = attribute
+        .parse_args_with(syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+    else {
+        return Vec::new();
+    };
+    let Some(Expr::Lit(ExprLit {
+        lit: Lit::Str(path),
+        ..
+    })) = args.first()
+    else {
+        return Vec::new();
+    };
+    let methods: Vec<String> = match fixed_method {
+        Some(method) => vec![method.to_owned()],
+        None => args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| match arg {
+                Expr::Assign(assign) => match (&*assign.left, &*assign.right) {
+                    (
+                        Expr::Path(key),
+                        Expr::Lit(ExprLit {
+                            lit: Lit::Str(method),
+                            ..
+                        }),
+                    ) if key.path.is_ident("method") => Some(method.value().to_uppercase()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
+    };
+    methods
+        .into_iter()
+        .map(|method| (method, path.clone()))
+        .collect()
 }
 
 pub(crate) fn first_string_arg(

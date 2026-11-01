@@ -2662,3 +2662,24 @@ fn recursive_configure_does_not_loop() {
     paths.sort();
     assert_eq!(paths, ["/x/a", "/x/b"]);
 }
+
+#[test]
+fn qualified_and_multi_method_route_attributes_are_extracted() {
+    let repo = TempRepo::new(
+        "a3-attributes",
+        &[(
+            "main.rs",
+            "#[actix_web::get(\"/x\")] async fn x() {}
+             #[route(\"/y\", method = \"GET\", method = \"POST\")] async fn y() {}
+             #[get(\"/z\", wrap = \"Logger::default()\")] async fn z() {}",
+        )],
+    );
+
+    let routes: Vec<_> = repo
+        .analyze()
+        .routes
+        .into_iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect();
+    assert_eq!(routes, ["GET /x", "GET /y", "POST /y", "GET /z"]);
+}
