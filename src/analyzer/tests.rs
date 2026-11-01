@@ -3022,6 +3022,22 @@ fn different_privilege_mechanisms_are_not_weaker() {
 fn fixture_report(name: &str, source: &str) -> Report {
     TempRepo::new(name, &[("Cargo.toml", CARGO_TOML), ("src/main.rs", source)]).analyze()
 }
+
+fn has_evidence(route: &Route, kind: AuthEvidenceKind, mechanism: &str) -> bool {
+    route
+        .authorization
+        .iter()
+        .any(|evidence| evidence.kind == kind && evidence.mechanism == mechanism)
+}
+
+fn finding_paths(report: &Report) -> Vec<&str> {
+    report
+        .finding_details
+        .iter()
+        .map(|finding| finding.suspicious_route.path.as_str())
+        .collect()
+}
+
 #[test]
 fn deeply_nested_builder_chains_do_not_overflow_the_stack() {
     let routes: String = (0..5000)
@@ -3035,6 +3051,34 @@ fn deeply_nested_builder_chains_do_not_overflow_the_stack() {
     );
     assert_eq!(report.routes.len(), 5000);
     assert_eq!(report.routes[0].path, "/s/r0");
+}
+
+#[test]
+fn attribute_routes_registered_through_tuples_and_services_macro_take_the_scope() {
+    let report = fixture_report(
+        "e2-tuple-services",
+        include_str!("../../tests/fixtures/probes/e2_tuple_and_services_macro.rs"),
+    );
+    let paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/admin/users",
+            "/admin/orders",
+            "/admin/payments",
+            "/public/health"
+        ]
+    );
+    assert!(has_evidence(
+        route_at(&report, "/public/health"),
+        AuthEvidenceKind::AuthorizationMiddleware,
+        "RequireAdminMiddleware"
+    ));
+    assert_eq!(finding_paths(&report), ["/admin/payments"]);
 }
 
 #[test]

@@ -188,8 +188,38 @@ impl<'a> RouteVisitor<'a> {
             .collect()
     }
 
-    /// Records `.service(handler)` when `handler` names a module-level function.
+    /// Records `.service(handler)` when `handler` names a module-level
+    /// function. Actix also accepts a tuple of services, `.service((a, b))`,
+    /// and the `services![a, b]` macro that builds one; each element counts.
     pub(crate) fn add_registration(&mut self, arg: &Expr) {
+        match arg {
+            Expr::Tuple(tuple) => {
+                return tuple
+                    .elems
+                    .iter()
+                    .for_each(|element| self.add_registration(element));
+            }
+            Expr::Paren(paren) => return self.add_registration(&paren.expr),
+            Expr::Group(group) => return self.add_registration(&group.expr),
+            Expr::Macro(mac)
+                if mac
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "services") =>
+            {
+                if let Ok(elements) = mac.mac.parse_body_with(
+                    syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated,
+                ) {
+                    elements
+                        .iter()
+                        .for_each(|element| self.add_registration(element));
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some(definition) = self.named_definition(arg) else {
             return;
         };
