@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 mod analyzer;
 
@@ -21,6 +21,11 @@ struct Cli {
     /// Also scan tests/, examples/, and benches/ directories
     #[arg(long)]
     include_tests: bool,
+
+    /// Exit with status 1 when drift findings are reported (status 2 means
+    /// the analysis itself failed)
+    #[arg(long)]
+    fail_on_findings: bool,
 
     /// Minimum number of authorized peers before a peer group can produce findings
     #[arg(long, default_value_t = analyzer::AnalysisOptions::DEFAULT_MIN_SUPPORT,
@@ -53,8 +58,20 @@ fn parse_threshold(value: &str) -> Result<f64, String> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    match run(&cli) {
+        Ok(has_findings) if has_findings && cli.fail_on_findings => ExitCode::from(1),
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Analyzes and prints the report; returns whether there are findings.
+fn run(cli: &Cli) -> Result<bool> {
     let options = analyzer::AnalysisOptions {
         include_tests: cli.include_tests,
         min_support: cli.min_support,
@@ -64,7 +81,7 @@ fn main() -> Result<()> {
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+        return Ok(!report.finding_details.is_empty());
     }
 
     println!("ARCHER authorization analysis");
@@ -116,5 +133,5 @@ fn main() -> Result<()> {
         println!("\nNo prototype drift findings.");
     }
 
-    Ok(())
+    Ok(!report.finding_details.is_empty())
 }

@@ -49,6 +49,9 @@ pub fn analyze_repository(root: &Path) -> Result<Report> {
 }
 
 pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result<Report> {
+    if !root.exists() {
+        anyhow::bail!("{} does not exist", root.display());
+    }
     let mut files_scanned = 0;
     let mut parse_errors = Vec::new();
     let mut routes = Vec::new();
