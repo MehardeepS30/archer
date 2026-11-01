@@ -38,7 +38,7 @@ impl BlockScope {
 
 pub(crate) struct RouteVisitor<'a> {
     pub(crate) file: PathBuf,
-    pub(crate) index: &'a HandlerIndex,
+    pub(crate) index: &'a HandlerIndex<'a>,
     pub(crate) crate_key: PathBuf,
     pub(crate) module: Vec<String>,
     pub(crate) block_scopes: Vec<BlockScope>,
@@ -48,6 +48,13 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) scope_context: String,
     pub(crate) routes: Vec<Route>,
     pub(crate) registrations: Vec<Registration>,
+    /// Definitions named by a `.configure(f)` call. Routes found while
+    /// visiting such a function on its own are replaced by its expansions.
+    pub(crate) configured: Vec<usize>,
+    /// The module-level function being visited, outside any expansion.
+    pub(crate) enclosing: Option<usize>,
+    /// `.configure` targets being expanded, innermost last.
+    pub(crate) expanding: Vec<usize>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -57,10 +64,11 @@ pub(crate) struct Registration {
     pub(crate) prefix: String,
     /// Guard and middleware evidence of the registering scope and its parents.
     pub(crate) inherited: Vec<AuthEvidence>,
+    pub(crate) enclosing: Option<usize>,
 }
 
 impl<'a> RouteVisitor<'a> {
-    pub(crate) fn new(file: PathBuf, index: &'a HandlerIndex) -> Self {
+    pub(crate) fn new(file: PathBuf, index: &'a HandlerIndex<'a>) -> Self {
         let (crate_key, module) = index
             .file_modules
             .get(&file)
@@ -76,7 +84,48 @@ impl<'a> RouteVisitor<'a> {
             scope_context: String::new(),
             routes: Vec::new(),
             registrations: Vec::new(),
+            configured: Vec::new(),
+            enclosing: None,
+            expanding: Vec::new(),
         }
+    }
+
+    /// The definition a `.service`/`.configure` argument names, unless it is
+    /// a block-local function (which has no index entry).
+    pub(crate) fn named_definition(&self, arg: &Expr) -> Option<usize> {
+        let target = handler_target(arg)?;
+        if self.block_local_handler(&target).is_some() {
+            return None;
+        }
+        self.index
+            .resolve_handler_index(&self.crate_key, &self.module, &target)
+            .0
+    }
+
+    /// Visits the body of a `.configure(f)` target as if it were written at
+    /// the call: under the caller's scope prefix and guard/middleware chain,
+    /// resolving names from `f`'s own module. Recursive configuration stops.
+    pub(crate) fn expand_configure(&mut self, definition: usize) {
+        self.configured.push(definition);
+        if self.expanding.contains(&definition) {
+            return;
+        }
+        let index = self.index;
+        let target = &index.definitions[definition];
+        let item = index.items[definition];
+        let file = std::mem::replace(&mut self.file, target.file.clone());
+        let crate_key = std::mem::replace(&mut self.crate_key, target.crate_key.clone());
+        let module = std::mem::replace(&mut self.module, target.module.clone());
+        let block_scopes = std::mem::take(&mut self.block_scopes);
+        self.expanding.push(definition);
+        self.with_locals(signature_bindings(&item.sig), |visitor| {
+            visitor.visit_block(&item.block)
+        });
+        self.expanding.pop();
+        self.block_scopes = block_scopes;
+        self.module = module;
+        self.crate_key = crate_key;
+        self.file = file;
     }
 
     /// Looks a bare handler name up in the enclosing scopes, innermost first;
@@ -138,22 +187,14 @@ impl<'a> RouteVisitor<'a> {
 
     /// Records `.service(handler)` when `handler` names a module-level function.
     pub(crate) fn add_registration(&mut self, arg: &Expr) {
-        let Some(target) = handler_target(arg) else {
-            return;
-        };
-        if self.block_local_handler(&target).is_some() {
-            return;
-        }
-        let (Some(definition), _) =
-            self.index
-                .resolve_handler_index(&self.crate_key, &self.module, &target)
-        else {
+        let Some(definition) = self.named_definition(arg) else {
             return;
         };
         self.registrations.push(Registration {
             definition,
             prefix: self.scope_context.clone(),
             inherited: self.inherited_evidence(),
+            enclosing: self.enclosing,
         });
     }
 
@@ -221,6 +262,7 @@ impl<'a> RouteVisitor<'a> {
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
                 attribute: None,
+                enclosing: self.enclosing,
             },
         });
     }
@@ -229,9 +271,18 @@ impl<'a> RouteVisitor<'a> {
 impl<'ast> Visit<'ast> for RouteVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.add_attribute_routes(node);
+        let enclosing = self.enclosing;
+        if self.block_scopes.is_empty() && self.expanding.is_empty() {
+            self.enclosing = self.index.definition_in(
+                &self.crate_key,
+                &self.module,
+                &node.sig.ident.to_string(),
+            );
+        }
         self.with_locals(signature_bindings(&node.sig), |visitor| {
             visit::visit_item_fn(visitor, node)
         });
+        self.enclosing = enclosing;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
@@ -339,11 +390,15 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             self.chain_scopes.push((root, evidence));
         }
 
-        if node.method == "service" {
+        if node.method == "service" || node.method == "configure" {
             let previous_context = self.scope_context.clone();
             self.scope_context = join_paths(&previous_context, &scope_prefix(&node.receiver));
             for arg in &node.args {
-                self.add_registration(arg);
+                if node.method == "service" {
+                    self.add_registration(arg);
+                } else if let Some(definition) = self.named_definition(arg) {
+                    self.expand_configure(definition);
+                }
                 self.visit_expr(arg);
             }
             self.scope_context = previous_context;
@@ -394,6 +449,7 @@ impl RouteVisitor<'_> {
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),
+                    enclosing: None,
                 },
             });
         }

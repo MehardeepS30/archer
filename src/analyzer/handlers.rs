@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-use syn::{Item, UseTree};
+use syn::{Item, ItemFn, UseTree};
 
 use super::{evidence::*, model::*, routes::*};
 
@@ -14,6 +14,7 @@ pub(crate) const MAX_RESOLUTION_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HandlerDefinition {
+    pub(crate) file: PathBuf,
     pub(crate) crate_key: PathBuf,
     pub(crate) module: Vec<String>,
     pub(crate) name: String,
@@ -55,17 +56,20 @@ pub(crate) enum Lookup {
 
 /// Every free function in the scanned repository, keyed by crate and module
 /// path, together with each module's `use` declarations.
-#[derive(Debug, Default)]
-pub(crate) struct HandlerIndex {
+#[derive(Default)]
+pub(crate) struct HandlerIndex<'a> {
     pub(crate) definitions: Vec<HandlerDefinition>,
+    /// The syntax of each definition, parallel to `definitions`, so that
+    /// `.configure(f)` can visit `f`'s body.
+    pub(crate) items: Vec<&'a ItemFn>,
     pub(crate) by_name: HashMap<String, Vec<usize>>,
     pub(crate) scopes: HashMap<ModuleKey, ModuleScope>,
     pub(crate) modules: HashSet<ModuleKey>,
     pub(crate) file_modules: HashMap<PathBuf, ModuleKey>,
 }
 
-impl HandlerIndex {
-    pub(crate) fn build<'a>(
+impl<'a> HandlerIndex<'a> {
+    pub(crate) fn build(
         files: impl IntoIterator<Item = (&'a Path, ModuleKey, &'a syn::File)>,
     ) -> Self {
         let mut index = Self::default();
@@ -84,7 +88,7 @@ impl HandlerIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn single_file(file: &Path, syntax: &syn::File) -> Self {
+    pub(crate) fn single_file(file: &'a Path, syntax: &'a syn::File) -> Self {
         Self::build([(file, (file.to_path_buf(), Vec::new()), syntax)])
     }
 
@@ -93,7 +97,7 @@ impl HandlerIndex {
         file: &Path,
         crate_key: &Path,
         module: &mut Vec<String>,
-        items: &[Item],
+        items: &'a [Item],
     ) {
         for item in items {
             match item {
@@ -103,7 +107,9 @@ impl HandlerIndex {
                         .entry(name.clone())
                         .or_default()
                         .push(self.definitions.len());
+                    self.items.push(function);
                     self.definitions.push(HandlerDefinition {
+                        file: file.to_path_buf(),
                         crate_key: crate_key.to_path_buf(),
                         module: module.clone(),
                         name,

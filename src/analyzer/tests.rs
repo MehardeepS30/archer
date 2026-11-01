@@ -2604,3 +2604,61 @@ fn attribute_routes_take_prefix_and_middleware_from_their_registering_scope() {
         .collect();
     assert_eq!(flagged, ["/admin/payments"]);
 }
+
+#[test]
+fn configure_inside_scope_inherits_prefix_and_middleware() {
+    let repo = TempRepo::new(
+        "a2-configure",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/main.rs",
+                include_str!("../../tests/fixtures/probes/a2_configure_in_scope.rs"),
+            ),
+        ],
+    );
+
+    let report = repo.analyze();
+    let paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    assert_eq!(paths, ["/admin/users", "/admin/orders", "/admin/payments"]);
+    for route in &report.routes {
+        assert_eq!(route.scope_prefix, "/admin");
+        assert!(
+            route.authorization.iter().any(|evidence| {
+                evidence.kind == AuthEvidenceKind::AuthorizationMiddleware
+                    && evidence.mechanism == "RequireAdminMiddleware"
+            }),
+            "{}",
+            route.path
+        );
+    }
+}
+
+#[test]
+fn recursive_configure_does_not_loop() {
+    let repo = TempRepo::new(
+        "a2-configure-recursive",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/main.rs",
+                "fn a(cfg: &mut web::ServiceConfig) { cfg.route(\"/a\", web::get().to(h)).configure(b); }
+                 fn b(cfg: &mut web::ServiceConfig) { cfg.route(\"/b\", web::get().to(h)).configure(a); }
+                 fn main() { App::new().service(web::scope(\"/x\").configure(a)); }",
+            ),
+        ],
+    );
+
+    let mut paths: Vec<_> = repo
+        .analyze()
+        .routes
+        .into_iter()
+        .map(|route| route.path)
+        .collect();
+    paths.sort();
+    assert_eq!(paths, ["/x/a", "/x/b"]);
+}

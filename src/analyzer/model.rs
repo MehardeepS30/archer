@@ -96,6 +96,9 @@ pub(crate) struct RouteOrigin {
     /// For attribute routes: the handler definition and the attribute's own
     /// path, so the route can be re-rooted where `.service(handler)` registers it.
     pub(crate) attribute: Option<(usize, String)>,
+    /// The module-level function whose own body (not a `.configure` expansion
+    /// of it) produced the route.
+    pub(crate) enclosing: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]

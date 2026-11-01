@@ -12,6 +12,7 @@ pub use model::*;
 
 use anyhow::Result;
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -94,12 +95,21 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
     );
     let mut registrations = Vec::new();
+    let mut configured = HashSet::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
         registrations.extend(visitor.registrations);
+        configured.extend(visitor.configured);
     }
+    // A function passed to `.configure(f)` registers its routes where it is
+    // called; its own top-level visit, with no caller scope, is discarded.
+    let outside_configured = |enclosing: Option<usize>| {
+        enclosing.is_none_or(|definition| !configured.contains(&definition))
+    };
+    routes.retain(|route| outside_configured(route.origin.enclosing));
+    registrations.retain(|registration| outside_configured(registration.enclosing));
     let mut routes = apply_registrations(routes, &registrations);
     // Builder chains are visited outermost call first; report routes in the
     // order they are written.
