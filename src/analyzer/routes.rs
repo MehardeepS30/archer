@@ -477,7 +477,6 @@ impl RouteVisitor<'_> {
             let prefix = self.scope_context.clone();
             let path = join_paths(&prefix, &path_literal.value());
             let handler = node.sig.ident.to_string();
-            let authorization = handler_evidence(&self.file, node);
             // Only module-level functions can be named by `.service(handler)`.
             let definition = if self.block_scopes.is_empty() {
                 self.index
@@ -485,6 +484,11 @@ impl RouteVisitor<'_> {
             } else {
                 None
             };
+            // The index's evidence includes the handler's helpers.
+            let authorization = definition.map_or_else(
+                || handler_evidence(&self.file, node),
+                |definition| self.index.definitions[definition].evidence.clone(),
+            );
 
             self.routes.push(Route {
                 method,

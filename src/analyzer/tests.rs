@@ -3206,6 +3206,37 @@ fn comparisons_with_non_authorization_values_are_not_evidence() {
 }
 
 #[test]
+fn authorization_in_called_helpers_is_evidence_for_the_handler() {
+    let report = fixture_report(
+        "e8-helper-wrapper",
+        include_str!("../../tests/fixtures/probes/e8_helper_wrapper.rs"),
+    );
+    let route = route_at(&report, "/admin/a");
+    assert!(has_evidence(
+        route,
+        AuthEvidenceKind::RoleCheck,
+        "require_admin"
+    ));
+    assert!(report.finding_details.is_empty());
+}
+
+#[test]
+fn recursive_helpers_do_not_loop() {
+    let report = fixture_report(
+        "e8-recursive-helpers",
+        "fn ping(n: u32) { pong(n) }
+         fn pong(n: u32) { ping(n); require_admin(); }
+         async fn h() { ping(1); }
+         fn main() { App::new().route(\"/h\", web::get().to(h)); }",
+    );
+    assert!(has_evidence(
+        route_at(&report, "/h"),
+        AuthEvidenceKind::RoleCheck,
+        "require_admin"
+    ));
+}
+
+#[test]
 fn large_peer_groups_are_grouped_without_pairwise_comparison() {
     let routes: String = (0..10_000)
         .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
