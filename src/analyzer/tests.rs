@@ -2864,3 +2864,27 @@ fn unscoped_routes_with_different_leading_segments_are_not_peers() {
     paths.sort();
     assert_eq!(paths, ["/admin/orders", "/admin/users"]);
 }
+
+#[test]
+fn routes_under_an_auth_prefix_are_still_analysed() {
+    let users = route("GET", "/auth/admin/users", "/auth/admin", "PRESENT");
+    let orders = route("GET", "/auth/admin/orders", "/auth/admin", "PRESENT");
+    let purge = route("GET", "/auth/admin/purge", "/auth/admin", "NONE");
+    assert!(!is_authentication_route(&purge));
+    assert!(is_authentication_route(&route(
+        "POST",
+        "/auth/login",
+        "/auth",
+        "NONE"
+    )));
+    assert!(is_authentication_route(&route(
+        "POST",
+        "/api/token/{id}",
+        "/api",
+        "NONE"
+    )));
+
+    let details = build_analysis_layers(&[users, orders, purge]).2;
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].suspicious_route.path, "/auth/admin/purge");
+}

@@ -242,6 +242,9 @@ pub(crate) fn is_dynamic_segment(segment: &str) -> bool {
         || (segment.starts_with('<') && segment.ends_with('>'))
 }
 
+/// An authentication endpoint such as `/auth/login` or `/api/token/{id}`:
+/// its last static segment names one. Other routes under an `/auth` or
+/// `/token` prefix (`/auth/admin/purge`) are analysed like any route.
 pub(crate) fn is_authentication_route(route: &Route) -> bool {
     let authentication_names = [
         "auth", "login", "logout", "register", "signup", "signin", "token", "refresh",
@@ -249,10 +252,10 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
     route
         .path
         .split('/')
-        .chain(route.scope_prefix.split('/'))
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_ascii_lowercase)
-        .any(|segment| authentication_names.contains(&segment.as_str()))
+        .rfind(|segment| !segment.is_empty() && !is_dynamic_segment(segment))
+        .is_some_and(|segment| {
+            authentication_names.contains(&segment.to_ascii_lowercase().as_str())
+        })
 }
 
 pub(crate) fn unique_routes<'a, I>(routes: I) -> Vec<&'a Route>
