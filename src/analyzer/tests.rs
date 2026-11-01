@@ -2970,3 +2970,51 @@ fn evidence_kinds_and_strengths_have_readable_names() {
     );
     assert_eq!(AuthStrength::Strong.to_string(), "strong");
 }
+
+#[test]
+fn weaker_authorization_is_reported_separately_with_its_evidence() {
+    let repo = TempRepo::new(
+        "c3-weaker",
+        &[(
+            "main.rs",
+            include_str!("../../tests/fixtures/probes/c3_weaker_evidence_kind.rs"),
+        )],
+    );
+
+    let report = repo.analyze();
+    assert_eq!(report.finding_details.len(), 1);
+    let finding = &report.finding_details[0];
+    assert_eq!(finding.category, FindingCategory::WeakerAuthorization);
+    assert_eq!(finding.suspicious_route.path, "/admin/payments");
+    assert_eq!(finding.suspicious_route_tier, EvidenceTier::Resource);
+    assert_eq!(finding.expected_tier, EvidenceTier::Privilege);
+    assert!(
+        finding
+            .suspicious_route_evidence
+            .iter()
+            .any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck)
+    );
+    let mut peers: Vec<_> = finding
+        .authorized_peer_routes
+        .iter()
+        .map(|peer| peer.path.as_str())
+        .collect();
+    peers.sort();
+    assert_eq!(peers, ["/admin/orders", "/admin/users"]);
+    assert!(report.findings[0].contains("weaker authorization"));
+}
+
+#[test]
+fn different_privilege_mechanisms_are_not_weaker() {
+    let mut users = route("GET", "/admin/users", "/admin", "PRESENT");
+    users.authorization[0].kind = AuthEvidenceKind::AuthorizationMiddleware;
+    let orders = route("GET", "/admin/orders", "/admin", "PRESENT");
+    let mut reports = route("GET", "/admin/reports", "/admin", "PRESENT");
+    reports.authorization[0].kind = AuthEvidenceKind::PermissionCheck;
+    let payments = route("GET", "/admin/payments", "/admin", "NONE");
+
+    let details = build_analysis_layers(&[users, orders, reports, payments]).2;
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].category, FindingCategory::MissingAuthorization);
+    assert_eq!(details[0].suspicious_route_tier, EvidenceTier::None);
+}

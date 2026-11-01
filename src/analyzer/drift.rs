@@ -104,9 +104,10 @@ pub(crate) fn build_analysis_layers_with(
         };
         invariants.push(invariant.clone());
 
-        if unauthorized == 0 || !is_dominant(authorized, peers.len(), options) {
+        if !is_dominant(authorized, peers.len(), options) {
             continue;
         }
+        let expected_tier = dominant_tier(peers, options);
         for route in peers.iter().filter(|route| !route.is_authorized()) {
             let authorized_peer_routes: Vec<RouteReference> = peers
                 .iter()
@@ -115,10 +116,37 @@ pub(crate) fn build_analysis_layers_with(
                 .collect();
             let finding = Finding {
                 peer_group_id: id.clone(),
+                category: FindingCategory::MissingAuthorization,
                 invariant: invariant.clone(),
                 suspicious_route: (*route).into(),
+                suspicious_route_tier: route.best_tier(),
+                expected_tier,
                 suspicious_route_evidence: route.authorization.clone(),
                 authorized_peer_routes,
+            };
+            findings.push(format_finding(&finding));
+            finding_details.push(finding);
+        }
+
+        // Authorized routes whose best evidence is below the tier their peers
+        // reach, such as an ownership check among role-checked peers.
+        for route in peers
+            .iter()
+            .filter(|route| route.is_authorized() && route.best_tier() < expected_tier)
+        {
+            let finding = Finding {
+                peer_group_id: id.clone(),
+                category: FindingCategory::WeakerAuthorization,
+                invariant: invariant.clone(),
+                suspicious_route: (*route).into(),
+                suspicious_route_tier: route.best_tier(),
+                expected_tier,
+                suspicious_route_evidence: route.authorization.clone(),
+                authorized_peer_routes: peers
+                    .iter()
+                    .filter(|peer| peer.best_tier() >= expected_tier)
+                    .map(|peer| (*peer).into())
+                    .collect(),
             };
             findings.push(format_finding(&finding));
             finding_details.push(finding);
@@ -131,6 +159,22 @@ pub(crate) fn build_analysis_layers_with(
 #[cfg(test)]
 pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
     build_analysis_layers(routes).3
+}
+
+/// The highest tier that a dominant share of the group reaches. Computed
+/// only for groups whose authorized routes are dominant, so it is at least
+/// the tier of the weakest authorization evidence.
+pub(crate) fn dominant_tier(peers: &[&Route], options: &AnalysisOptions) -> EvidenceTier {
+    [EvidenceTier::Privilege, EvidenceTier::Resource]
+        .into_iter()
+        .find(|tier| {
+            let reaching = peers
+                .iter()
+                .filter(|peer| peer.best_tier() >= *tier)
+                .count();
+            is_dominant(reaching, peers.len(), options)
+        })
+        .unwrap_or(EvidenceTier::Resource)
 }
 
 /// Whether authorized routes are common enough in a group for its
@@ -183,11 +227,19 @@ pub fn format_finding(finding: &Finding) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let category = match finding.category {
+        FindingCategory::MissingAuthorization => String::new(),
+        FindingCategory::WeakerAuthorization => format!(
+            "  Category: weaker authorization (best evidence tier {}, peers reach {})\n",
+            finding.suspicious_route_tier, finding.expected_tier
+        ),
+    };
     format!(
-        "  Suspicious route: {} {} ({}:{})\n\
+        "{}  Suspicious route: {} {} ({}:{})\n\
   Inferred invariant: {}\n\
   Authorized peer evidence ({} route(s)):\n{}\n\
   Suspicious route evidence: {}.",
+        category,
         route.method,
         route.path,
         route.file.display(),

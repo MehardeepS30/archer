@@ -13,7 +13,7 @@ fn archer(args: &[&str]) -> i32 {
 }
 
 const DRIFT: &str = "tests/fixtures/probes/a1_attribute_routes_in_scope.rs";
-const NO_DRIFT: &str = "tests/fixtures/probes/c3_weaker_evidence_kind.rs";
+const NO_DRIFT: &str = "tests/fixtures/probes/a2_configure_in_scope.rs";
 
 #[test]
 fn findings_exit_zero_without_fail_on_findings() {

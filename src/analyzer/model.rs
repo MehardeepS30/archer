@@ -174,10 +174,65 @@ pub struct AuthorizationInvariant {
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub peer_group_id: String,
+    pub category: FindingCategory,
     pub invariant: AuthorizationInvariant,
     pub suspicious_route: RouteReference,
+    /// The best tier of the suspicious route's own evidence.
+    pub suspicious_route_tier: EvidenceTier,
+    /// The tier a dominant share of the route's peers reaches.
+    pub expected_tier: EvidenceTier,
     pub suspicious_route_evidence: Vec<AuthEvidence>,
+    /// Peers that reach `expected_tier`, with their evidence.
     pub authorized_peer_routes: Vec<RouteReference>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum FindingCategory {
+    /// The route has no authorization evidence while its peers do.
+    MissingAuthorization,
+    /// The route has authorization evidence, but of a lower tier than its
+    /// peers', such as an ownership check where peers check a role.
+    WeakerAuthorization,
+}
+
+/// How much a piece of evidence restricts access, ordered weakest first.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EvidenceTier {
+    /// No recognized evidence.
+    None,
+    /// Establishes who the caller is, not what they may do.
+    Identity,
+    /// Restricts access to the caller's own resources (ownership checks).
+    Resource,
+    /// Restricts access by role, permission, or an authorization guard,
+    /// middleware, or explicit authorize call.
+    Privilege,
+}
+
+impl EvidenceTier {
+    pub fn of(kind: &AuthEvidenceKind) -> Self {
+        match kind {
+            AuthEvidenceKind::RoleCheck
+            | AuthEvidenceKind::PermissionCheck
+            | AuthEvidenceKind::AuthorizationGuard
+            | AuthEvidenceKind::AuthorizationMiddleware
+            | AuthEvidenceKind::ManualAuthorizationCheck => Self::Privilege,
+            AuthEvidenceKind::OwnershipCheck => Self::Resource,
+            AuthEvidenceKind::IdentityExtraction => Self::Identity,
+            AuthEvidenceKind::Unknown => Self::None,
+        }
+    }
+}
+
+impl std::fmt::Display for EvidenceTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Identity => "identity",
+            Self::Resource => "resource",
+            Self::Privilege => "privilege",
+        })
+    }
 }
 
 impl Route {
@@ -185,6 +240,15 @@ impl Route {
         self.authorization
             .iter()
             .any(AuthEvidence::is_authorization)
+    }
+
+    /// The highest tier among the route's evidence.
+    pub fn best_tier(&self) -> EvidenceTier {
+        self.authorization
+            .iter()
+            .map(|evidence| EvidenceTier::of(&evidence.kind))
+            .max()
+            .unwrap_or(EvidenceTier::None)
     }
 
     #[allow(dead_code)]
