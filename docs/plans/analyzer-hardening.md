@@ -140,7 +140,9 @@ Findings require `authorized >= min_support && authorized / total >= dominance_t
 
 ### Task 15: C3 — weaker-authorization findings
 
-Needs an architectural decision (definition of "weaker"); options go to the user before implementation.
+Decided by the user: option 1, evidence tiers. `EvidenceTier` = `Privilege` (role, permission, authorization guard/middleware, manual authorize) > `Resource` (ownership) > `Identity` > `None`. In a dominant group the expected tier is the highest tier a dominant share of routes reaches. Unauthorized routes stay `MissingAuthorization`; authorized routes below the expected tier become `WeakerAuthorization`. `Finding` gains `category`, `suspicious_route_tier`, `expected_tier`; `authorized_peer_routes` lists the peers reaching the expected tier.
+
+- [x] Tests `weaker_authorization_is_reported_separately_with_its_evidence` (probe c3) and `different_privilege_mechanisms_are_not_weaker`.
 
 ### Task 16: D1 — `--fail-on-findings`
 
@@ -164,7 +166,7 @@ Re-run the 20-repo benchmark (dataset location pending from the user), update `d
 
 ## Implementation Notes
 
-Status: every task except Task 15 (C3) and Task 18's benchmark run is done; Task 15 waits for the design choice described in the thread, and the benchmark dataset is not in the repository.
+Status: every task is done except Task 18's benchmark run; the benchmark dataset is not in the repository.
 
 Deviations from the steps above, each kept within the spec:
 
