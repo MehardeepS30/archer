@@ -2937,3 +2937,22 @@ fn threshold_edges_do_not_panic() {
             .is_empty()
     );
 }
+
+#[test]
+fn structured_findings_drive_text_and_json_omits_preformatted_findings() {
+    let repo = TempRepo::new(
+        "d2-findings",
+        &[(
+            "main.rs",
+            include_str!("../../tests/fixtures/probes/a1_attribute_routes_in_scope.rs"),
+        )],
+    );
+    let report = repo.analyze();
+    assert_eq!(report.finding_details.len(), 1);
+    let rendered: Vec<String> = report.finding_details.iter().map(format_finding).collect();
+    assert_eq!(rendered, report.findings);
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert!(json.get("findings").is_none());
+    assert!(json.get("finding_details").is_some());
+}

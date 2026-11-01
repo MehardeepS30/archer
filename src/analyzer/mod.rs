@@ -8,6 +8,7 @@ mod routes;
 #[cfg(test)]
 mod tests;
 
+pub use drift::format_finding;
 pub use model::*;
 
 use anyhow::Result;

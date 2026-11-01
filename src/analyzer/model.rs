@@ -229,6 +229,10 @@ pub struct Report {
     pub routes: Vec<Route>,
     pub peer_groups: Vec<PeerGroup>,
     pub invariants: Vec<AuthorizationInvariant>,
+    /// Text renderings of `finding_details`, for the CLI and tests; the JSON
+    /// report carries only the structured findings.
+    #[serde(skip)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub findings: Vec<String>,
     pub finding_details: Vec<Finding>,
 }

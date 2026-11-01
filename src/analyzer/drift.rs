@@ -113,40 +113,15 @@ pub(crate) fn build_analysis_layers_with(
                 .filter(|peer| peer.is_authorized())
                 .map(|peer| (*peer).into())
                 .collect();
-            finding_details.push(Finding {
+            let finding = Finding {
                 peer_group_id: id.clone(),
                 invariant: invariant.clone(),
                 suspicious_route: (*route).into(),
                 suspicious_route_evidence: route.authorization.clone(),
                 authorized_peer_routes,
-            });
-            let peer_lines = peers
-                .iter()
-                .filter(|peer| peer.is_authorized())
-                .map(|peer| {
-                    format!(
-                        "    - {} {}\n      {}",
-                        peer.method,
-                        peer.path,
-                        format_evidence(peer)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            findings.push(format!(
-                "  Suspicious route: {} {} ({}:{})\n\
-  Inferred invariant: {}\n\
-  Authorized peer evidence ({} route(s)):\n{}\n\
-  Suspicious route evidence: {}.",
-                route.method,
-                route.path,
-                route.file.display(),
-                route.line,
-                invariant.description,
-                authorized,
-                peer_lines,
-                format_evidence(route)
-            ));
+            };
+            findings.push(format_finding(&finding));
+            finding_details.push(finding);
         }
     }
 
@@ -192,12 +167,43 @@ pub(crate) fn route_shape_description(route: &Route) -> String {
     }
 }
 
-pub(crate) fn format_evidence(route: &Route) -> String {
-    if route.authorization.is_empty() {
+/// The text form of a finding, as printed by the CLI.
+pub fn format_finding(finding: &Finding) -> String {
+    let route = &finding.suspicious_route;
+    let peer_lines = finding
+        .authorized_peer_routes
+        .iter()
+        .map(|peer| {
+            format!(
+                "    - {} {}\n      {}",
+                peer.method,
+                peer.path,
+                format_evidence(&peer.authorization)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "  Suspicious route: {} {} ({}:{})\n\
+  Inferred invariant: {}\n\
+  Authorized peer evidence ({} route(s)):\n{}\n\
+  Suspicious route evidence: {}.",
+        route.method,
+        route.path,
+        route.file.display(),
+        route.line,
+        finding.invariant.description,
+        finding.authorized_peer_routes.len(),
+        peer_lines,
+        format_evidence(&finding.suspicious_route_evidence)
+    )
+}
+
+pub(crate) fn format_evidence(authorization: &[AuthEvidence]) -> String {
+    if authorization.is_empty() {
         return "No recognized authorization evidence".into();
     }
-    route
-        .authorization
+    authorization
         .iter()
         .map(|evidence| {
             format!(

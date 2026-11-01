@@ -124,10 +124,10 @@ fn run(cli: &Cli) -> Result<bool> {
         }
     }
 
-    if !report.findings.is_empty() {
+    if !report.finding_details.is_empty() {
         println!("\nPotential authorization drift:");
-        for finding in &report.findings {
-            println!("{}", finding);
+        for finding in &report.finding_details {
+            println!("{}", analyzer::format_finding(finding));
         }
     } else {
         println!("\nNo prototype drift findings.");
