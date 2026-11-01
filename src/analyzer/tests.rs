@@ -2683,3 +2683,34 @@ fn qualified_and_multi_method_route_attributes_are_extracted() {
         .collect();
     assert_eq!(routes, ["GET /x", "GET /y", "POST /y", "GET /z"]);
 }
+
+#[test]
+fn resource_to_registers_an_any_method_route() {
+    let repo = TempRepo::new(
+        "a4-resource-to",
+        &[(
+            "main.rs",
+            "fn handler() {} fn h() {}
+             fn configure(cfg: &mut web::ServiceConfig) {
+                 cfg.service(web::resource(\"/res\").wrap(AdminGuard).to(handler))
+                    .service(web::resource(\"/r2\").route(web::get().to(h)));
+             }",
+        )],
+    );
+
+    let report = repo.analyze();
+    let routes: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect();
+    assert_eq!(routes, ["UNKNOWN /res", "GET /r2"]);
+    let resource = route_at(&report, "/res");
+    assert_eq!(resource.handler.as_deref(), Some("handler"));
+    assert!(
+        resource
+            .authorization
+            .iter()
+            .any(|evidence| evidence.mechanism == "AdminGuard")
+    );
+}

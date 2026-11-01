@@ -200,27 +200,39 @@ impl<'a> RouteVisitor<'a> {
 
     pub(crate) fn add_route(&mut self, node: &ExprMethodCall) {
         let name = node.method.to_string();
-        if name != "route" && name != "resource" {
+        if name != "route" && name != "resource" && name != "to" {
             return;
         }
 
         // `cfg.route("/path", builder)` names its path; `web::resource("/path")
-        // .route(builder)` takes it from the resource the chain starts from.
-        let Some((path, path_line)) = first_string_arg(&node.args)
-            .zip(first_string_arg_line(&node.args))
-            .or_else(|| {
-                (name == "route")
-                    .then(|| resource_path(&node.receiver))
-                    .flatten()
-            })
-        else {
+        // .route(builder)` and `web::resource("/path").to(handler)` take it
+        // from the resource the chain starts from.
+        let path = if name == "to" {
+            resource_path(&node.receiver)
+        } else {
+            first_string_arg(&node.args)
+                .zip(first_string_arg_line(&node.args))
+                .or_else(|| {
+                    (name == "route")
+                        .then(|| resource_path(&node.receiver))
+                        .flatten()
+                })
+        };
+        let Some((path, path_line)) = path else {
             return;
         };
 
         let local_prefix = scope_prefix(&node.receiver);
         let prefix = join_paths(&self.scope_context, &local_prefix);
         let path = join_paths(&prefix, &path);
-        let target = find_handler(&node.args);
+        // A resource's own `.to(handler)` answers every method.
+        let target = if name == "to" {
+            node.args
+                .first()
+                .map(|arg| handler_target(arg).unwrap_or(HandlerTarget::Other))
+        } else {
+            find_handler(&node.args)
+        };
         let (handler_evidence, handler_resolution) = match &target {
             None => (Vec::new(), None),
             Some(target) => match self.block_local_handler(target) {
