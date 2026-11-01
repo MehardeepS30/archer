@@ -618,10 +618,14 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
     let root = loop {
         match expr {
             Expr::MethodCall(call) => {
-                // `Route::method` adds a method guard; other builder calls
-                // (`to`, `guard`, ...) do not constrain the method.
+                // `Route::method` and a method guard (`.guard(guard::Get())`)
+                // constrain the method; other builder calls do not.
                 if call.method == "method" {
                     methods.push(method_constant(call.args.first()?)?);
+                } else if call.method == "guard"
+                    && let Some(method) = call.args.first().and_then(method_guard)
+                {
+                    methods.push(method);
                 }
                 expr = &call.receiver;
             }
@@ -665,6 +669,39 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
         // An any-method route without a method guard, or conflicting guards.
         _ => None,
     }
+}
+
+/// Reads a method guard: `guard::Get()`, `actix_web::guard::Post()`, or
+/// `guard::Method(Method::PUT)`. Other guards return `None`.
+pub(crate) fn method_guard(expr: &Expr) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Path(function) = &*call.func else {
+        return None;
+    };
+    let segments: Vec<String> = function
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let (name, module) = segments.split_last()?;
+    let module: Vec<&str> = module.iter().map(String::as_str).collect();
+    if !matches!(module.as_slice(), [] | ["guard"] | ["actix_web", "guard"]) {
+        return None;
+    }
+    if name == "Method" {
+        return method_constant(call.args.first()?);
+    }
+    // `guard::Get`, not `guard::GET` or `guard::get`, which are not guards.
+    let method = name.to_uppercase();
+    let camel: String = method
+        .chars()
+        .take(1)
+        .chain(method.chars().skip(1).flat_map(char::to_lowercase))
+        .collect();
+    (HTTP_METHOD_CONSTANTS.contains(&method.as_str()) && *name == camel).then_some(method)
 }
 
 /// Reads `Method::PUT`, `http::Method::PUT`, or `actix_web::http::Method::PUT`.
@@ -759,7 +796,9 @@ pub(crate) fn configuration_call_evidence(
     // a route's receiver walk passes through.
     let (authorization_kind, authorization_strength) = if method.method == "guard" {
         (AuthEvidenceKind::AuthorizationGuard, AuthStrength::Strong)
-    } else if method.method == "wrap" {
+    } else if method.method == "wrap" || method.method == "wrap_fn" {
+        // `wrap_fn(|req, srv| ...)` is middleware written as a closure; the
+        // names it calls are classified like a `wrap` argument's.
         (
             AuthEvidenceKind::AuthorizationMiddleware,
             AuthStrength::Medium,

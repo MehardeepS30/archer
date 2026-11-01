@@ -3140,6 +3140,37 @@ fn functions_returning_a_scope_are_expanded_where_they_are_registered() {
 }
 
 #[test]
+fn wrap_fn_closures_are_middleware_evidence() {
+    let report = fixture_report(
+        "e5-wrap-fn",
+        include_str!("../../tests/fixtures/probes/e5_wrap_fn.rs"),
+    );
+    for path in ["/admin/x", "/admin/y"] {
+        assert!(
+            has_evidence(
+                route_at(&report, path),
+                AuthEvidenceKind::AuthorizationMiddleware,
+                "check_admin"
+            ),
+            "{path}"
+        );
+    }
+    assert!(route_at(&report, "/staff/x").authorization.is_empty());
+}
+
+#[test]
+fn method_guards_set_the_route_method() {
+    let report = fixture_report(
+        "e6-method-guards",
+        include_str!("../../tests/fixtures/probes/e6_method_guards.rs"),
+    );
+    for route in &report.routes {
+        assert_eq!(route.method, "GET", "{}", route.path);
+    }
+    assert_eq!(finding_paths(&report), ["/admin/c"]);
+}
+
+#[test]
 fn large_peer_groups_are_grouped_without_pairwise_comparison() {
     let routes: String = (0..10_000)
         .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
