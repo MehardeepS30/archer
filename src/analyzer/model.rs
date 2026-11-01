@@ -93,6 +93,9 @@ pub struct Route {
 pub(crate) struct RouteOrigin {
     /// Line and column of the registering call or attribute, for source order.
     pub(crate) position: (usize, usize),
+    /// For attribute routes: the handler definition and the attribute's own
+    /// path, so the route can be re-rooted where `.service(handler)` registers it.
+    pub(crate) attribute: Option<(usize, String)>,
 }
 
 #[derive(Debug, Clone, Serialize)]

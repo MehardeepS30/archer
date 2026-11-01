@@ -47,6 +47,16 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) chain_scopes: Vec<(*const Expr, Vec<AuthEvidence>)>,
     pub(crate) scope_context: String,
     pub(crate) routes: Vec<Route>,
+    pub(crate) registrations: Vec<Registration>,
+}
+
+/// A `.service(handler)` call naming a function, with the scope it is made in.
+#[derive(Debug, Clone)]
+pub(crate) struct Registration {
+    pub(crate) definition: usize,
+    pub(crate) prefix: String,
+    /// Guard and middleware evidence of the registering scope and its parents.
+    pub(crate) inherited: Vec<AuthEvidence>,
 }
 
 impl<'a> RouteVisitor<'a> {
@@ -65,6 +75,7 @@ impl<'a> RouteVisitor<'a> {
             chain_scopes: Vec::new(),
             scope_context: String::new(),
             routes: Vec::new(),
+            registrations: Vec::new(),
         }
     }
 
@@ -117,6 +128,35 @@ impl<'a> RouteVisitor<'a> {
         }
     }
 
+    /// Guard and middleware evidence of the scopes currently being visited.
+    pub(crate) fn inherited_evidence(&self) -> Vec<AuthEvidence> {
+        self.chain_scopes
+            .iter()
+            .flat_map(|(_, evidence)| evidence.iter().cloned())
+            .collect()
+    }
+
+    /// Records `.service(handler)` when `handler` names a module-level function.
+    pub(crate) fn add_registration(&mut self, arg: &Expr) {
+        let Some(target) = handler_target(arg) else {
+            return;
+        };
+        if self.block_local_handler(&target).is_some() {
+            return;
+        }
+        let (Some(definition), _) =
+            self.index
+                .resolve_handler_index(&self.crate_key, &self.module, &target)
+        else {
+            return;
+        };
+        self.registrations.push(Registration {
+            definition,
+            prefix: self.scope_context.clone(),
+            inherited: self.inherited_evidence(),
+        });
+    }
+
     pub(crate) fn add_route(&mut self, node: &ExprMethodCall) {
         let name = node.method.to_string();
         if name != "route" && name != "resource" {
@@ -162,13 +202,11 @@ impl<'a> RouteVisitor<'a> {
         // Middleware and guards of this route's scope, wherever they appear in
         // its builder chain, and of every enclosing scope. Evidence already
         // found on the route's own receiver chain is not repeated.
-        for inherited in self.chain_scopes.iter().flat_map(|(_, evidence)| evidence) {
-            let mut inherited = inherited.clone();
-            inherited.handler = handler.clone();
-            if !authorization.contains(&inherited) {
-                authorization.push(inherited);
-            }
-        }
+        add_inherited_evidence(
+            &mut authorization,
+            &self.inherited_evidence(),
+            handler.as_deref(),
+        );
 
         self.routes.push(Route {
             method: extract_http_method(node),
@@ -182,6 +220,7 @@ impl<'a> RouteVisitor<'a> {
             file: self.file.clone(),
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
+                attribute: None,
             },
         });
     }
@@ -304,6 +343,7 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             let previous_context = self.scope_context.clone();
             self.scope_context = join_paths(&previous_context, &scope_prefix(&node.receiver));
             for arg in &node.args {
+                self.add_registration(arg);
                 self.visit_expr(arg);
             }
             self.scope_context = previous_context;
@@ -333,6 +373,13 @@ impl RouteVisitor<'_> {
             let path = join_paths(&prefix, &path_literal.value());
             let handler = node.sig.ident.to_string();
             let authorization = handler_evidence(&self.file, node);
+            // Only module-level functions can be named by `.service(handler)`.
+            let definition = if self.block_scopes.is_empty() {
+                self.index
+                    .definition_in(&self.crate_key, &self.module, &handler)
+            } else {
+                None
+            };
 
             self.routes.push(Route {
                 method: method.into(),
@@ -346,6 +393,7 @@ impl RouteVisitor<'_> {
                 file: self.file.clone(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
+                    attribute: definition.map(|definition| (definition, path_literal.value())),
                 },
             });
         }
@@ -746,6 +794,22 @@ impl HandlerTarget {
     }
 }
 
+/// The function a handler expression names, if it is a plain path.
+pub(crate) fn handler_target(expr: &Expr) -> Option<HandlerTarget> {
+    match expr {
+        Expr::Path(path) if path.qself.is_none() => Some(HandlerTarget::Path {
+            segments: path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect(),
+            leading_colon: path.path.leading_colon.is_some(),
+        }),
+        _ => None,
+    }
+}
+
 pub(crate) fn find_handler(
     exprs: &syn::punctuated::Punctuated<Expr, syn::token::Comma>,
 ) -> Option<HandlerTarget> {
@@ -754,23 +818,66 @@ pub(crate) fn find_handler(
 
 pub(crate) fn find_handler_in_expr(expr: &Expr) -> Option<HandlerTarget> {
     match expr {
-        Expr::MethodCall(method) if method.method == "to" => Some(match method.args.first()? {
-            Expr::Path(path) if path.qself.is_none() => HandlerTarget::Path {
-                segments: path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect(),
-                leading_colon: path.path.leading_colon.is_some(),
-            },
-            _ => HandlerTarget::Other,
-        }),
+        Expr::MethodCall(method) if method.method == "to" => {
+            Some(handler_target(method.args.first()?).unwrap_or(HandlerTarget::Other))
+        }
         Expr::MethodCall(method) => {
             find_handler(&method.args).or_else(|| find_handler_in_expr(&method.receiver))
         }
         _ => None,
     }
+}
+
+/// Adds scope guard and middleware evidence to a route, attributed to its
+/// handler. Evidence already present is not repeated.
+pub(crate) fn add_inherited_evidence(
+    authorization: &mut Vec<AuthEvidence>,
+    inherited: &[AuthEvidence],
+    handler: Option<&str>,
+) {
+    for inherited in inherited {
+        let mut inherited = inherited.clone();
+        inherited.handler = handler.map(str::to_owned);
+        if !authorization.contains(&inherited) {
+            authorization.push(inherited);
+        }
+    }
+}
+
+/// Re-roots attribute routes at every `.service(handler)` call that registers
+/// their handler, taking that scope's prefix and inherited evidence. Attribute
+/// routes whose handler is never registered this way keep their own path.
+pub(crate) fn apply_registrations(
+    routes: Vec<Route>,
+    registrations: &[Registration],
+) -> Vec<Route> {
+    let mut placed = Vec::with_capacity(routes.len());
+    for route in routes {
+        let Some((definition, attribute_path)) = route.origin.attribute.clone() else {
+            placed.push(route);
+            continue;
+        };
+        let matching: Vec<&Registration> = registrations
+            .iter()
+            .filter(|registration| registration.definition == definition)
+            .collect();
+        if matching.is_empty() {
+            placed.push(route);
+            continue;
+        }
+        for registration in matching {
+            let mut registered = route.clone();
+            registered.path = join_paths(&registration.prefix, &attribute_path);
+            registered.scope_prefix = registration.prefix.clone();
+            add_inherited_evidence(
+                &mut registered.authorization,
+                &registration.inherited,
+                route.handler.as_deref(),
+            );
+            placed.push(registered);
+        }
+    }
+    placed
 }
 
 /// Line and column where a span starts.

@@ -165,6 +165,31 @@ impl HandlerIndex {
         module: &[String],
         target: &HandlerTarget,
     ) -> (Option<&HandlerDefinition>, HandlerResolution) {
+        let (index, resolution) = self.resolve_handler_index(crate_key, module, target);
+        (index.map(|index| &self.definitions[index]), resolution)
+    }
+
+    /// The top-level function `name` defined directly in `module`, if exactly one is.
+    pub(crate) fn definition_in(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        name: &str,
+    ) -> Option<usize> {
+        let mut matches = self
+            .definitions_named(crate_key, name)
+            .filter(|&index| self.definitions[index].module == module);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    /// Like `resolve_handler`, returning the definition's index.
+    pub(crate) fn resolve_handler_index(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        target: &HandlerTarget,
+    ) -> (Option<usize>, HandlerResolution) {
         let HandlerTarget::Path {
             segments,
             leading_colon,
@@ -201,7 +226,7 @@ impl HandlerIndex {
         };
 
         match lookup {
-            Lookup::Found(index, resolution) => (Some(&self.definitions[index]), resolution),
+            Lookup::Found(index, resolution) => (Some(index), resolution),
             Lookup::Ambiguous(candidates) => (None, self.ambiguous(candidates)),
             Lookup::NotFound { explicit: true } => (None, HandlerResolution::Unresolved),
             Lookup::NotFound { explicit: false } => {
@@ -215,10 +240,7 @@ impl HandlerIndex {
                     .collect();
                 match candidates.as_slice() {
                     [] => (None, HandlerResolution::Unresolved),
-                    [index] => (
-                        Some(&self.definitions[*index]),
-                        HandlerResolution::UniqueName,
-                    ),
+                    [index] => (Some(*index), HandlerResolution::UniqueName),
                     _ => (None, self.ambiguous(candidates)),
                 }
             }

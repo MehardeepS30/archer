@@ -93,11 +93,14 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
             .iter()
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
     );
+    let mut registrations = Vec::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
+        registrations.extend(visitor.registrations);
     }
+    let mut routes = apply_registrations(routes, &registrations);
     // Builder chains are visited outermost call first; report routes in the
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));

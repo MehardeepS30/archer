@@ -2561,3 +2561,46 @@ fn routes_are_reported_in_source_order() {
         .collect();
     assert_eq!(paths, ["/admin/users", "/admin/orders", "/admin/payments"]);
 }
+
+#[test]
+fn attribute_routes_take_prefix_and_middleware_from_their_registering_scope() {
+    let repo = TempRepo::new(
+        "a1-attribute-scope",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/main.rs",
+                include_str!("../../tests/fixtures/probes/a1_attribute_routes_in_scope.rs"),
+            ),
+            (
+                "src/ops.rs",
+                "use crate::health;
+                 fn configure(cfg: &mut web::ServiceConfig) {
+                     cfg.service(web::scope(\"/ops\").wrap(RequireAdminMiddleware).service(health));
+                 }",
+            ),
+        ],
+    );
+
+    let report = repo.analyze();
+    let payments = route_at(&report, "/admin/payments");
+    assert_eq!(payments.scope_prefix, "/admin");
+    assert!(report.routes.iter().all(|route| route.path != "/payments"));
+
+    // `health` is registered at the application root and under `/ops`.
+    let ops_health = route_at(&report, "/ops/health");
+    assert!(
+        ops_health
+            .authorization
+            .iter()
+            .any(|evidence| evidence.mechanism == "RequireAdminMiddleware")
+    );
+    assert!(route_at(&report, "/health").authorization.is_empty());
+
+    let flagged: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| finding.suspicious_route.path.as_str())
+        .collect();
+    assert_eq!(flagged, ["/admin/payments"]);
+}
