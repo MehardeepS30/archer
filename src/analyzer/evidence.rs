@@ -5,7 +5,8 @@ use quote::ToTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use syn::{
-    Expr, ExprCall, ExprMethodCall, ExprPath, ImplItemFn, ItemFn, TraitItemFn,
+    Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, GenericArgument, ImplItemFn, ItemFn,
+    PathArguments, TraitItemFn, Type,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -13,9 +14,144 @@ use syn::{
 use super::model::*;
 
 pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> {
-    let mut visitor = AuthEvidenceVisitor::new(file, &item.sig.ident.to_string());
+    let handler = item.sig.ident.to_string();
+    let mut evidence = Vec::new();
+    for input in &item.sig.inputs {
+        if let FnArg::Typed(argument) = input {
+            extractor_evidence(&argument.ty, file, &handler, &mut evidence);
+        }
+    }
+    let mut visitor = AuthEvidenceVisitor::new(file, &handler);
     visitor.visit_block(&item.block);
-    visitor.evidence
+    evidence.extend(visitor.evidence);
+    evidence
+}
+
+/// Extractors whose type parameter is request data or application state,
+/// not a check: `web::Json<RoleUpdate>` does not authorize anything. An
+/// `Option<AdminUser>` extractor does not reject the request either.
+const DATA_EXTRACTORS: [&str; 10] = [
+    "Json",
+    "Path",
+    "Query",
+    "Form",
+    "Data",
+    "ReqData",
+    "Bytes",
+    "Payload",
+    "Option",
+    "HttpRequest",
+];
+
+/// Words that make a type name request data or a service rather than an
+/// authorization extractor (`RoleUpdate`, `PermissionService`).
+const EXTRACTOR_EXCLUDED_WORDS: [&str; 16] = [
+    "service",
+    "services",
+    "repository",
+    "repo",
+    "update",
+    "create",
+    "request",
+    "response",
+    "input",
+    "payload",
+    "dto",
+    "query",
+    "params",
+    "info",
+    "data",
+    "config",
+];
+
+/// Records handler arguments whose type is an authorization extractor
+/// (`AdminUser`, `RequireRole<Admin>`) or an authentication-only extractor
+/// (`BearerAuth`). An extractor that implements `FromRequest` rejects the
+/// request before the handler runs, so its type is the evidence. This is a
+/// naming heuristic: the extractor's implementation is not inspected.
+fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<AuthEvidence>) {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => {
+            let Some(segment) = path.path.segments.last() else {
+                return;
+            };
+            let name = segment.ident.to_string();
+            if DATA_EXTRACTORS.contains(&name.as_str()) {
+                return;
+            }
+            if let Some((kind, strength)) = classify_extractor_name(&name) {
+                evidence.push(AuthEvidence {
+                    kind,
+                    mechanism: name,
+                    symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                    file: file.to_path_buf(),
+                    line: ty.span().start().line,
+                    handler: Some(handler.into()),
+                    strength,
+                });
+                return;
+            }
+            if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                for argument in &arguments.args {
+                    if let GenericArgument::Type(inner) = argument {
+                        extractor_evidence(inner, file, handler, evidence);
+                    }
+                }
+            }
+        }
+        Type::Reference(reference) => extractor_evidence(&reference.elem, file, handler, evidence),
+        Type::Paren(paren) => extractor_evidence(&paren.elem, file, handler, evidence),
+        Type::Group(group) => extractor_evidence(&group.elem, file, handler, evidence),
+        Type::Tuple(tuple) => {
+            for element in &tuple.elems {
+                extractor_evidence(element, file, handler, evidence);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn classify_extractor_name(name: &str) -> Option<(AuthEvidenceKind, AuthStrength)> {
+    if !name.chars().next().is_some_and(char::is_uppercase) {
+        return None;
+    }
+    let words = camel_case_words(name);
+    let has_word =
+        |candidates: &[&str]| words.iter().any(|word| candidates.contains(&word.as_str()));
+    if has_word(&CONFIGURATION_EXCLUDED_WORDS) || has_word(&EXTRACTOR_EXCLUDED_WORDS) {
+        return None;
+    }
+    if ["BearerAuth", "BasicAuth", "Identity", "AuthenticatedUser"].contains(&name)
+        || has_word(&["claims"])
+    {
+        Some((AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak))
+    } else if has_word(&[
+        "permission",
+        "permissions",
+        "acl",
+        "authorization",
+        "authorize",
+        "authorized",
+        "authz",
+    ]) {
+        Some((AuthEvidenceKind::PermissionCheck, AuthStrength::Medium))
+    } else if has_word(&[
+        "admin",
+        "admins",
+        "role",
+        "roles",
+        "rbac",
+        "manager",
+        "superuser",
+    ]) {
+        Some((AuthEvidenceKind::RoleCheck, AuthStrength::Medium))
+    } else if classify_route_configuration_name(name)
+        == Some(RouteConfigurationName::Authentication)
+    {
+        Some((AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak))
+    } else {
+        None
+    }
 }
 
 /// Name-keyed evidence map used by evidence-classification tests. Route

@@ -2770,3 +2770,49 @@ fn const_paths_resolve_and_unresolved_paths_are_kept_with_a_warning() {
             .all(|route| !route.path.contains("unresolved"))
     );
 }
+
+fn signature_evidence(source: &str) -> Vec<(AuthEvidenceKind, String)> {
+    let item: syn::ItemFn = syn::parse_str(source).unwrap();
+    handler_evidence(Path::new("extractors.rs"), &item)
+        .into_iter()
+        .map(|evidence| (evidence.kind, evidence.mechanism))
+        .collect()
+}
+
+#[test]
+fn authorization_extractors_in_handler_signatures_are_evidence() {
+    use AuthEvidenceKind::*;
+    assert_eq!(
+        signature_evidence("async fn users(_admin: AdminUser) {}"),
+        [(RoleCheck, "AdminUser".to_owned())]
+    );
+    assert_eq!(
+        signature_evidence("async fn users(_: RequireRole<Admin>) {}"),
+        [(RoleCheck, "RequireRole".to_owned())]
+    );
+    assert_eq!(
+        signature_evidence("async fn users(_: web::ReqData<PermissionsGuard>) {}"),
+        []
+    );
+    assert_eq!(
+        signature_evidence("async fn users(auth: BearerAuth) {}"),
+        [(IdentityExtraction, "BearerAuth".to_owned())]
+    );
+    assert_eq!(
+        signature_evidence(
+            "async fn update(body: web::Json<RoleUpdate>, roles: web::Data<RoleService>, id: web::Path<u32>) {}"
+        ),
+        []
+    );
+
+    let repo = TempRepo::new(
+        "b1-extractors",
+        &[(
+            "main.rs",
+            include_str!("../../tests/fixtures/probes/b1_b2_extractors_and_attributes.rs"),
+        )],
+    );
+    let report = repo.analyze();
+    assert!(route_at(&report, "/admin/users").is_authorized());
+    assert!(route_at(&report, "/admin/orders").is_authorized());
+}
