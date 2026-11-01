@@ -3285,3 +3285,22 @@ fn a_route_factory_called_in_two_scopes_registers_in_both() {
         "RequireAdminMiddleware"
     ));
 }
+
+#[test]
+fn config_functions_reachable_only_from_themselves_keep_their_routes() {
+    let report = fixture_report(
+        "e9-self-configure",
+        "fn a(cfg: &mut ServiceConfig) { cfg.route(\"/a\", web::get().to(h)); b(cfg); }
+         fn b(cfg: &mut ServiceConfig) { cfg.route(\"/b\", web::get().to(h)).configure(a); }
+         fn c(cfg: &mut ServiceConfig) { cfg.route(\"/c\", web::get().to(h)); c(cfg); }
+         async fn h() {}",
+    );
+    let mut paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths, ["/a", "/b", "/c"]);
+}

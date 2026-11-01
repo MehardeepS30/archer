@@ -53,7 +53,9 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) warnings: Vec<String>,
     /// Definitions named by a `.configure(f)` call. Routes found while
     /// visiting such a function on its own are replaced by its expansions.
-    pub(crate) configured: Vec<usize>,
+    /// Each as `(caller, target)`: the module-level function making the call
+    /// (`None` outside one) and the definition it expands.
+    pub(crate) configured: Vec<(Option<usize>, usize)>,
     /// The module-level function being visited, outside any expansion.
     pub(crate) enclosing: Option<usize>,
     /// `.configure` targets being expanded, innermost last.
@@ -110,7 +112,7 @@ impl<'a> RouteVisitor<'a> {
     /// the call: under the caller's scope prefix and guard/middleware chain,
     /// resolving names from `f`'s own module. Recursive configuration stops.
     pub(crate) fn expand_configure(&mut self, definition: usize) {
-        self.configured.push(definition);
+        self.configured.push((self.enclosing, definition));
         if self.expanding.contains(&definition) {
             return;
         }

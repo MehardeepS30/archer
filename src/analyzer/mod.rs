@@ -117,7 +117,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     );
     let mut registrations = Vec::new();
     let mut warnings = Vec::new();
-    let mut configured = HashSet::new();
+    let mut configured = Vec::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
         visitor.visit_file(syntax);
@@ -131,6 +131,9 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     warnings.dedup();
     // A function passed to `.configure(f)` registers its routes where it is
     // called; its own top-level visit, with no caller scope, is discarded.
+    // That holds only when some chain of such calls starts outside these
+    // functions: one reachable only from itself keeps its own routes.
+    let configured = reachable_from_roots(&configured);
     let outside_configured = |enclosing: Option<usize>| {
         enclosing.is_none_or(|definition| !configured.contains(&definition))
     };
@@ -154,4 +157,27 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         findings,
         finding_details,
     })
+}
+
+/// Targets of `(caller, target)` expansion edges that are reachable from a
+/// caller which is not itself a target.
+fn reachable_from_roots(edges: &[(Option<usize>, usize)]) -> HashSet<usize> {
+    let targets: HashSet<usize> = edges.iter().map(|&(_, target)| target).collect();
+    let mut reached: HashSet<usize> = HashSet::new();
+    let mut pending: Vec<usize> = edges
+        .iter()
+        .filter(|(caller, _)| caller.is_none_or(|caller| !targets.contains(&caller)))
+        .map(|&(_, target)| target)
+        .collect();
+    while let Some(target) = pending.pop() {
+        if reached.insert(target) {
+            pending.extend(
+                edges
+                    .iter()
+                    .filter(|(caller, _)| *caller == Some(target))
+                    .map(|&(_, next)| next),
+            );
+        }
+    }
+    reached
 }
