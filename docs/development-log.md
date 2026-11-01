@@ -154,3 +154,36 @@ The controlled benchmark could not be re-run: its 20 repositories were never com
 
 ### Next Step
 Restore or rebuild the benchmark dataset, rerun it at the default thresholds, then sweep `--threshold` and `--min-support` and record precision, recall, and false positives for each setting.
+
+## 10. Analyzer Hardening, Second Pass
+
+### Objective
+Check that the section 9 fixes hold, then look for remaining detection gaps (missed or misattributed routes and evidence, which cause false negatives and false positives) and robustness failures on unusual input. Each new problem gets an ID (E1-E9), a probe fixture in `tests/fixtures/probes/e*`, and a regression test.
+
+### Work Completed
+Verification: all 73 tests passed on `improve/analyzer-hardening`, every earlier probe gave its expected routes and findings, and after this pass `tests/fixtures/demo.rs` and the `a*`/`b*`/`c*` probes produce byte-identical JSON to before.
+
+New problems, all fixed on `improve/analyzer-hardening-2`:
+
+| ID | Problem found | Effect before the fix | Fix |
+|----|---------------|-----------------------|-----|
+| E1 | A builder chain of about 800 `.route()` calls overflowed the 1 MiB Windows main-thread stack (debug; about 1,600 in release). Peer grouping compared every pair of routes and deduplicated each group pairwise, which is cubic: 2,000 routes in one group took 45 s. `Spanned::span()` on every method call in a handler body rebuilt the call's whole token stream, which is quadratic on long chains. | Crash (exit code 127) on large route files; minutes of runtime on large apps. | Analysis runs on a thread with a 512 MiB reserved stack. Routes are bucketed by peer key (scope prefix, structural prefix, method, path shape) in one pass with the same group order. Scope prefixes are read iteratively, and a method call's span is computed only when the call is evidence. A 5,000-route chain now takes 0.6 s. |
+| E2 | `.service((a, b))` and `.service(services![a, b])` registrations were ignored. | Attribute routes kept bare paths and lost their scope's middleware; a missing check under `/admin` went unreported. | Each tuple element and `services!` argument is a registration. |
+| E3 | A config function called directly (`admin::config(cfg)` inside another config function, or `.configure(\|c\| admin_routes(c))`) was not expanded. | Its routes lost the caller's prefix and middleware. | A call to a function with a `ServiceConfig` parameter is expanded at the call, like `.configure(f)`. |
+| E4 | `.service(admin_scope())`, where the function returns a `Scope`, was not expanded. | Same as E3. | Calls to functions returning `Scope`, `Resource`, or `impl HttpServiceFactory` are expanded at the call. A factory used in two scopes yields routes in both. |
+| E5 | `.wrap_fn(\|req, srv\| ...)` middleware was not read. | A scope protected by a closure calling `check_admin(&req)` looked unauthorized. | `wrap_fn` arguments are classified like `wrap` arguments. |
+| E6 | `web::route().guard(guard::Get())` gave method `UNKNOWN`. | Such routes could not be peers of `web::get()` routes, hiding drift. | `guard::Get()`-style guards and `guard::Method(Method::X)` set the method. |
+| E7 | Role checks written as comparisons (`user.role != Role::Admin`, `matches!(user.role, Role::Admin)`, `user.roles.contains(&Role::Admin)`, `claims.is_admin`) were not evidence. | Routes checking roles this way looked unauthorized (false positives), and could make a group non-dominant, hiding a real gap (false negative). | Comparisons where an operand is a variant of a `Role`/`Permission`-named type or a field ending in `role(s)`/`permission(s)` are `Medium` role or permission evidence. Assigning a flag, `roles.len() == 2`, and `Status::Paid` comparisons are not. |
+| E8 | A check inside a called helper (`ensure_can_manage(&user)` calling `require_admin`) was not seen. | The handler was reported as missing authorization (false positive). | Each function also carries the evidence of repository functions it calls, up to 3 calls deep, with cycle protection. Only calls resolved by scoping rules count, not unique-name guesses. Evidence keeps the callee's file and line, and its symbol shows the call path. |
+| E9 | A config function whose only caller was itself, or a cycle with no outside caller, had its routes dropped. | Routes disappeared from the report. | Free-visit routes are dropped only for functions reachable from a caller outside the expansion graph. |
+
+Malformed input was also tried (attributes without arguments, `web::scope()` and `.route()` without arguments, empty `services![]`, `guard::Method()` without arguments, non-ASCII guard names, empty files, macro-only files): no panics, and syntax errors are reported in `parse_errors`.
+
+### Result
+83 unit tests and 3 CLI tests pass, up from 70 and 3. `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean. The earlier fixtures give unchanged JSON.
+
+### Limitation / Learning
+E7 and E8 widen what counts as evidence, which removes false positives but can hide a finding if a helper or comparison is not really a check (a helper that only logs the role, for example). E8 follows only free-function calls, not method calls (`self.authz.check()`). E3/E4 recognize config and factory functions by type name (`ServiceConfig`, `Scope`, `Resource`, `HttpServiceFactory`), so type aliases are missed. A cycle of config functions with no outside caller reports some routes once per function in the cycle. Without the benchmark, the precision effect of these changes is not measured.
+
+### Next Step
+Same as section 9: rebuild the benchmark dataset and measure precision and recall before and after sections 9 and 10, paying attention to whether E7 and E8 hide any true findings.
