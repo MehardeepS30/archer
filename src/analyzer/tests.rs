@@ -3082,6 +3082,64 @@ fn attribute_routes_registered_through_tuples_and_services_macro_take_the_scope(
 }
 
 #[test]
+fn config_functions_called_directly_inherit_the_callers_scope() {
+    for (name, source) in [
+        (
+            "e3-direct-call",
+            include_str!("../../tests/fixtures/probes/e3_direct_config_call.rs"),
+        ),
+        (
+            "e3-closure",
+            include_str!("../../tests/fixtures/probes/e3_closure_configure.rs"),
+        ),
+    ] {
+        let report = fixture_report(name, source);
+        assert!(!report.routes.is_empty(), "{name}");
+        for route in &report.routes {
+            assert!(route.path.starts_with("/admin/"), "{name}: {}", route.path);
+            assert_eq!(route.scope_prefix, "/admin", "{name}");
+            assert!(
+                has_evidence(
+                    route,
+                    AuthEvidenceKind::AuthorizationMiddleware,
+                    "RequireAdminMiddleware"
+                ),
+                "{name}: {}",
+                route.path
+            );
+        }
+    }
+}
+
+#[test]
+fn functions_returning_a_scope_are_expanded_where_they_are_registered() {
+    let report = fixture_report(
+        "e4-scope-fn",
+        include_str!("../../tests/fixtures/probes/e4_scope_returning_function.rs"),
+    );
+    let paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/admin/users",
+            "/api/admin/orders",
+            "/api/admin/payments"
+        ]
+    );
+    for route in &report.routes {
+        assert!(has_evidence(
+            route,
+            AuthEvidenceKind::AuthorizationMiddleware,
+            "RequireAdminMiddleware"
+        ));
+    }
+}
+
+#[test]
 fn large_peer_groups_are_grouped_without_pairwise_comparison() {
     let routes: String = (0..10_000)
         .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
@@ -3099,4 +3157,34 @@ fn large_peer_groups_are_grouped_without_pairwise_comparison() {
         report.finding_details.is_empty(),
         "2 of 10002 is not dominant"
     );
+}
+
+#[test]
+fn a_route_factory_called_in_two_scopes_registers_in_both() {
+    let report = fixture_report(
+        "e4-two-scopes",
+        "fn users() -> Scope { web::scope(\"/users\").route(\"\", web::get().to(h)) }
+         fn helper(n: u32) -> u32 { n }
+         async fn h() {}
+         fn main() {
+             helper(1);
+             App::new()
+                 .service(web::scope(\"/v1\").service(users()))
+                 .service(web::scope(\"/v2\").wrap(RequireAdminMiddleware).service(users()));
+         }",
+    );
+    // Both expansions share the factory's source position.
+    let mut paths: Vec<_> = report
+        .routes
+        .iter()
+        .map(|route| route.path.as_str())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, ["/v1/users", "/v2/users"]);
+    assert!(route_at(&report, "/v1/users").authorization.is_empty());
+    assert!(has_evidence(
+        route_at(&report, "/v2/users"),
+        AuthEvidenceKind::AuthorizationMiddleware,
+        "RequireAdminMiddleware"
+    ));
 }

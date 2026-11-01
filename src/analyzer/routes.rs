@@ -5,8 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use syn::{
-    Arm, BinOp, Block, Expr, ExprClosure, ExprForLoop, ExprIf, ExprLit, ExprMethodCall, ExprWhile,
-    FnArg, ImplItemFn, Item, ItemFn, ItemMod, Lit, Pat, Signature, Stmt, TraitItemFn,
+    Arm, BinOp, Block, Expr, ExprCall, ExprClosure, ExprForLoop, ExprIf, ExprLit, ExprMethodCall,
+    ExprWhile, FnArg, ImplItemFn, Item, ItemFn, ItemMod, Lit, Pat, ReturnType, Signature, Stmt,
+    TraitItemFn, Type, TypeParamBound,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -338,6 +339,19 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         self.with_locals(signature_bindings(&node.sig), |visitor| {
             visit::visit_trait_item_fn(visitor, node)
         });
+    }
+
+    /// A direct call to a function that registers or builds routes, such as
+    /// `admin::config(cfg)` or `.service(admin_scope())`, is expanded at the
+    /// call, like `.configure(f)`: its routes take the caller's scope prefix
+    /// and middleware.
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Some(definition) = self.named_definition(&node.func)
+            && is_route_factory(&self.index.items[definition].sig)
+        {
+            self.expand_configure(definition);
+        }
+        visit::visit_expr_call(self, node);
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
@@ -844,6 +858,41 @@ pub(crate) fn pattern_bindings(pat: &Pat, names: &mut HashSet<String>) {
         Pat::Type(pat) => pattern_bindings(&pat.pat, names),
         _ => {}
     }
+}
+
+/// Whether a function registers routes on a `ServiceConfig` argument, or
+/// returns a `Scope`, `Resource`, or `impl HttpServiceFactory` for
+/// `.service(...)`. Matched by type name, so aliases are not recognized.
+pub(crate) fn is_route_factory(signature: &Signature) -> bool {
+    fn last_segment_is(ty: &Type, names: &[&str]) -> bool {
+        match ty {
+            Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| names.iter().any(|name| segment.ident == name)),
+            Type::Reference(reference) => last_segment_is(&reference.elem, names),
+            Type::Paren(paren) => last_segment_is(&paren.elem, names),
+            Type::Group(group) => last_segment_is(&group.elem, names),
+            Type::ImplTrait(bounds) => bounds.bounds.iter().any(|bound| {
+                matches!(bound, TypeParamBound::Trait(bound)
+                if bound.path.segments.last().is_some_and(|segment| {
+                    names.iter().any(|name| segment.ident == name)
+                }))
+            }),
+            _ => false,
+        }
+    }
+    let configures = signature.inputs.iter().any(|input| {
+        matches!(input, FnArg::Typed(argument) if last_segment_is(&argument.ty, &["ServiceConfig"]))
+    });
+    let builds = match &signature.output {
+        ReturnType::Type(_, ty) => {
+            last_segment_is(ty, &["Scope", "Resource", "HttpServiceFactory"])
+        }
+        ReturnType::Default => false,
+    };
+    configures || builds
 }
 
 pub(crate) fn signature_bindings(signature: &Signature) -> HashSet<String> {
