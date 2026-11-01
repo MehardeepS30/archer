@@ -10,7 +10,7 @@ mod tests;
 
 pub use model::*;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -64,10 +64,18 @@ pub fn analyze_repository_with(root: &Path, options: &AnalysisOptions) -> Result
 
     let mut parsed_files = Vec::new();
     for file_path in rust_files {
-        let source = fs::read_to_string(&file_path)
-            .with_context(|| format!("failed to read {}", file_path.display()))?;
-
         files_scanned += 1;
+        let source = match fs::read_to_string(&file_path) {
+            Ok(source) => source,
+            Err(error) => {
+                parse_errors.push(format!(
+                    "{}: failed to read: {}",
+                    file_path.display(),
+                    error
+                ));
+                continue;
+            }
+        };
         let syntax = match syn::parse_file(&source) {
             Ok(syntax) => syntax,
             Err(error) => {

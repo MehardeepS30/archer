@@ -2517,3 +2517,21 @@ fn build_output_and_test_directories_are_not_scanned() {
     assert_eq!(report.files_scanned, 2);
     assert_eq!(report.routes.len(), 6);
 }
+
+#[test]
+fn unreadable_file_is_reported_and_skipped() {
+    let repo = TempRepo::new(
+        "a7-unreadable",
+        &[(
+            "valid.rs",
+            "fn configure(cfg: &mut web::ServiceConfig) { cfg.route(\"/users\", web::get()); }",
+        )],
+    );
+    fs::write(repo.0.join("latin1.rs"), b"// caf\xe9\nfn main() {}\n").unwrap();
+
+    let report = repo.analyze();
+    assert_eq!(report.parse_errors.len(), 1);
+    assert!(report.parse_errors[0].contains("latin1.rs"));
+    assert!(report.parse_errors[0].contains("failed to read"));
+    assert_eq!(report.routes.len(), 1);
+}
