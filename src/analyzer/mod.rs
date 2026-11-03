@@ -186,6 +186,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
                 evidence.requirements.clear();
             }
         }
+        route.requirement = Requirement::of(route);
     }
 
     let (peer_groups, invariants, finding_details, findings) =

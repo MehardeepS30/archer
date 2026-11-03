@@ -199,27 +199,32 @@ pub(crate) fn build_analysis_layers_with(
                 }
             }
         } else if expected == EvidenceTier::Privilege && tier == EvidenceTier::Privilege {
-            let requirements = route.privilege_requirements();
-            let missing = entries.iter().copied().find(|(group, _, _)| {
-                group
-                    .dominant_requirement
-                    .as_deref()
-                    .is_some_and(|required| {
-                        !requirements.is_empty() && !requirements.contains(&required)
-                    })
+            // Compare the role sets, not just the tier.
+            let requirement = Requirement::of(route);
+            let mismatch = entries.iter().copied().find_map(|(group, key, id)| {
+                role_mismatch(route, &requirement, group, options).map(|category| (category, group, key, id))
             });
-            let Some((group, key, id)) = missing else {
+            let Some((category, group, key, id)) = mismatch else {
                 continue;
             };
-            finding_details.push(finding(
-                route,
-                FindingCategory::DifferentAuthorization,
-                expected,
-                group,
-                key,
-                id,
-                options,
-            ));
+            let mut reported = finding(route, category, expected, group, key, id, options);
+            if category == FindingCategory::WeakerAuthorization {
+                let extra: Vec<String> = requirement
+                    .roles
+                    .iter()
+                    .filter(|role| !group.dominant_roles.contains(role))
+                    .map(|role| format!("`{role}`"))
+                    .collect();
+                reported.rationale = format!(
+                    "Admits any of {} where its {} peers under {} admit only {}; it also lets in {}.",
+                    requirement.roles.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", "),
+                    key.class,
+                    key.prefix,
+                    group.dominant_roles.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", "),
+                    extra.join(", "),
+                );
+            }
+            finding_details.push(reported);
             continue;
         } else {
             continue;
@@ -508,6 +513,11 @@ pub(crate) struct GroupStats<'a> {
     /// A requirement carried by a dominant share of the group's
     /// privilege-tier routes that name one.
     pub(crate) dominant_requirement: Option<String>,
+    /// Every role or permission that a dominant share of the group's
+    /// role-naming routes requires, sorted.
+    pub(crate) dominant_roles: Vec<String>,
+    /// Most of those routes take their roles from one allow-list.
+    pub(crate) roles_any_of: bool,
     /// Unrecognized components most of the group carries, such as a
     /// scope-wide middleware. They cannot explain why one route differs.
     pub(crate) common_unknowns: Vec<String>,
@@ -538,6 +548,19 @@ impl<'a> GroupStats<'a> {
             .first()
             .filter(|(_, count)| is_dominant_weight(*count, naming, options))
             .map(|(requirement, _)| requirement.to_string());
+        let mut dominant_roles: Vec<String> = ranked
+            .iter()
+            .filter(|(_, count)| is_dominant_weight(*count, naming, options))
+            .map(|(requirement, _)| requirement.to_string())
+            .collect();
+        dominant_roles.sort();
+        let any_of: f64 = peers
+            .iter()
+            .zip(&weights)
+            .filter(|(peer, _)| peer.best_tier() == EvidenceTier::Privilege && Requirement::of(peer).roles_any_of)
+            .map(|(_, weight)| weight)
+            .sum();
+        let roles_any_of = naming > 0.0 && any_of * 2.0 > naming;
         let total: f64 = weights.iter().sum();
         let mut unknown_counts: HashMap<&str, f64> = HashMap::new();
         for (peer, weight) in peers.iter().zip(&weights) {
@@ -562,6 +585,8 @@ impl<'a> GroupStats<'a> {
             peers,
             expected,
             dominant_requirement,
+            dominant_roles,
+            roles_any_of,
             common_unknowns,
             authorized,
         }
@@ -646,6 +671,63 @@ fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &Analysi
         })
 }
 
+/// How a privileged route's roles differ from its group's, if they do:
+/// an allow-list that admits roles the peers do not is weaker; lacking the
+/// role the peers lead with is different. A route that requires more than
+/// its peers, or allows a subset of their allow-list, is stricter and is
+/// not reported.
+fn role_mismatch(
+    route: &Route,
+    requirement: &Requirement,
+    group: &GroupStats,
+    options: &AnalysisOptions,
+) -> Option<FindingCategory> {
+    if requirement.roles.is_empty() || group.dominant_roles.is_empty() {
+        return None;
+    }
+    let missing = group
+        .dominant_roles
+        .iter()
+        .any(|role| !requirement.roles.contains(role));
+    let extra = requirement
+        .roles
+        .iter()
+        .any(|role| !group.dominant_roles.contains(role));
+    if requirement.roles_any_of && extra && !missing {
+        // Supported by other routes alone: peers that name roles and admit
+        // none of the extra ones.
+        let naming: Vec<Requirement> = group
+            .peers
+            .iter()
+            .filter(|peer| route_identity(peer) != route_identity(route))
+            .map(|peer| Requirement::of(peer))
+            .filter(|peer| !peer.roles.is_empty())
+            .collect();
+        let narrower = naming
+            .iter()
+            .filter(|peer| {
+                peer.roles
+                    .iter()
+                    .all(|role| !requirement.roles.contains(role) || group.dominant_roles.contains(role))
+            })
+            .count();
+        if is_dominant_weight(narrower as f64, naming.len() as f64, options) {
+            return Some(FindingCategory::WeakerAuthorization);
+        }
+        return None;
+    }
+    // Conjunctive checks are compared on the group's leading requirement
+    // only: routes that name several checks rarely name the same set.
+    let lacks_leading = group
+        .dominant_requirement
+        .as_ref()
+        .is_some_and(|required| !requirement.roles.contains(required));
+    if lacks_leading && !(group.roles_any_of && !extra) {
+        return Some(FindingCategory::DifferentAuthorization);
+    }
+    None
+}
+
 /// Unanalyzed protection that can wrap many routes alike: an unrecognized
 /// guard or middleware, or middleware that checks only some paths. When most
 /// of a group carries it, it does not explain why one route falls short.
@@ -696,14 +778,19 @@ fn finding(
         FindingCategory::DifferentAuthorization => (
             Severity::Medium,
             format!(
-                "Checks {} where {compared} require `{}`.",
+                "Checks {} where {compared} require {}.",
                 route
                     .privilege_requirements()
                     .iter()
                     .map(|requirement| format!("`{requirement}`"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                group.dominant_requirement.as_deref().unwrap_or("?")
+                group
+                    .dominant_roles
+                    .iter()
+                    .map(|requirement| format!("`{requirement}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
             ),
         ),
         FindingCategory::InconsistentRegistration => (

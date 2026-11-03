@@ -35,6 +35,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
         line: 1,
         file: PathBuf::from("fixture.rs"),
         unverified: Vec::new(),
+        requirement: Requirement::default(),
         origin: RouteOrigin::default(),
     }
 }
@@ -791,6 +792,7 @@ fn access_token_and_access_log_helpers_are_not_authorization() {
         line: 1,
         file: PathBuf::from("access.rs"),
         unverified: Vec::new(),
+        requirement: Requirement::default(),
         origin: RouteOrigin::default(),
     };
     assert!(!token_route.is_authorized());
@@ -1221,6 +1223,7 @@ fn identity_extraction_is_not_authorization() {
         line: 1,
         file: PathBuf::from("identity.rs"),
         unverified: Vec::new(),
+        requirement: Requirement::default(),
         origin: RouteOrigin::default(),
     };
     assert!(!route.is_authorized());
@@ -4067,5 +4070,38 @@ fn middleware_that_checks_only_some_paths_is_unverified() {
             "GET".to_string(),
             "/portal/private/drafts".to_string()
         )]
+    );
+}
+
+#[test]
+fn role_lists_and_ownership_are_compared_as_fields() {
+    let report = drift_fixture(
+        "f29",
+        include_str!("../../tests/fixtures/probes/drift/f29_role_lists_and_ownership.rs"),
+    );
+    let requirement = |method: &str, path: &str| -> Requirement {
+        report
+            .routes
+            .iter()
+            .find(|route| route.method == method && route.path == path)
+            .unwrap_or_else(|| panic!("no route {method} {path}"))
+            .requirement
+            .clone()
+    };
+    let daily = requirement("GET", "/reports/daily");
+    assert_eq!(daily.roles, ["admin"]);
+    assert!(daily.authenticated && !daily.roles_any_of);
+    let yearly = requirement("GET", "/reports/yearly");
+    assert_eq!(yearly.roles, ["admin", "viewer"]);
+    assert!(yearly.roles_any_of);
+    assert!(requirement("PUT", "/notes/{id}").ownership);
+    assert!(requirement("PATCH", "/notes/{id}").ownership);
+    assert!(!requirement("DELETE", "/notes/{id}").ownership);
+    assert_eq!(
+        reported(&report),
+        [
+            (FindingCategory::MissingAuthorization, "DELETE".to_string(), "/notes/{id}".to_string()),
+            (FindingCategory::WeakerAuthorization, "GET".to_string(), "/reports/yearly".to_string()),
+        ]
     );
 }

@@ -130,9 +130,61 @@ pub struct Route {
     /// missing authorization, only as unverified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unverified: Vec<String>,
+    /// What the route's evidence requires of a caller, field by field.
+    pub requirement: Requirement,
     /// Extraction bookkeeping that is not part of the report.
     #[serde(skip)]
     pub(crate) origin: RouteOrigin,
+}
+
+/// What a route requires of its caller, read from its evidence. Peers are
+/// compared on these fields; `EvidenceTier` is their summary for ranking.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct Requirement {
+    /// The caller must be identified.
+    pub authenticated: bool,
+    /// Roles or permissions a check names, sorted.
+    pub roles: Vec<String>,
+    /// The roles come from one allow-list (`allowed_roles([Admin, Editor])`):
+    /// any one of them admits the caller.
+    pub roles_any_of: bool,
+    /// The handler compares a record's owner with the caller.
+    pub ownership: bool,
+    /// Some protection could not be evaluated. It never meets a peer's
+    /// requirement; it only turns a shortfall into "review manually".
+    pub unverified: bool,
+}
+
+impl Requirement {
+    pub fn of(route: &Route) -> Self {
+        let tier = route.best_tier();
+        let roles: Vec<String> = route
+            .privilege_requirements()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let roles_any_of = roles.len() > 1
+            && route.authorization.iter().any(|evidence| {
+                evidence.requirements.len() > 1
+                    && evidence
+                        .symbol
+                        .as_deref()
+                        .is_some_and(|symbol| symbol.starts_with(".wrap") || symbol.starts_with(".guard"))
+            });
+        Self {
+            authenticated: tier >= EvidenceTier::Identity,
+            roles,
+            roles_any_of,
+            ownership: route
+                .authorization
+                .iter()
+                .any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck),
+            unverified: !route.unverified.is_empty()
+                || route.authorization.iter().any(|evidence| {
+                    matches!(evidence.kind, AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated)
+                }),
+        }
+    }
 }
 
 /// Where a route was found, for ordering and for later extraction passes.

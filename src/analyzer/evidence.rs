@@ -656,6 +656,44 @@ pub(crate) struct AuthEvidenceVisitor {
     in_returned_value: bool,
     capture: Option<Captured>,
     bound: HashMap<String, Captured>,
+    /// Bindings that hold the requesting caller's identity, read from a call
+    /// named for it (`let username = get_username_from_session(&s)`).
+    callers: HashSet<String>,
+}
+
+/// Words of a call's name that make its result the caller's identity.
+const CALLER_SOURCE_WORDS: [&str; 11] = [
+    "username", "userid", "uid", "identity", "principal", "claims", "session", "current",
+    "caller", "subject", "whoami",
+];
+
+/// Whether an expression reads the caller's identity from a call named for
+/// it, through `?`, `.unwrap()` and similar.
+fn reads_caller_identity(expr: &Expr) -> bool {
+    let name = match strip_conversions(expr) {
+        Expr::Try(attempt) => return reads_caller_identity(&attempt.expr),
+        Expr::Await(awaited) => return reads_caller_identity(&awaited.base),
+        Expr::MethodCall(call)
+            if ["unwrap_or", "unwrap_or_default", "unwrap_or_else", "expect", "ok_or", "ok"]
+                .iter()
+                .any(|method| call.method == method) =>
+        {
+            return reads_caller_identity(&call.receiver);
+        }
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(path) => path.path.segments.last().map(|segment| segment.ident.to_string()),
+            _ => None,
+        },
+        Expr::MethodCall(call) => Some(call.method.to_string()),
+        _ => None,
+    };
+    name.is_some_and(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower
+            .split('_')
+            .any(|word| CALLER_SOURCE_WORDS.contains(&word))
+            || lower.contains("user_id")
+    })
 }
 
 impl AuthEvidenceVisitor {
@@ -672,7 +710,22 @@ impl AuthEvidenceVisitor {
             in_returned_value: false,
             capture: None,
             bound: HashMap::new(),
+            callers: HashSet::new(),
         }
+    }
+
+    /// A binding that holds the caller's identity.
+    fn is_caller_binding(&self, expr: &Expr) -> bool {
+        matches!(strip_conversions(expr), Expr::Path(path)
+            if path.path.get_ident().is_some_and(|ident| self.callers.contains(&ident.to_string())))
+    }
+
+    /// A field of a record that is not the caller (`article.creater`): what
+    /// an ownership check compares with the caller's identity.
+    fn record_field(&self, expr: &Expr) -> bool {
+        matches!(strip_conversions(expr), Expr::Field(field)
+            if matches!(&*field.base, Expr::Path(base)
+                if base.path.get_ident().is_some_and(|ident| !self.callers.contains(&ident.to_string()))))
     }
 
     fn with_use(&mut self, use_: Use, visit: impl FnOnce(&mut Self)) {
@@ -805,6 +858,9 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         }
         let mut names = HashSet::new();
         pattern_bindings(&node.pat, &mut names);
+        if reads_caller_identity(&init.expr) {
+            self.callers.extend(names.iter().cloned());
+        }
         let previous = self.capture.replace(Captured::default());
         self.with_use(Use::Value, |visitor| visitor.visit_expr(&init.expr));
         let captured = std::mem::replace(&mut self.capture, previous).unwrap_or_default();
@@ -1175,7 +1231,13 @@ impl AuthEvidenceVisitor {
         if let [left, right] = operands.as_slice()
             && let Some(owned) = [(left, right), (right, left)]
                 .into_iter()
-                .find(|(owned, caller)| ownership_operand(owned) && caller_operand(caller))
+                .find(|(owned, caller)| {
+                    (ownership_operand(owned) && caller_operand(caller))
+                        // `article.creater == username`, where `username`
+                        // was read as the caller's identity: whatever the
+                        // field is called, the record is held to its owner.
+                        || (self.record_field(owned) && self.is_caller_binding(caller))
+                })
                 .map(|(owned, _)| *owned)
         {
             let written = owned.to_token_stream().to_string().replace(' ', "");
@@ -1987,6 +2049,79 @@ pub(crate) fn keys_in_expr(expr: &Expr) -> Vec<String> {
     let mut visitor = KeyVisitor::default();
     visitor.visit_expr(expr);
     visitor.keys
+}
+
+/// Words of a constructor or builder method that take a role list:
+/// `allowed_roles`, `with_permissions`, `require_scope`.
+const ROLE_LIST_WORDS: [&str; 7] =
+    ["role", "roles", "permission", "permissions", "scope", "scopes", "grant"];
+
+/// Roles a guard or middleware is constructed with:
+/// `RequireAuth::allowed_roles(vec![UserRole::Admin])`,
+/// `RoleGuard::new(&["editor", "admin"])`. Role-typed variants count
+/// anywhere in the expression; string literals count only as arguments of a
+/// call named for roles or permissions. `vec![..]` and array arguments are
+/// read element by element.
+pub(crate) fn component_roles(expr: &Expr) -> Vec<String> {
+    #[derive(Default)]
+    struct Roles {
+        keys: Vec<String>,
+        in_role_call: usize,
+    }
+    fn names_roles(name: &str) -> bool {
+        let words = if name.contains('_') || !name.chars().any(char::is_uppercase) {
+            name.to_ascii_lowercase().split('_').map(str::to_owned).collect()
+        } else {
+            camel_case_words(name)
+        };
+        words.iter().any(|word| ROLE_LIST_WORDS.contains(&word.as_str()))
+    }
+    impl<'ast> Visit<'ast> for Roles {
+        fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+            if self.in_role_call > 0 {
+                self.keys.extend(literal_key(&node.value()));
+            }
+        }
+        fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+            self.keys.extend(variant_key(&node.path));
+        }
+        fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+            let role_call = matches!(&*node.func, Expr::Path(path)
+                if path.path.segments.iter().any(|segment| names_roles(&segment.ident.to_string())));
+            self.in_role_call += usize::from(role_call);
+            for argument in &node.args {
+                self.visit_expr(argument);
+            }
+            self.in_role_call -= usize::from(role_call);
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            self.visit_expr(&node.receiver);
+            let role_call = names_roles(&node.method.to_string());
+            self.in_role_call += usize::from(role_call);
+            for argument in &node.args {
+                self.visit_expr(argument);
+            }
+            self.in_role_call -= usize::from(role_call);
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if node.mac.path.is_ident("vec") {
+                if let Ok(items) = node
+                    .mac
+                    .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                {
+                    for item in &items {
+                        self.visit_expr(item);
+                    }
+                }
+            }
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+    }
+    let mut roles = Roles::default();
+    roles.visit_expr(expr);
+    roles.keys.sort();
+    roles.keys.dedup();
+    roles.keys
 }
 
 /// `Role::Admin`, `UserRole::Admin`, `Permission::WriteUsers`: the variant

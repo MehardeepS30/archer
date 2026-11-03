@@ -499,6 +499,7 @@ impl<'a> RouteVisitor<'a> {
             line: path_line,
             file: self.file.clone(),
             unverified,
+            requirement: Requirement::default(),
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
                 attribute: None,
@@ -749,6 +750,7 @@ impl RouteVisitor<'_> {
                 line: path_literal.span().start().line,
                 file: self.file.clone(),
                 unverified: Vec::new(),
+                requirement: Requirement::default(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),
@@ -1115,8 +1117,17 @@ pub(crate) fn configuration_call_evidence(
                 if authorizes {
                     requirements = name_keys(&name);
                 }
+                // Built with a role list, an authentication component also
+                // enforces those roles.
+                let roles = if authorizes || authenticates { component_roles(arg) } else { Vec::new() };
+                let role_list = !roles.is_empty();
+                if role_list {
+                    requirements = roles;
+                }
                 evidence.push(AuthEvidence {
-                    kind: if authorizes {
+                    kind: if role_list {
+                        AuthEvidenceKind::RoleCheck
+                    } else if authorizes {
                         AuthEvidenceKind::AuthorizationMiddleware
                     } else if authenticates {
                         AuthEvidenceKind::IdentityExtraction
@@ -1144,18 +1155,35 @@ pub(crate) fn configuration_call_evidence(
         requirements.dedup();
         // Authentication-only guards and middleware establish who the caller
         // is, not what they may do.
+        let roles = component_roles(arg);
         let (kind, strength) = match class {
             RouteConfigurationName::Authorization => {
+                requirements.extend(roles.iter().cloned());
+                requirements.sort();
+                requirements.dedup();
                 (authorization_kind.clone(), authorization_strength.clone())
+            }
+            // `RequireAuth::allowed_roles(vec![Role::Admin])`: built with a
+            // role list, it enforces those roles, not only a login.
+            RouteConfigurationName::Authentication if !roles.is_empty() => {
+                requirements = roles.clone();
+                (AuthEvidenceKind::RoleCheck, AuthStrength::Medium)
             }
             RouteConfigurationName::Authentication => {
                 (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
             }
         };
+        // A role list read from the arguments marks the evidence as the
+        // component's allow-list (see `Requirement::roles_any_of`).
+        let symbol = if kind == AuthEvidenceKind::RoleCheck && requirements.len() > 1 {
+            format!(".{}({})", method.method, identifier.name)
+        } else {
+            identifier.name.clone()
+        };
         evidence.push(AuthEvidence {
             kind,
             mechanism: identifier.name.clone(),
-            symbol: Some(identifier.name),
+            symbol: Some(symbol),
             file: file.to_path_buf(),
             line: identifier.line,
             handler: handler.map(str::to_owned),
