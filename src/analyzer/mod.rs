@@ -3,6 +3,7 @@
 mod drift;
 mod evidence;
 mod handlers;
+mod middleware;
 mod model;
 mod routes;
 #[cfg(test)]
@@ -140,6 +141,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
         crates,
     );
+    middleware::index_path_conditional(parsed_files.iter().map(|(_, _, syntax)| syntax));
     let mut registrations = Vec::new();
     let mut warnings = Vec::new();
     let mut configured = Vec::new();

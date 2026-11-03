@@ -1080,6 +1080,24 @@ pub(crate) fn configuration_call_evidence(
         return;
     };
     for arg in &method.args {
+        // Middleware defined in the crate that checks the caller only for
+        // some request paths: which routes it protects is decided at
+        // runtime, so it does not count as protection (fail closed).
+        if method.method != "guard" {
+            if let Some(name) = super::middleware::path_conditional_component(arg) {
+                evidence.push(AuthEvidence {
+                    kind: AuthEvidenceKind::Delegated,
+                    mechanism: format!("`{name}` checks the caller only for some request paths, decided at runtime"),
+                    symbol: Some(format!(".{}({name})", method.method)),
+                    file: file.to_path_buf(),
+                    line: arg.span().start().line,
+                    handler: handler.map(str::to_owned),
+                    strength: AuthStrength::Weak,
+                    requirements: Vec::new(),
+                });
+                continue;
+            }
+        }
         let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
             // Neither authorization, authentication, nor a known harmless
             // component: it may protect the route, so it is kept as unknown.

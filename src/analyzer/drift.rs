@@ -543,8 +543,7 @@ impl<'a> GroupStats<'a> {
         for (peer, weight) in peers.iter().zip(&weights) {
             let mut seen = HashSet::new();
             for evidence in &peer.authorization {
-                if evidence.kind == AuthEvidenceKind::Unknown
-                    && seen.insert(evidence.mechanism.as_str())
+                if is_shared_unknown(evidence) && seen.insert(evidence.mechanism.as_str())
                 {
                     *unknown_counts
                         .entry(evidence.mechanism.as_str())
@@ -636,14 +635,27 @@ fn capitalized(text: &str) -> String {
 /// could not be analyzed.
 fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &AnalysisOptions) -> bool {
     !route.unverified.is_empty()
-        || route
-            .authorization
-            .iter()
-            .any(|evidence| evidence.kind == AuthEvidenceKind::Delegated)
         || route.authorization.iter().any(|evidence| {
-            evidence.kind == AuthEvidenceKind::Unknown
-                && !group.common_unknowns.contains(&evidence.mechanism)
+            match evidence.kind {
+                AuthEvidenceKind::Unknown => {}
+                AuthEvidenceKind::Delegated if is_shared_unknown(evidence) => {}
+                AuthEvidenceKind::Delegated => return true,
+                _ => return false,
+            }
+            !group.common_unknowns.contains(&evidence.mechanism)
         })
+}
+
+/// Unanalyzed protection that can wrap many routes alike: an unrecognized
+/// guard or middleware, or middleware that checks only some paths. When most
+/// of a group carries it, it does not explain why one route falls short.
+fn is_shared_unknown(evidence: &AuthEvidence) -> bool {
+    evidence.kind == AuthEvidenceKind::Unknown
+        || (evidence.kind == AuthEvidenceKind::Delegated
+            && evidence
+                .symbol
+                .as_deref()
+                .is_some_and(|symbol| symbol.starts_with(".wrap")))
 }
 
 fn finding(

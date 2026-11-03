@@ -4033,3 +4033,39 @@ fn unregistered_attribute_routes_are_left_out_with_a_warning() {
     assert!(report.warnings.iter().any(|warning| warning.contains("never registered")));
     assert_eq!(reported(&report), []);
 }
+
+#[test]
+fn middleware_that_checks_only_some_paths_is_unverified() {
+    let report = drift_fixture(
+        "f28",
+        include_str!("../../tests/fixtures/probes/drift/f28_path_conditional_middleware.rs"),
+    );
+    let kinds = |path: &str| -> Vec<AuthEvidenceKind> {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap_or_else(|| panic!("no route {path}"))
+            .authorization
+            .iter()
+            .map(|evidence| evidence.kind.clone())
+            .collect()
+    };
+    // Evaluated and unconditional: authentication, as before.
+    assert_eq!(kinds("/members/profile"), [AuthEvidenceKind::IdentityExtraction]);
+    // Branches on the request path: not counted as protection.
+    assert_eq!(kinds("/portal/private/drafts"), [AuthEvidenceKind::Delegated]);
+    assert_eq!(kinds("/board/posts"), [AuthEvidenceKind::Delegated]);
+    assert_eq!(kinds("/inbox/messages"), [AuthEvidenceKind::Delegated]);
+    // The draft route falls short of its peers' handler-level identity. The
+    // middleware all three share does not explain the difference, so it is
+    // reported as missing, not covered by the middleware.
+    assert_eq!(
+        reported(&report),
+        [(
+            FindingCategory::MissingAuthentication,
+            "GET".to_string(),
+            "/portal/private/drafts".to_string()
+        )]
+    );
+}
