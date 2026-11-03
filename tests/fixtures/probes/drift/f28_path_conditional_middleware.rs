@@ -32,6 +32,24 @@ impl<S> Service<ServiceRequest> for AuthMiddleware<S> {
     }
 }
 
+// The path test sits in a helper that takes the request.
+pub struct Authentication;
+impl<S> Transform<S, ServiceRequest> for Authentication {
+    type Transform = AuthenticationMiddleware<S>;
+}
+pub struct AuthenticationMiddleware<S> { service: S }
+impl<S> Service<ServiceRequest> for AuthenticationMiddleware<S> {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        if should_skip_auth(&req) {
+            return self.service.call(req);
+        }
+        verify_token(req, &self.service)
+    }
+}
+fn should_skip_auth(req: &ServiceRequest) -> bool {
+    SKIPPED.iter().any(|path| req.path() == *path)
+}
+
 // A function middleware with the same shape.
 async fn auth_middleware(req: ServiceRequest, next: Next) -> Result<ServiceResponse, Error> {
     match req.path() {
@@ -52,6 +70,9 @@ fn app() {
             .route("/private/notes", web::get().to(notes))
             .route("/private/files", web::get().to(files))
             .route("/private/drafts", web::get().to(drafts)))
+        .service(web::scope("/desk")
+            .wrap(Authentication)
+            .route("/tickets", web::get().to(tickets)))
         .service(web::scope("/board")
             .wrap(from_fn(auth_middleware))
             .route("/posts", web::get().to(posts)))
@@ -69,4 +90,5 @@ async fn notes(user: Identity) {}
 async fn files(user: Identity) {}
 async fn drafts() {}
 async fn posts() {}
+async fn tickets() {}
 async fn messages() {}

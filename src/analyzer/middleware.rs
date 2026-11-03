@@ -28,14 +28,23 @@ thread_local! {
     /// request path. Set once per analysis, before routes are extracted, on
     /// the analysis thread.
     static PATH_CONDITIONAL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Request-taking helpers that read the path, for `wrap_fn` closures.
+    static PATH_READERS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Records the path-conditional components of the files about to be analyzed.
 pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn::File>) {
+    let files: Vec<&syn::File> = files.into_iter().collect();
+    // Helpers that read the request path (`fn should_skip_auth(req:
+    // &ServiceRequest) -> bool`): a condition calling one branches on it.
+    let mut readers: HashSet<String> = HashSet::new();
+    for file in &files {
+        collect_readers(&file.items, &mut readers);
+    }
     let mut transforms: Vec<(String, String)> = Vec::new();
     let mut conditional: HashSet<String> = HashSet::new();
-    for file in files {
-        collect(&file.items, &mut transforms, &mut conditional);
+    for file in &files {
+        collect(&file.items, &readers, &mut transforms, &mut conditional);
     }
     // `impl Transform for AuthService { type Transform = AuthMiddleware<S>; }`
     // makes `AuthService` as conditional as the service it builds.
@@ -49,6 +58,7 @@ pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn
         }
     }
     PATH_CONDITIONAL.with(|set| *set.borrow_mut() = conditional);
+    PATH_READERS.with(|set| *set.borrow_mut() = readers);
 }
 
 /// The first component named in a `.wrap(..)` argument whose checks depend
@@ -86,20 +96,41 @@ pub(crate) fn path_conditional_component(arg: &Expr) -> Option<String> {
     })
 }
 
-fn collect(items: &[Item], transforms: &mut Vec<(String, String)>, conditional: &mut HashSet<String>) {
+/// Functions that take the request and read its path anywhere in their body.
+fn collect_readers(items: &[Item], readers: &mut HashSet<String>) {
+    let reads = |signature: &syn::Signature, block: &Block| {
+        takes_request(signature) && {
+            let branches = PathBranches::default();
+            let mut found = false;
+            struct Any<'a>(&'a PathBranches, &'a mut bool);
+            impl<'ast> Visit<'ast> for Any<'_> {
+                fn visit_expr(&mut self, expr: &'ast Expr) {
+                    if self.0.reads_path(expr) {
+                        *self.1 = true;
+                    }
+                }
+            }
+            Any(&branches, &mut found).visit_block(block);
+            found
+        }
+    };
     for item in items {
         match item {
-            Item::Impl(item) => collect_impl(item, transforms, conditional),
-            Item::Fn(function) => {
-                // `from_fn(check)` / `HttpAuthentication::bearer(validator)`:
-                // a free function that receives the request.
-                if takes_service_request(&function.sig) && decides_by_path(&function.block) {
-                    conditional.insert(function.sig.ident.to_string());
+            Item::Fn(function) if reads(&function.sig, &function.block) => {
+                readers.insert(function.sig.ident.to_string());
+            }
+            Item::Impl(item) => {
+                for member in &item.items {
+                    if let ImplItem::Fn(function) = member
+                        && reads(&function.sig, &function.block)
+                    {
+                        readers.insert(function.sig.ident.to_string());
+                    }
                 }
             }
             Item::Mod(module) => {
                 if let Some((_, items)) = &module.content {
-                    collect(items, transforms, conditional);
+                    collect_readers(items, readers);
                 }
             }
             _ => {}
@@ -107,7 +138,38 @@ fn collect(items: &[Item], transforms: &mut Vec<(String, String)>, conditional: 
     }
 }
 
-fn collect_impl(item: &ItemImpl, transforms: &mut Vec<(String, String)>, conditional: &mut HashSet<String>) {
+fn collect(
+    items: &[Item],
+    readers: &HashSet<String>,
+    transforms: &mut Vec<(String, String)>,
+    conditional: &mut HashSet<String>,
+) {
+    for item in items {
+        match item {
+            Item::Impl(item) => collect_impl(item, readers, transforms, conditional),
+            Item::Fn(function) => {
+                // `from_fn(check)` / `HttpAuthentication::bearer(validator)`:
+                // a free function that receives the request.
+                if takes_service_request(&function.sig) && decides_by_path(&function.block, readers) {
+                    conditional.insert(function.sig.ident.to_string());
+                }
+            }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect(items, readers, transforms, conditional);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_impl(
+    item: &ItemImpl,
+    readers: &HashSet<String>,
+    transforms: &mut Vec<(String, String)>,
+    conditional: &mut HashSet<String>,
+) {
     let Some((trait_path, _)) = &item.trait_ else {
         return;
     };
@@ -132,7 +194,7 @@ fn collect_impl(item: &ItemImpl, transforms: &mut Vec<(String, String)>, conditi
         "Service" => {
             for member in &item.items {
                 if let ImplItem::Fn(function) = member {
-                    if function.sig.ident == "call" && decides_by_path(&function.block) {
+                    if function.sig.ident == "call" && decides_by_path(&function.block, readers) {
                         conditional.insert(self_name.clone());
                     }
                 }
@@ -151,6 +213,14 @@ fn type_name(ty: &Type) -> Option<String> {
     }
 }
 
+fn takes_request(signature: &syn::Signature) -> bool {
+    signature.inputs.iter().any(|input| match input {
+        FnArg::Typed(typed) => type_name(&typed.ty)
+            .is_some_and(|name| name == "ServiceRequest" || name == "HttpRequest"),
+        FnArg::Receiver(_) => false,
+    })
+}
+
 fn takes_service_request(signature: &syn::Signature) -> bool {
     signature.inputs.iter().any(|input| match input {
         FnArg::Typed(typed) => type_name(&typed.ty).is_some_and(|name| name == "ServiceRequest"),
@@ -161,14 +231,15 @@ fn takes_service_request(signature: &syn::Signature) -> bool {
 /// Whether a body branches on the request path: an `if`, `match`, or match
 /// guard whose condition reads `req.path()` or similar, directly or through
 /// a binding initialized from it.
-fn decides_by_path(block: &Block) -> bool {
-    let mut visitor = PathBranches::default();
+fn decides_by_path(block: &Block, readers: &HashSet<String>) -> bool {
+    let mut visitor = PathBranches { readers: readers.clone(), ..PathBranches::default() };
     visitor.visit_block(block);
     visitor.found
 }
 
 fn decides_by_path_expr(expr: &Expr) -> bool {
-    let mut visitor = PathBranches::default();
+    let readers = PATH_READERS.with(|set| set.borrow().clone());
+    let mut visitor = PathBranches { readers, ..PathBranches::default() };
     visitor.visit_expr(expr);
     visitor.found
 }
@@ -176,6 +247,7 @@ fn decides_by_path_expr(expr: &Expr) -> bool {
 #[derive(Default)]
 struct PathBranches {
     bindings: HashSet<String>,
+    readers: HashSet<String>,
     found: bool,
 }
 
@@ -183,14 +255,29 @@ impl PathBranches {
     fn reads_path(&self, expr: &Expr) -> bool {
         struct Reads<'a> {
             bindings: &'a HashSet<String>,
+            readers: &'a HashSet<String>,
             found: bool,
         }
         impl<'ast> Visit<'ast> for Reads<'_> {
             fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-                if PATH_ACCESSORS.iter().any(|name| call.method == name) {
+                if PATH_ACCESSORS.iter().any(|name| call.method == name)
+                    || self.readers.contains(&call.method.to_string())
+                {
                     self.found = true;
                 }
                 visit::visit_expr_method_call(self, call);
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let Expr::Path(path) = &*call.func
+                    && path
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| self.readers.contains(&segment.ident.to_string()))
+                {
+                    self.found = true;
+                }
+                visit::visit_expr_call(self, call);
             }
             fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
                 if path
@@ -202,7 +289,7 @@ impl PathBranches {
                 }
             }
         }
-        let mut reads = Reads { bindings: &self.bindings, found: false };
+        let mut reads = Reads { bindings: &self.bindings, readers: &self.readers, found: false };
         reads.visit_expr(expr);
         reads.found
     }

@@ -4067,6 +4067,7 @@ fn middleware_that_checks_only_some_paths_is_unverified() {
     // Branches on the request path: not counted as protection.
     assert_eq!(kinds("/portal/private/drafts"), [AuthEvidenceKind::Delegated]);
     assert_eq!(kinds("/board/posts"), [AuthEvidenceKind::Delegated]);
+    assert_eq!(kinds("/desk/tickets"), [AuthEvidenceKind::Delegated]);
     assert_eq!(kinds("/inbox/messages"), [AuthEvidenceKind::Delegated]);
     // The draft route falls short of its peers' handler-level identity. The
     // middleware all three share does not explain the difference, so it is
