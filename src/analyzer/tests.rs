@@ -2809,10 +2809,15 @@ fn const_paths_resolve_and_unresolved_paths_are_kept_with_a_warning() {
             "/admin/<unresolved:MISSING>"
         ]
     );
-    assert_eq!(report.warnings.len(), 1);
-    assert!(report.warnings[0].contains("MISSING"));
-    // A route whose path is unknown is not compared with peers.
+    assert_eq!(
+        report.warnings.iter().filter(|warning| warning.contains("MISSING")).count(),
+        1
+    );
+    // A route whose path is unknown is not compared with peers, and says so.
     assert!(report.finding_details.is_empty());
+    assert!(report.unjudged.iter().any(|route| {
+        route.path == "/admin/<unresolved:MISSING>" && route.reason == UnjudgedReason::UnresolvedPath
+    }));
     assert!(
         report
             .peer_groups
@@ -4139,4 +4144,29 @@ fn routes_serving_the_same_data_are_compared_across_paths() {
     let finding = &report.finding_details[0];
     assert_eq!(finding.severity, Severity::Medium);
     assert_eq!(finding.authorized_peer_routes[0].path, "/studio/item/{id}");
+}
+
+#[test]
+fn small_groups_fall_back_to_enclosing_scopes_and_unjudged_routes_say_why() {
+    let report = drift_fixture(
+        "f31",
+        include_str!("../../tests/fixtures/probes/drift/f31_small_group_fallback.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [(FindingCategory::MissingAuthentication, "POST".to_string(), "/shop/cart/clear".to_string())]
+    );
+    let reason = |path: &str| {
+        report
+            .unjudged
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.reason)
+    };
+    assert_eq!(reason("/misc/about"), Some(UnjudgedReason::NoPeers));
+    assert_eq!(reason("/blog/posts"), Some(UnjudgedReason::PeersUnprotected));
+    // Judged routes are not listed.
+    assert_eq!(reason("/shop/orders/place"), None);
+    assert_eq!(reason("/shop/cart/clear"), None);
+    assert!(report.warnings.iter().any(|warning| warning.contains("not compared with any peers")));
 }

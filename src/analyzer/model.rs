@@ -510,6 +510,59 @@ impl Default for AnalysisOptions {
     }
 }
 
+/// Why a route was not compared with any peers.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UnjudgedReason {
+    /// Login, registration, token, and similar endpoints: public by design.
+    AuthenticationEndpoint,
+    /// Health, metrics, documentation and similar endpoints at the root.
+    WellKnownPublic,
+    /// The path holds a part Archer cannot resolve, so its place is unknown.
+    UnresolvedPath,
+    /// No other route of its method class in its resource or any scope above.
+    NoPeers,
+    /// Its peers carry no protection at all.
+    PeersUnprotected,
+    /// Its peers disagree: no protection reaches the support threshold.
+    BelowSupport,
+}
+
+impl std::fmt::Display for UnjudgedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AuthenticationEndpoint => "authentication endpoint",
+            Self::WellKnownPublic => "well-known public endpoint",
+            Self::UnresolvedPath => "unresolved path",
+            Self::NoPeers => "no peers",
+            Self::PeersUnprotected => "peers carry no protection",
+            Self::BelowSupport => "peers below the support threshold",
+        })
+    }
+}
+
+/// A route that no peer group or resource link judged, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnjudgedRoute {
+    pub method: String,
+    pub path: String,
+    pub handler: Option<String>,
+    pub reason: UnjudgedReason,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl UnjudgedRoute {
+    pub fn new(route: &Route, reason: UnjudgedReason, detail: String) -> Self {
+        Self {
+            method: route.method.clone(),
+            path: route.path.clone(),
+            handler: route.handler.clone(),
+            reason,
+            detail,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub files_scanned: usize,
@@ -528,6 +581,8 @@ pub struct Report {
     #[cfg_attr(not(test), allow(dead_code))]
     pub findings: Vec<String>,
     pub finding_details: Vec<Finding>,
+    /// Routes no comparison judged, with the reason for each.
+    pub unjudged: Vec<UnjudgedRoute>,
 }
 
 /// How much of the repository's request handling Archer's routes cover. A

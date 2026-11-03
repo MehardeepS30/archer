@@ -17,6 +17,7 @@ pub(crate) fn build_analysis_layers(
     build_analysis_layers_with(routes, &AnalysisOptions::default())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_analysis_layers_with(
     routes: &[Route],
     options: &AnalysisOptions,
@@ -26,6 +27,41 @@ pub(crate) fn build_analysis_layers_with(
     Vec<Finding>,
     Vec<String>,
 ) {
+    let (groups, invariants, details, findings, _) = build_analysis_layers_full(routes, options);
+    (groups, invariants, details, findings)
+}
+
+/// The analysis layers, and every route that no comparison judged, with why.
+pub(crate) fn build_analysis_layers_full(
+    routes: &[Route],
+    options: &AnalysisOptions,
+) -> (
+    Vec<PeerGroup>,
+    Vec<AuthorizationInvariant>,
+    Vec<Finding>,
+    Vec<String>,
+    Vec<UnjudgedRoute>,
+) {
+    let mut unjudged: Vec<UnjudgedRoute> = Vec::new();
+    let mut seen_identities = HashSet::new();
+    for route in routes {
+        if !seen_identities.insert(route_identity(route)) {
+            continue;
+        }
+        let reason = if is_authentication_route(route) {
+            Some(UnjudgedReason::AuthenticationEndpoint)
+        } else if is_well_known_public_route(route) {
+            Some(UnjudgedReason::WellKnownPublic)
+        } else if has_unresolved_segment(&route.path) {
+            Some(UnjudgedReason::UnresolvedPath)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            unjudged.push(UnjudgedRoute::new(route, reason, String::new()));
+        }
+    }
+    let mut pending: Vec<(&Route, UnjudgedReason, String)> = Vec::new();
     let candidates: Vec<&Route> = unique_routes(routes.iter().filter(|route| {
         !is_authentication_route(route)
             && !is_well_known_public_route(route)
@@ -69,13 +105,24 @@ pub(crate) fn build_analysis_layers_with(
     };
     for (index, place) in placed.iter().enumerate() {
         let Some(mut own) = comparison_key(place, &class_size) else {
+            pending.push((
+                candidates[index],
+                UnjudgedReason::NoPeers,
+                format!(
+                    "no other {} route shares its resource {} or a scope above it",
+                    place.class, place.resource
+                ),
+            ));
             continue;
         };
         // A resource whose few routes disagree (one authenticated, one not)
         // cannot say what it expects. Its namespace can: hold the route to
         // the wider group instead. A resource whose routes all lack auth
         // agrees that it is public and keeps its own verdict.
-        if own.level == GroupLevel::Resource {
+        // The same holds above: a namespace whose routes disagree, below
+        // the support threshold, defers to the enclosing scope tree, and so
+        // on up to the outermost scope that is not only generic segments.
+        loop {
             let undecided = {
                 let group = stats.entry(own.clone()).or_insert_with(|| compute(&own));
                 group.expected.is_none()
@@ -84,8 +131,19 @@ pub(crate) fn build_analysis_layers_with(
                         .iter()
                         .any(|peer| peer.best_tier() > EvidenceTier::None)
             };
-            if undecided && let Some(wider) = wider_key(place, &class_size) {
-                own = wider;
+            if !undecided {
+                break;
+            }
+            let next = match own.level {
+                GroupLevel::Resource => wider_key(place, &class_size),
+                GroupLevel::Namespace | GroupLevel::Subtree => {
+                    parent_key(place, &own, &class_size)
+                }
+                GroupLevel::Handler | GroupLevel::Linked => None,
+            };
+            match next {
+                Some(next) if next != own => own = next,
+                _ => break,
             }
         }
         let reads = (place.class == MethodClass::Write).then(|| GroupKey {
@@ -162,9 +220,44 @@ pub(crate) fn build_analysis_layers_with(
                 std::cmp::Reverse(key.class != MethodClass::of(&route.method)),
             )
         }) else {
+            let group = &stats[&own];
+            let (reason, detail) = if group.peers.len() < 2 {
+                (
+                    UnjudgedReason::NoPeers,
+                    format!("the only {} route under {}", own.class, own.prefix),
+                )
+            } else {
+                (
+                    UnjudgedReason::PeersUnprotected,
+                    format!(
+                        "none of its {} {} peers under {} carries protection; read as public by design",
+                        group.peers.len() - 1,
+                        own.class,
+                        own.prefix
+                    ),
+                )
+            };
+            pending.push((route, reason, detail));
             continue;
         };
         let Some(mut expected) = basis.expected else {
+            let protected = basis
+                .peers
+                .iter()
+                .filter(|peer| peer.best_tier() > EvidenceTier::None)
+                .count();
+            pending.push((
+                route,
+                UnjudgedReason::BelowSupport,
+                format!(
+                    "{protected} of {} {} routes under {} carry protection, below the {} routes and {:.0}% a pattern needs",
+                    basis.peers.len(),
+                    basis_key.class,
+                    basis_key.prefix,
+                    options.min_support,
+                    options.dominance_threshold * 100.0
+                ),
+            ));
             continue;
         };
         // Ownership is checked against the record a route serves, so it is
@@ -235,9 +328,29 @@ pub(crate) fn build_analysis_layers_with(
         ));
     }
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
-    same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
+    let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
+    // A route its groups could not judge falls back to the routes linked to
+    // it by data; if those judged it, it is not left unjudged.
+    let reported: HashSet<_> = finding_details
+        .iter()
+        .map(|finding| {
+            let route = &finding.suspicious_route;
+            (route.method.clone(), route.path.clone(), route.handler.clone())
+        })
+        .collect();
+    for (route, reason, detail) in pending {
+        let identity = (route.method.clone(), route.path.clone(), route.handler.clone());
+        if reported.contains(&identity) || linked.contains(&identity) {
+            continue;
+        }
+        unjudged.push(UnjudgedRoute::new(
+            route,
+            reason,
+            format!("{detail}; no routes are linked to it by shared data"),
+        ));
+    }
     let findings = finding_details.iter().map(format_finding).collect();
-    (peer_groups, invariants, finding_details, findings)
+    (peer_groups, invariants, finding_details, findings, unjudged)
 }
 
 /// One handler definition registered for the same method at several paths,
@@ -421,7 +534,8 @@ fn same_resource_weaker(
     invariants: &mut Vec<AuthorizationInvariant>,
     finding_details: &mut Vec<Finding>,
     options: &AnalysisOptions,
-) {
+) -> HashSet<(String, String, Option<String>)> {
+    let mut compared = HashSet::new();
     let eligible: Vec<&Route> = unique_routes(routes.iter().filter(|route| {
         !route.resource_keys.is_empty()
             && !has_unresolved_segment(&route.path)
@@ -453,6 +567,7 @@ fn same_resource_weaker(
         if linked.is_empty() {
             continue;
         }
+        compared.insert((route.method.clone(), route.path.clone(), route.handler.clone()));
         let requirement = Requirement::of(route);
         let stronger: Vec<(&Route, Vec<&'static str>)> = linked
             .iter()
@@ -558,6 +673,7 @@ fn same_resource_weaker(
             authorized_peer_routes: stronger.iter().map(|(other, _)| (*other).into()).collect(),
         });
     }
+    compared
 }
 
 #[cfg(test)]
@@ -691,6 +807,21 @@ fn wider_key(place: &Placement, class_size: &impl Fn(&GroupKey) -> usize) -> Opt
         .map(|prefix| place.subtree_key(prefix))
         .find(|key| class_size(key) > own_size.max(1))
         .or(Some(namespace))
+}
+
+/// The nearest enclosing scope tree above `own` that holds more routes of
+/// its class.
+fn parent_key(
+    place: &Placement,
+    own: &GroupKey,
+    class_size: &impl Fn(&GroupKey) -> usize,
+) -> Option<GroupKey> {
+    let size = class_size(own);
+    place
+        .subtrees()
+        .filter(|prefix| prefix.len() < own.prefix.len() && own.prefix.starts_with(prefix.as_str()))
+        .map(|prefix| place.subtree_key(prefix))
+        .find(|key| class_size(key) > size)
 }
 
 /// What a peer group establishes.

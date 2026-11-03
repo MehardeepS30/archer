@@ -199,8 +199,28 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         route.resource_keys = keys;
     }
 
-    let (peer_groups, invariants, finding_details, findings) =
-        build_analysis_layers_with(&routes, options);
+    let (peer_groups, invariants, finding_details, findings, unjudged) =
+        build_analysis_layers_full(&routes, options);
+    if !unjudged.is_empty() {
+        let mut counts: Vec<(UnjudgedReason, usize)> = Vec::new();
+        for route in &unjudged {
+            match counts.iter_mut().find(|(reason, _)| *reason == route.reason) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((route.reason, 1)),
+            }
+        }
+        counts.sort();
+        warnings.push(format!(
+            "{} of {} routes were not compared with any peers ({}); see `unjudged` for each route's reason",
+            unjudged.len(),
+            routes.len(),
+            counts
+                .iter()
+                .map(|(reason, count)| format!("{count} {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     let mut coverage = coverage(&index, &routes);
     coverage.unregistered_attribute_routes = unregistered.len();
@@ -240,6 +260,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         coverage,
         findings,
         finding_details,
+        unjudged,
     })
 }
 
