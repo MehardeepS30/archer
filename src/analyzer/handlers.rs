@@ -86,6 +86,10 @@ pub(crate) struct HandlerIndex<'a> {
     /// for them (`lemmy_api` for package `lemmy_api` or `lemmy-api`), so that
     /// `use lemmy_api::site::purge` resolves into that crate.
     pub(crate) crates: HashMap<String, PathBuf>,
+    /// Set while a glob import's own path is resolved, so that resolution
+    /// does not search globs again: modules re-exporting each other's globs
+    /// would otherwise branch at every level.
+    pub(crate) resolving_glob: std::cell::Cell<bool>,
 }
 
 impl<'a> HandlerIndex<'a> {
@@ -621,6 +625,10 @@ impl<'a> HandlerIndex<'a> {
                             self.resolve_module(crate_key, module, import, depth + 1)?,
                             &segments[1..],
                         )
+                    } else if let Some(found) = self.glob_module(crate_key, module, first, depth) {
+                        // `use crate::api::*;` then `ping_controller::ping`:
+                        // the module came in through exactly one glob.
+                        (found, &segments[1..])
                     } else {
                         // Since the 2018 edition, a dependency's name is in
                         // scope in every module.
@@ -632,6 +640,40 @@ impl<'a> HandlerIndex<'a> {
         resolved.extend(rest.iter().cloned());
         self.is_module(&target_crate, &resolved)
             .then_some((target_crate, resolved))
+    }
+}
+
+impl HandlerIndex<'_> {
+    /// The module named `name` that one of `module`'s glob imports brings
+    /// into scope, if exactly one does.
+    fn glob_module(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        name: &str,
+        depth: usize,
+    ) -> Option<ModuleKey> {
+        if self.resolving_glob.get() {
+            return None;
+        }
+        let scope = self.scope(crate_key, module)?;
+        let mut found: Option<ModuleKey> = None;
+        for glob in &scope.globs {
+            self.resolving_glob.set(true);
+            let resolved = self.resolve_module(crate_key, module, glob, depth + 1);
+            self.resolving_glob.set(false);
+            let Some((glob_crate, mut glob_module)) = resolved else {
+                continue;
+            };
+            glob_module.push(name.to_owned());
+            if self.is_module(&glob_crate, &glob_module) {
+                if found.as_ref().is_some_and(|existing| *existing != (glob_crate.clone(), glob_module.clone())) {
+                    return None;
+                }
+                found = Some((glob_crate, glob_module));
+            }
+        }
+        found
     }
 }
 

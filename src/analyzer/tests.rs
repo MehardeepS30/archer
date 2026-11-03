@@ -4170,3 +4170,28 @@ fn small_groups_fall_back_to_enclosing_scopes_and_unjudged_routes_say_why() {
     assert_eq!(reason("/shop/cart/clear"), None);
     assert!(report.warnings.iter().any(|warning| warning.contains("not compared with any peers")));
 }
+
+#[test]
+fn attribute_routes_registered_through_a_glob_imported_module_are_kept() {
+    let repo = TempRepo::new(
+        "glob-registration",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            ("src/main.rs", "mod api;\nmod config;\n"),
+            ("src/api/mod.rs", "pub mod ping_controller;\n"),
+            (
+                "src/api/ping_controller.rs",
+                "#[get(\"/ping\")]\nasync fn ping() -> HttpResponse { HttpResponse::Ok().finish() }\n",
+            ),
+            ("src/config/mod.rs", "pub mod app;\n"),
+            (
+                "src/config/app.rs",
+                "use crate::api::*;\npub fn config(cfg: &mut web::ServiceConfig) {\n    cfg.service(web::scope(\"/api\").service(ping_controller::ping));\n}\n",
+            ),
+        ],
+    );
+    let report = repo.analyze();
+    let paths: Vec<_> = report.routes.iter().map(|route| route.path.as_str()).collect();
+    assert_eq!(paths, ["/api/ping"]);
+    assert_eq!(report.coverage.unregistered_attribute_routes, 0);
+}
