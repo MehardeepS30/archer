@@ -13,6 +13,7 @@ use syn::{
 };
 
 use super::{evidence::*, handlers::*, model::*};
+use quote::ToTokens;
 
 /// One lexical scope: a block, or the binding region of a function, closure,
 /// loop, match arm, or `if let`/`while let`.
@@ -1333,7 +1334,18 @@ impl RouteVisitor<'_> {
                 }
                 segments.join("::")
             }
-            _ => "expression".to_owned(),
+            // `web::scope(&cfg.common.base_uri)`: kept by its text, so two
+            // different runtime prefixes stay apart.
+            _ => {
+                let text: String = expr
+                    .to_token_stream()
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace() && !"&/<>{}".contains(*character))
+                    .take(48)
+                    .collect();
+                if text.is_empty() { "expression".to_owned() } else { text }
+            }
         };
         self.warnings.push(format!(
             "{}:{}: path `{}` is not a string literal or resolvable const",
@@ -1423,6 +1435,16 @@ impl RouteVisitor<'_> {
 /// Whether a path contains a segment that could not be resolved statically.
 pub(crate) fn has_unresolved_segment(path: &str) -> bool {
     path.split('/')
+        .any(|segment| segment.starts_with("<unresolved:"))
+}
+
+/// Whether a path has an unresolved part other than a leading mount prefix.
+/// `web::scope(&cfg.base_uri)` wrapping a whole app prefixes every route
+/// alike, so routes under it can still be compared with each other.
+pub(crate) fn has_unresolved_inner_segment(path: &str) -> bool {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .skip(1)
         .any(|segment| segment.starts_with("<unresolved:"))
 }
 

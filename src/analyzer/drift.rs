@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{model::*, routes::has_unresolved_segment};
+use super::{model::*, routes::has_unresolved_inner_segment as has_unresolved_segment};
 
 /// Analysis layers with default options.
 #[cfg(test)]
@@ -1317,13 +1317,15 @@ pub(crate) fn is_generic_segment(segment: &str) -> bool {
 /// `/admin/users/{id}`, and `/admin/users/{id}/roles`. Parameters are
 /// normalized, so `/t/{id}/x` and `/t/{tenant}/x` share a resource.
 pub(crate) fn placement(route: &Route) -> Placement {
-    let segments: Vec<&str> = route
-        .path
+    // A leading runtime mount prefix (`web::scope(&cfg.base_uri)`) is the
+    // same for every route under it: place routes as if it were the root.
+    let path = without_mount_prefix(&route.path);
+    let scope_prefix = without_mount_prefix(&route.scope_prefix);
+    let segments: Vec<&str> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    let scope_segments = route
-        .scope_prefix
+    let scope_segments = scope_prefix
         .split('/')
         .filter(|segment| !segment.is_empty())
         .count()
@@ -1368,6 +1370,14 @@ pub(crate) fn placement(route: &Route) -> Placement {
         namespace: prefix(namespace_length),
         resource: prefix(resource_length),
         class: MethodClass::of(&route.method),
+    }
+}
+
+/// A path without its leading `<unresolved:..>` mount segment, if any.
+fn without_mount_prefix(path: &str) -> &str {
+    match path.strip_prefix("/<unresolved:") {
+        Some(rest) => rest.find('/').map_or("", |slash| &rest[slash..]),
+        None => path,
     }
 }
 
@@ -1459,10 +1469,13 @@ pub(crate) fn is_well_known_public_route(route: &Route) -> bool {
         "openapi.json",
         "favicon.ico",
     ];
-    if route.path.split('/').any(is_dynamic_segment) {
+    // A leading runtime mount prefix (`/<unresolved:cfg.base_uri>/healthz`)
+    // does not make the endpoint dynamic.
+    let path = without_mount_prefix(&route.path);
+    if path.split('/').any(is_dynamic_segment) {
         return false;
     }
-    let statics = static_segments(&route.path);
+    let statics = static_segments(path);
     let Some((last, before)) = statics.split_last() else {
         return false;
     };

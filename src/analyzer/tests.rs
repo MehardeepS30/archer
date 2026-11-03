@@ -4196,3 +4196,27 @@ fn attribute_routes_registered_through_a_glob_imported_module_are_kept() {
     assert_eq!(paths, ["/api/ping"]);
     assert_eq!(report.coverage.unregistered_attribute_routes, 0);
 }
+
+#[test]
+fn routes_under_a_runtime_mount_prefix_are_still_compared() {
+    let report = drift_fixture(
+        "f32",
+        include_str!("../../tests/fixtures/probes/drift/f32_runtime_mount_prefix.rs"),
+    );
+    assert!(report.routes.iter().any(|route| route.path == "/<unresolved:cfg.base_uri>/api/projects"));
+    assert_eq!(
+        reported(&report),
+        [(
+            FindingCategory::MissingAuthentication,
+            "DELETE".to_string(),
+            "/<unresolved:cfg.base_uri>/api/projects/{id}".to_string()
+        )]
+    );
+    assert!(report.unjudged.iter().any(|route| {
+        route.path.contains("export") && route.reason == UnjudgedReason::UnresolvedPath
+    }));
+    // A health check under the prefix is still a well-known public endpoint.
+    assert!(report.unjudged.iter().any(|route| {
+        route.path.ends_with("/healthz") && route.reason == UnjudgedReason::WellKnownPublic
+    }));
+}
