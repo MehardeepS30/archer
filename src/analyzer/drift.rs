@@ -51,38 +51,57 @@ pub(crate) fn build_analysis_layers_with(
     let mut stats: HashMap<GroupKey, GroupStats> = HashMap::new();
     let mut order: Vec<GroupKey> = Vec::new();
     let mut judged: Vec<(usize, GroupKey, Option<GroupKey>)> = Vec::new();
+    let compute = |key: &GroupKey| {
+        let indices: Vec<usize> = members.get(key).cloned().unwrap_or_default();
+        let peers: Vec<&Route> = indices.iter().map(|&member| candidates[member]).collect();
+        // Across a namespace, each resource counts once: a resource
+        // with many routes must not outvote its single-route siblings.
+        let weights: Vec<f64> = indices
+            .iter()
+            .map(|&member| match key.level {
+                GroupLevel::Resource | GroupLevel::Handler => 1.0,
+                GroupLevel::Namespace | GroupLevel::Subtree => {
+                    1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1) as f64
+                }
+            })
+            .collect();
+        GroupStats::of(peers, weights, options)
+    };
     for (index, place) in placed.iter().enumerate() {
-        let Some(own) = comparison_key(place, &class_size) else {
+        let Some(mut own) = comparison_key(place, &class_size) else {
             continue;
         };
+        // A resource whose few routes disagree (one authenticated, one not)
+        // cannot say what it expects. Its namespace can: hold the route to
+        // the wider group instead. A resource whose routes all lack auth
+        // agrees that it is public and keeps its own verdict.
+        if own.level == GroupLevel::Resource {
+            let undecided = {
+                let group = stats.entry(own.clone()).or_insert_with(|| compute(&own));
+                group.expected.is_none()
+                    && group
+                        .peers
+                        .iter()
+                        .any(|peer| peer.best_tier() > EvidenceTier::None)
+            };
+            if undecided && let Some(wider) = wider_key(place, &class_size) {
+                own = wider;
+            }
+        }
         let reads = (place.class == MethodClass::Write).then(|| GroupKey {
             class: MethodClass::Read,
             ..own.clone()
         });
         for key in std::iter::once(&own).chain(reads.as_ref()) {
-            if !stats.contains_key(key) {
-                let indices: Vec<usize> = members.get(key).cloned().unwrap_or_default();
-                let peers: Vec<&Route> = indices.iter().map(|&member| candidates[member]).collect();
-                // Across a namespace, each resource counts once: a resource
-                // with many routes must not outvote its single-route siblings.
-                let weights: Vec<f64> = indices
+            let group = stats.entry(key.clone()).or_insert_with(|| compute(key));
+            if !order.contains(key)
+                && group.peers.len() >= 2
+                && group
+                    .peers
                     .iter()
-                    .map(|&member| match key.level {
-                        GroupLevel::Resource | GroupLevel::Handler => 1.0,
-                        GroupLevel::Namespace | GroupLevel::Subtree => {
-                            1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1)
-                                as f64
-                        }
-                    })
-                    .collect();
-                if peers.len() >= 2
-                    && peers
-                        .iter()
-                        .any(|peer| peer.best_tier() > EvidenceTier::None)
-                {
-                    order.push(key.clone());
-                }
-                stats.insert(key.clone(), GroupStats::of(peers, weights, options));
+                    .any(|peer| peer.best_tier() > EvidenceTier::None)
+            {
+                order.push(key.clone());
             }
         }
         judged.push((index, own, reads));
@@ -131,8 +150,9 @@ pub(crate) fn build_analysis_layers_with(
             .filter_map(|key| ids.get(key).map(|id| (&stats[key], key, id)))
             .filter(|(group, key, _)| {
                 key.class == place_class(route)
-                    || key.level == GroupLevel::Resource
-                    || group.expected == Some(EvidenceTier::Privilege)
+                    || (key.level == GroupLevel::Resource && targets_record(route))
+                    || (group.expected == Some(EvidenceTier::Privilege)
+                        && own_undecided(&stats, &own))
             })
             .collect();
         let Some(&(basis, basis_key, basis_id)) = entries.iter().max_by_key(|(group, key, _)| {
@@ -435,6 +455,35 @@ fn comparison_key(
     if informative {
         return Some(resource);
     }
+    wider_key(place, class_size)
+}
+
+/// Whether a route acts on its resource's collection or one of its records
+/// (`/users`, `/users/{id}`), where writes are never less protected than
+/// reads. A sub-action below a record (`/users/{id}/otp`,
+/// `/users/{id}/self/delete`) is its own operation with its own policy.
+fn targets_record(route: &Route) -> bool {
+    let resource = placement(route).resource;
+    let depth = resource.split('/').filter(|segment| !segment.is_empty()).count();
+    route
+        .path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .skip(depth)
+        .all(is_dynamic_segment)
+}
+
+/// Whether a route's own-class group gives no verdict, so that a wider or
+/// cross-class group has to speak for it. A namespace whose writes agree
+/// among themselves (self-service writes beside admin-only reads) is judged
+/// by those writes.
+fn own_undecided(stats: &HashMap<GroupKey, GroupStats>, own: &GroupKey) -> bool {
+    stats.get(own).is_none_or(|group| group.expected.is_none())
+}
+
+/// The group above a route's resource: its namespace, or the nearest
+/// enclosing scope with more routes of its class.
+fn wider_key(place: &Placement, class_size: &impl Fn(&GroupKey) -> usize) -> Option<GroupKey> {
     if place.namespace == place.resource || place.namespace == "/" {
         return None;
     }

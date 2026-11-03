@@ -3974,3 +3974,46 @@ fn files_of_test_only_modules_are_not_scanned() {
     let paths: Vec<_> = repo.analyze().routes.into_iter().map(|route| route.path).collect();
     assert_eq!(paths, ["/a"]);
 }
+
+#[test]
+fn f24_validate_methods_on_the_caller_are_role_checks() {
+    let report = drift_fixture(
+        "f24",
+        include_str!("../../tests/fixtures/probes/drift/f24_validate_methods.rs"),
+    );
+    let list = route_at(&report, "/api/users");
+    assert!(has_evidence(list, AuthEvidenceKind::RoleCheck, "validate_admin_session"));
+    assert!(
+        list.authorization
+            .iter()
+            .any(|evidence| evidence.requirements == ["admin"])
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "DELETE", "/api/users/{id}/sessions")]
+    );
+}
+
+#[test]
+fn f25_a_resource_that_disagrees_is_judged_by_its_namespace() {
+    let report = drift_fixture(
+        "f25",
+        include_str!("../../tests/fixtures/probes/drift/f25_undecided_resource.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthentication, "POST", "/api/post/mark_as_read/many")]
+    );
+}
+
+#[test]
+fn f26_only_record_writes_are_held_to_the_resource_reads() {
+    let report = drift_fixture(
+        "f26",
+        include_str!("../../tests/fixtures/probes/drift/f26_record_writes_and_sub_actions.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "PUT", "/api/accounts/{id}")]
+    );
+}

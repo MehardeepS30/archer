@@ -1533,13 +1533,15 @@ pub(crate) fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthS
     // `verify_resource_access`); as a modifier it names authentication artifacts
     // such as `verify_access_token` or logging helpers such as `check_access_log`.
     let ends_with_access = last == "access";
-    let uses_check_prefix = ["require_", "check_", "verify_", "assert_", "ensure_"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix));
+    let uses_check_prefix = [
+        "require_", "check_", "verify_", "assert_", "ensure_", "validate_",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
 
     // `host.validate_secret(..)?`, `verify_api_token(..)`: a presented
     // credential is checked, which identifies the caller.
-    let credential_check = (uses_check_prefix || lower.starts_with("validate_"))
+    let credential_check = uses_check_prefix
         && ["secret", "token", "signature", "credentials", "password", "apikey"]
             .contains(&last)
         && !has_token(&["access", "csrf", "reset"]);
@@ -1809,6 +1811,9 @@ impl<'ast> Visit<'ast> for RouteConfigurationNameVisitor {
 /// Words that name the kind or shape of a check, not what it requires:
 /// `require_admin` requires `admin`, `RequireRole<Admin>` requires `admin`.
 const KEY_STOP_WORDS: &[&str] = &[
+    "validate",
+    "session",
+    "sessions",
     "require",
     "requires",
     "required",
@@ -1915,6 +1920,11 @@ pub(crate) fn name_keys(name: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     };
+    // `validate_api_key_or_admin_session` passes on either alternative, so
+    // it names no single requirement to compare against peers.
+    if words.iter().any(|word| word == "or") {
+        return Vec::new();
+    }
     let subject: Vec<&str> = words
         .iter()
         .map(String::as_str)
