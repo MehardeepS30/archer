@@ -482,4 +482,11 @@ pub struct Coverage {
     pub unresolved_handlers: usize,
     /// Routes whose path holds a part that is not a literal or a constant.
     pub unresolved_paths: usize,
+    /// Attribute routes that nothing registers, left out of `routes`.
+    pub unregistered_attribute_routes: usize,
+    /// Macros that name unrouted handlers, with how many each names.
+    pub macro_registrations: Vec<(String, usize)>,
+    /// Names of the unrouted handler-like functions.
+    #[serde(skip)]
+    pub unrouted_names: std::collections::HashSet<String>,
 }

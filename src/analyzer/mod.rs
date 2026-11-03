@@ -164,7 +164,14 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     };
     routes.retain(|route| outside_configured(route.origin.enclosing));
     registrations.retain(|registration| outside_configured(registration.enclosing));
-    let mut routes = apply_registrations(routes, &registrations);
+    let (mut routes, unregistered) = apply_registrations(routes, &registrations);
+    if !unregistered.is_empty() {
+        warnings.push(format!(
+            "{} attribute route(s) are declared but never registered with `.service(..)` in code Archer could follow, so they are left out: {}",
+            unregistered.len(),
+            unregistered.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+        ));
+    }
     // Builder chains are visited outermost call first; report routes in the
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
@@ -182,7 +189,25 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     let (peer_groups, invariants, finding_details, findings) =
         build_analysis_layers_with(&routes, options);
 
-    let coverage = coverage(&index, &routes);
+    let mut coverage = coverage(&index, &routes);
+    coverage.unregistered_attribute_routes = unregistered.len();
+    coverage.macro_registrations = macro_registrations(
+        parsed_files.iter().map(|(_, _, syntax)| syntax),
+        &coverage.unrouted_names,
+    );
+    for (name, handlers) in &coverage.macro_registrations {
+        warnings.push(format!(
+            "{handlers} unrouted handler(s) are named inside macro `{name}`; routes registered by macros are not analyzed"
+        ));
+    }
+    if coverage.routed_handlers < coverage.likely_handlers {
+        warnings.push(format!(
+            "{} of {} functions that look like handlers are not reached by any route, for example {}",
+            coverage.likely_handlers - coverage.routed_handlers,
+            coverage.likely_handlers,
+            coverage.unrouted_examples.join(", ")
+        ));
+    }
     if coverage.likely_handlers >= 10
         && coverage.routed_handlers * 2 < coverage.likely_handlers
     {
@@ -363,13 +388,16 @@ fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
         let definition = &index.definitions[index_position];
         if routed.contains(&index_position) || routed_names.contains(definition.name.as_str()) {
             coverage.routed_handlers += 1;
-        } else if coverage.unrouted_examples.len() < 5 {
-            coverage.unrouted_examples.push(format!(
-                "{}:{} {}",
-                definition.file.display(),
-                item.sig.ident.span().start().line,
-                definition.name
-            ));
+        } else {
+            coverage.unrouted_names.insert(definition.name.clone());
+            if coverage.unrouted_examples.len() < 5 {
+                coverage.unrouted_examples.push(format!(
+                    "{}:{} {}",
+                    definition.file.display(),
+                    item.sig.ident.span().start().line,
+                    definition.name
+                ));
+            }
         }
     }
     coverage.unresolved_handlers = routes
@@ -386,6 +414,82 @@ fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
         .filter(|route| has_unresolved_segment(&route.path))
         .count();
     coverage
+}
+
+/// Macros (function-like or attribute) whose tokens name unrouted handlers,
+/// with how many distinct handlers each names: routes such a macro may
+/// register are invisible to Archer. Macros that only document handlers
+/// (`#[openapi(paths(..))]`) are counted too; the warning says "may".
+fn macro_registrations<'a>(
+    files: impl IntoIterator<Item = &'a syn::File>,
+    unrouted: &HashSet<String>,
+) -> Vec<(String, usize)> {
+    use quote::ToTokens;
+    use syn::visit::Visit;
+    struct MacroVisitor<'u> {
+        unrouted: &'u HashSet<String>,
+        named: HashMap<String, HashSet<String>>,
+    }
+    // Standard, logging, test, and JSON macros never register routes.
+    const NON_REGISTERING: [&str; 33] = [
+        "format", "format_args", "print", "println", "eprint", "eprintln", "write", "writeln",
+        "panic", "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq",
+        "debug_assert_ne", "vec", "matches", "todo", "unimplemented", "unreachable", "dbg",
+        "macro_rules", "cfg", "cfg_select", "concat", "stringify", "json", "select", "trace",
+        "debug", "info", "warn", "error",
+    ];
+    impl MacroVisitor<'_> {
+        fn scan(&mut self, path: &syn::Path, tokens: proc_macro2::TokenStream) {
+            if path
+                .segments
+                .last()
+                .is_some_and(|segment| NON_REGISTERING.contains(&segment.ident.to_string().as_str()))
+            {
+                return;
+            }
+            fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+                for token in tokens {
+                    match token {
+                        proc_macro2::TokenTree::Ident(ident) => out.push(ident.to_string()),
+                        proc_macro2::TokenTree::Group(group) => idents(group.stream(), out),
+                        _ => {}
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            idents(tokens, &mut found);
+            let name = path.to_token_stream().to_string().replace(' ', "");
+            for ident in found {
+                if self.unrouted.contains(&ident) {
+                    self.named.entry(name.clone()).or_default().insert(ident);
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for MacroVisitor<'_> {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            self.scan(&node.path, node.tokens.clone());
+        }
+        fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+            if let syn::Meta::List(list) = &node.meta {
+                self.scan(&list.path, list.tokens.clone());
+            }
+        }
+    }
+    if unrouted.is_empty() {
+        return Vec::new();
+    }
+    let mut visitor = MacroVisitor { unrouted, named: HashMap::new() };
+    for file in files {
+        visitor.visit_file(file);
+    }
+    let mut named: Vec<(String, usize)> = visitor
+        .named
+        .into_iter()
+        .map(|(name, handlers)| (name, handlers.len()))
+        .collect();
+    named.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    named
 }
 
 /// An async free function taking an Actix extractor or returning a response.

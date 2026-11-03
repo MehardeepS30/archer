@@ -1473,10 +1473,15 @@ pub(crate) fn add_inherited_evidence(
 /// Re-roots attribute routes at every `.service(handler)` call that registers
 /// their handler, taking that scope's prefix and inherited evidence. Attribute
 /// routes whose handler is never registered this way keep their own path.
+/// Places attribute routes (`#[get("/x")]`) where `.service(handler)`
+/// registers them. An attribute route that nothing registers is not served,
+/// so it is left out and returned, as `METHOD path handler (file:line)`, for
+/// a warning.
 pub(crate) fn apply_registrations(
     routes: Vec<Route>,
     registrations: &[Registration],
-) -> Vec<Route> {
+) -> (Vec<Route>, Vec<String>) {
+    let mut unregistered = Vec::new();
     let mut placed = Vec::with_capacity(routes.len());
     for route in routes {
         let Some((definition, attribute_path)) = route.origin.attribute.clone() else {
@@ -1488,7 +1493,14 @@ pub(crate) fn apply_registrations(
             .filter(|registration| registration.definition == definition)
             .collect();
         if matching.is_empty() {
-            placed.push(route);
+            unregistered.push(format!(
+                "{} {} {} ({}:{})",
+                route.method,
+                route.path,
+                route.handler.as_deref().unwrap_or("?"),
+                route.file.display(),
+                route.line
+            ));
             continue;
         }
         for registration in matching {
@@ -1503,7 +1515,7 @@ pub(crate) fn apply_registrations(
             placed.push(registered);
         }
     }
-    placed
+    (placed, unregistered)
 }
 
 /// Line and column where a span starts.

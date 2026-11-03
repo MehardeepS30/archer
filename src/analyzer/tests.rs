@@ -2195,6 +2195,7 @@ mod secure {
 #[get(\"/secure\")]
 async fn users() { crate::require_admin(); }
 }
+fn app() { App::new().service(users).service(secure::users); }
 ",
         )],
     );
@@ -2714,7 +2715,8 @@ fn qualified_and_multi_method_route_attributes_are_extracted() {
             "main.rs",
             "#[actix_web::get(\"/x\")] async fn x() {}
              #[route(\"/y\", method = \"GET\", method = \"POST\")] async fn y() {}
-             #[get(\"/z\", wrap = \"Logger::default()\")] async fn z() {}",
+             #[get(\"/z\", wrap = \"Logger::default()\")] async fn z() {}
+             fn app() { App::new().service(x).service(y).service(z); }",
         )],
     );
 
@@ -4016,4 +4018,18 @@ fn f26_only_record_writes_are_held_to_the_resource_reads() {
         reported(&report),
         [finding(MissingAuthorization, "PUT", "/api/accounts/{id}")]
     );
+}
+
+#[test]
+fn unregistered_attribute_routes_are_left_out_with_a_warning() {
+    let report = drift_fixture(
+        "f27",
+        include_str!("../../tests/fixtures/probes/drift/f27_unregistered_and_macro_routes.rs"),
+    );
+    let paths: Vec<_> = report.routes.iter().map(|route| route.path.as_str()).collect();
+    assert_eq!(paths, ["/articles/{id}", "/articles"]);
+    assert_eq!(report.coverage.unregistered_attribute_routes, 1);
+    assert_eq!(report.coverage.macro_registrations, [("api_routes".to_string(), 2)]);
+    assert!(report.warnings.iter().any(|warning| warning.contains("never registered")));
+    assert_eq!(reported(&report), []);
 }
