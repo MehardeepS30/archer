@@ -13,7 +13,7 @@ pub use model::*;
 
 use anyhow::Result;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -85,6 +85,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     rust_files.sort();
 
     let mut parsed_files = Vec::new();
+    let mut test_only_modules: Vec<(PathBuf, Vec<String>)> = Vec::new();
     for file_path in rust_files {
         files_scanned += 1;
         let source = match fs::read_to_string(&file_path) {
@@ -99,7 +100,18 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
             }
         };
         let syntax = match syn::parse_file(&source) {
-            Ok(syntax) => syntax,
+            Ok(mut syntax) => {
+                if !options.include_tests {
+                    let (crate_key, module) = module_location(root, &file_path);
+                    for name in test_only_module_declarations(&syntax.items) {
+                        let mut path = module.clone();
+                        path.push(name);
+                        test_only_modules.push((crate_key.clone(), path));
+                    }
+                    strip_test_items(&mut syntax.items);
+                }
+                syntax
+            }
             Err(error) => {
                 parse_errors.push(format!("{}: {}", file_path.display(), error));
                 continue;
@@ -108,12 +120,25 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         parsed_files.push((module_location(root, &file_path), file_path, syntax));
     }
 
+    // A module declared `#[cfg(test)] mod tests;` lives in its own file;
+    // that file, and the files of its submodules, are test code too.
+    if !options.include_tests {
+        let test_modules = std::mem::take(&mut test_only_modules);
+        parsed_files.retain(|((crate_key, module), _, _)| {
+            !test_modules.iter().any(|(test_crate, test_module)| {
+                test_crate == crate_key && module.starts_with(test_module)
+            })
+        });
+    }
+
     // Index every handler definition before extracting routes so that route
     // registrations can resolve handlers defined in other files.
+    let crates = workspace_crates(parsed_files.iter().map(|((crate_key, _), _, _)| crate_key));
     let index = HandlerIndex::build(
         parsed_files
             .iter()
             .map(|(location, file_path, syntax)| (file_path.as_path(), location.clone(), syntax)),
+        crates,
     );
     let mut registrations = Vec::new();
     let mut warnings = Vec::new();
@@ -157,6 +182,16 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     let (peer_groups, invariants, finding_details, findings) =
         build_analysis_layers_with(&routes, options);
 
+    let coverage = coverage(&index, &routes);
+    if coverage.likely_handlers >= 10
+        && coverage.routed_handlers * 2 < coverage.likely_handlers
+    {
+        warnings.push(format!(
+            "only {} of {} functions that look like request handlers are reached by a route Archer could read; routes may be registered in a way it cannot follow (such as a custom routing macro), so a clean report says little",
+            coverage.routed_handlers, coverage.likely_handlers
+        ));
+    }
+
     Ok(Report {
         files_scanned,
         parse_errors,
@@ -164,6 +199,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         routes,
         peer_groups,
         invariants,
+        coverage,
         findings,
         finding_details,
     })
@@ -190,4 +226,203 @@ fn reachable_from_roots(edges: &[(Option<usize>, usize)]) -> HashSet<usize> {
         }
     }
     reached
+}
+
+/// The library crates among the scanned crate directories, by the name other
+/// crates import them under: `[lib] name`, else `[package] name` with `-`
+/// read as `_`. A name two crates share resolves to neither.
+fn workspace_crates<'p>(crate_keys: impl IntoIterator<Item = &'p PathBuf>) -> HashMap<String, PathBuf> {
+    let mut seen: HashSet<&PathBuf> = HashSet::new();
+    let mut crates: HashMap<String, Option<PathBuf>> = HashMap::new();
+    for crate_key in crate_keys {
+        if !seen.insert(crate_key) {
+            continue;
+        }
+        let Ok(manifest) = fs::read_to_string(crate_key.join("Cargo.toml")) else {
+            continue;
+        };
+        let Some(name) = library_name(&manifest) else {
+            continue;
+        };
+        crates
+            .entry(name)
+            .and_modify(|existing| {
+                if existing.as_ref() != Some(crate_key) {
+                    *existing = None;
+                }
+            })
+            .or_insert_with(|| Some(crate_key.clone()));
+    }
+    crates
+        .into_iter()
+        .filter_map(|(name, key)| Some((name, key?)))
+        .collect()
+}
+
+/// The crate name a manifest's library is imported under, read from the
+/// `name` keys of its `[lib]` and `[package]` tables.
+pub(crate) fn library_name(manifest: &str) -> Option<String> {
+    let mut section = String::new();
+    let mut package = None;
+    let mut lib = None;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_owned();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').to_owned();
+        match section.as_str() {
+            "package" => package = Some(value),
+            "lib" => lib = Some(value),
+            _ => {}
+        }
+    }
+    lib.or(package).map(|name| name.replace('-', "_"))
+}
+
+/// Removes items compiled only for tests (`#[cfg(test)] mod tests`, test
+/// helpers): their routes are test fixtures, not the application's.
+fn strip_test_items(items: &mut Vec<syn::Item>) {
+    items.retain(|item| !item_attributes(item).iter().any(is_test_only_cfg));
+    for item in items {
+        match item {
+            syn::Item::Mod(module) => {
+                if let Some((_, content)) = &mut module.content {
+                    strip_test_items(content);
+                }
+            }
+            syn::Item::Impl(implementation) => implementation.items.retain(|item| match item {
+                syn::ImplItem::Fn(function) => !function.attrs.iter().any(is_test_only_cfg),
+                _ => true,
+            }),
+            _ => {}
+        }
+    }
+}
+
+fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+/// `#[cfg(test)]`, or an `all(..)` that requires `test`.
+fn is_test_only_cfg(attribute: &syn::Attribute) -> bool {
+    if !attribute.path().is_ident("cfg") {
+        return false;
+    }
+    let Ok(list) = attribute.meta.require_list() else {
+        return false;
+    };
+    let predicate: String = list
+        .tokens
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    predicate == "test"
+        || (predicate.starts_with("all(")
+            && predicate[4..predicate.len().saturating_sub(1)]
+                .split(',')
+                .any(|part| part == "test"))
+}
+
+/// Free functions that look like request handlers, and how many a route reaches.
+fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
+    let routed: HashSet<usize> = routes
+        .iter()
+        .filter_map(|route| route.origin.definition)
+        .collect();
+    let routed_names: HashSet<&str> = routes
+        .iter()
+        .filter_map(|route| route.handler.as_deref())
+        .collect();
+    let mut coverage = Coverage::default();
+    for (index_position, item) in index.items.iter().enumerate() {
+        if !looks_like_handler(item) {
+            continue;
+        }
+        coverage.likely_handlers += 1;
+        let definition = &index.definitions[index_position];
+        if routed.contains(&index_position) || routed_names.contains(definition.name.as_str()) {
+            coverage.routed_handlers += 1;
+        } else if coverage.unrouted_examples.len() < 5 {
+            coverage.unrouted_examples.push(format!(
+                "{}:{} {}",
+                definition.file.display(),
+                item.sig.ident.span().start().line,
+                definition.name
+            ));
+        }
+    }
+    coverage.unresolved_handlers = routes
+        .iter()
+        .filter(|route| {
+            matches!(
+                route.handler_resolution,
+                Some(HandlerResolution::Unresolved | HandlerResolution::Ambiguous { .. })
+            )
+        })
+        .count();
+    coverage.unresolved_paths = routes
+        .iter()
+        .filter(|route| has_unresolved_segment(&route.path))
+        .count();
+    coverage
+}
+
+/// An async free function taking an Actix extractor or returning a response.
+fn looks_like_handler(item: &syn::ItemFn) -> bool {
+    use quote::ToTokens;
+    if item.sig.asyncness.is_none() {
+        return false;
+    }
+    const EXTRACTORS: [&str; 9] = [
+        "Json", "Path", "Query", "Form", "Data", "ReqData", "Payload", "HttpRequest", "Bytes",
+    ];
+    let extractor = item.sig.inputs.iter().any(|input| match input {
+        syn::FnArg::Typed(typed) => match &*typed.ty {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| EXTRACTORS.contains(&segment.ident.to_string().as_str())),
+            _ => false,
+        },
+        syn::FnArg::Receiver(_) => false,
+    });
+    let output = item.sig.output.to_token_stream().to_string();
+    extractor || output.contains("HttpResponse") || output.contains("Responder")
+}
+
+/// Names of out-of-line modules (`mod tests;`) declared only for tests.
+fn test_only_module_declarations(items: &[syn::Item]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module)
+                if module.content.is_none() && module.attrs.iter().any(is_test_only_cfg) =>
+            {
+                Some(module.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }

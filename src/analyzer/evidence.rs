@@ -47,8 +47,14 @@ pub(crate) struct HelperCall {
 /// Evidence of one function, split by how it reaches a caller.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FunctionEvidence {
-    /// Checks the function itself enforces.
+    /// Checks the function itself enforces, including its signature's
+    /// extractors and attributes.
     pub(crate) evidence: Vec<AuthEvidence>,
+    /// The checks in the function's body alone. A helper contributes only
+    /// these to its callers: its parameter types are values passed to it,
+    /// not extractors that run on a request (`fn collection_source(manager:
+    /// &TileSourceManager)` checks no role).
+    pub(crate) body_evidence: Vec<AuthEvidence>,
     /// Checks in the value a `bool` function returns (`fn can_edit(u) -> bool
     /// { u.role == Role::Admin }`). They restrict access only where a caller
     /// enforces that value.
@@ -75,9 +81,20 @@ pub(crate) fn function_evidence(file: &Path, item: &ItemFn) -> FunctionEvidence 
         Use::Statement
     };
     visitor.visit_body(&item.block, tail);
-    evidence.extend(visitor.evidence);
+    let mut body_evidence = visitor.evidence;
+    body_evidence.extend(delegation_evidence(
+        file,
+        &handler,
+        &item.block,
+        identity_bindings(item.sig.inputs.iter().filter_map(|input| match input {
+            FnArg::Typed(typed) => Some((&*typed.pat, &*typed.ty)),
+            FnArg::Receiver(_) => None,
+        })),
+    ));
+    evidence.extend(body_evidence.iter().cloned());
     FunctionEvidence {
         evidence,
+        body_evidence,
         predicate_evidence: visitor.predicate_evidence,
         calls: visitor.calls,
         predicate_calls: visitor.predicate_calls,
@@ -105,7 +122,254 @@ pub(crate) fn closure_evidence(
         body => visitor.visit_expr(body),
     }
     evidence.extend(visitor.evidence);
+    let bindings = identity_bindings(closure.inputs.iter().filter_map(|input| match input {
+        Pat::Type(typed) => Some((&*typed.pat, &*typed.ty)),
+        _ => None,
+    }));
+    let mut delegations = DelegationVisitor::new(file, handler, bindings);
+    delegations.visit_expr(&closure.body);
+    evidence.extend(delegations.evidence);
     evidence
+}
+
+/// Names bound by parameters whose type is an identity or authorization
+/// value: an extractor such as `ActixAuth(auth): ActixAuth` or
+/// `principal: ReqPrincipal`, or a helper's `auth: &Auth`.
+fn identity_bindings<'p>(
+    parameters: impl IntoIterator<Item = (&'p Pat, &'p Type)>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for (pattern, ty) in parameters {
+        if identity_type(ty) {
+            pattern_bindings(pattern, &mut names);
+        }
+    }
+    names
+}
+
+fn identity_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            let name = segment.ident.to_string();
+            if name == "Option" || name == "Box" || name == "Arc" {
+                return match &segment.arguments {
+                    PathArguments::AngleBracketed(arguments) => {
+                        arguments.args.iter().any(|argument| {
+                            matches!(argument, GenericArgument::Type(inner) if identity_type(inner))
+                        })
+                    }
+                    _ => false,
+                };
+            }
+            !DATA_EXTRACTORS.contains(&name.as_str())
+                && (classify_extractor_name(&name).is_some() || names_authentication(&name))
+        }
+        Type::Reference(reference) => identity_type(&reference.elem),
+        Type::Paren(paren) => identity_type(&paren.elem),
+        Type::Group(group) => identity_type(&group.elem),
+        _ => false,
+    }
+}
+
+/// Evidence that a function hands an identity to code Archer does not
+/// analyze; see `AuthEvidenceKind::Delegated`.
+fn delegation_evidence(
+    file: &Path,
+    handler: &str,
+    block: &Block,
+    bindings: HashSet<String>,
+) -> Vec<AuthEvidence> {
+    let mut visitor = DelegationVisitor::new(file, handler, bindings);
+    visitor.visit_block(block);
+    visitor.evidence
+}
+
+/// Methods that only convert or copy a value: `auth.clone()` passed to a
+/// call passes `auth`.
+const TRANSPARENT_METHODS: [&str; 8] = [
+    "clone",
+    "as_ref",
+    "into_inner",
+    "to_owned",
+    "borrow",
+    "into",
+    "deref",
+    "as_deref",
+];
+
+struct DelegationVisitor {
+    file: PathBuf,
+    handler: String,
+    bindings: HashSet<String>,
+    evidence: Vec<AuthEvidence>,
+}
+
+impl DelegationVisitor {
+    fn new(file: &Path, handler: &str, bindings: HashSet<String>) -> Self {
+        Self {
+            file: file.to_path_buf(),
+            handler: handler.to_owned(),
+            bindings,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// The identity binding an expression passes, seen through references
+    /// and conversions.
+    fn binding<'e>(&self, expr: &'e Expr) -> Option<&'e syn::Ident> {
+        match expr {
+            Expr::Path(path) if path.qself.is_none() => {
+                let ident = path.path.get_ident()?;
+                self.bindings.contains(&ident.to_string()).then_some(ident)
+            }
+            Expr::Reference(reference) => self.binding(&reference.expr),
+            Expr::Paren(paren) => self.binding(&paren.expr),
+            Expr::Group(group) => self.binding(&group.expr),
+            Expr::MethodCall(call)
+                if TRANSPARENT_METHODS.contains(&call.method.to_string().as_str()) =>
+            {
+                self.binding(&call.receiver)
+            }
+            _ => None,
+        }
+    }
+
+    /// An authentication object built in an argument: `&auth::ApiKeyAuth`,
+    /// `auth::HeaderAuth(..)`, `auth::auth_type(..)`. `NoAuth` declares the
+    /// route public and is not one.
+    fn authentication_object(expr: &Expr) -> Option<String> {
+        let path = match expr {
+            Expr::Reference(reference) => return Self::authentication_object(&reference.expr),
+            Expr::Paren(paren) => return Self::authentication_object(&paren.expr),
+            Expr::Path(path) if path.qself.is_none() => &path.path,
+            Expr::Struct(item) => &item.path,
+            Expr::Call(call) => match &*call.func {
+                Expr::Path(path) if path.qself.is_none() => &path.path,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let names: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let last = names.last()?;
+        let public = camel_case_words(last)
+            .iter()
+            .any(|word| word == "no" || word == "none" || word == "public");
+        (!public && names_authentication(last)).then(|| names.join("::"))
+    }
+
+    fn record(&mut self, mechanism: String, symbol: String, line: usize) {
+        if self
+            .evidence
+            .iter()
+            .any(|existing| existing.mechanism == mechanism)
+        {
+            return;
+        }
+        self.evidence.push(AuthEvidence {
+            kind: AuthEvidenceKind::Delegated,
+            mechanism,
+            symbol: Some(symbol),
+            file: self.file.clone(),
+            line,
+            handler: Some(self.handler.clone()),
+            strength: AuthStrength::Weak,
+            requirements: Vec::new(),
+        });
+    }
+
+    fn arguments(&mut self, callee: &str, arguments: &Punctuated<Expr, Token![,]>, line: usize) {
+        for argument in arguments {
+            if let Some(binding) = self.binding(argument) {
+                self.record(
+                    format!("`{callee}` receives `{binding}`"),
+                    format!("{callee}({binding})"),
+                    line,
+                );
+            } else if let Some(object) = Self::authentication_object(argument) {
+                self.record(
+                    format!("`{callee}` receives `{object}`"),
+                    format!("{callee}({object})"),
+                    line,
+                );
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for DelegationVisitor {
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        let method = node.method.to_string();
+        let line = node.method.span().start().line;
+        if let Some(binding) = self.binding(&node.receiver)
+            && !TRANSPARENT_METHODS.contains(&method.as_str())
+            && classify_check_name(&method).is_none()
+        {
+            self.record(
+                format!("`{binding}.{method}()` is not analyzed"),
+                format!("{binding}.{method}()"),
+                line,
+            );
+        }
+        self.arguments(&method, &node.args, line);
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        // Calls of repository functions are followed as helpers; only calls
+        // of associated functions (`Type::method`) and of paths outside the
+        // repository are opaque. Both are recorded: which paths resolve is
+        // decided later, and a resolved helper's own checks still count.
+        let callee = match &*node.func {
+            Expr::Path(path) => path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let associated = callee.len() >= 2
+            && callee[callee.len() - 2]
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase);
+        if associated {
+            let line = node.func.span().start().line;
+            self.arguments(&callee.join("::"), &node.args, line);
+        } else if let Some(name) = callee.last() {
+            // A free function receiving an authentication object built in
+            // place (`server_wrap(.., &auth::ApiKeyAuth, ..)`) delegates the
+            // check to it; one receiving an identity binding is analyzed as
+            // a helper.
+            let line = node.func.span().start().line;
+            for argument in &node.args {
+                if self.binding(argument).is_none()
+                    && let Some(object) = Self::authentication_object(argument)
+                {
+                    self.record(
+                        format!("`{name}` receives `{object}`"),
+                        format!("{name}({object})"),
+                        line,
+                    );
+                }
+            }
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
+        visit::visit_expr_closure(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+    fn visit_impl_item_fn(&mut self, _: &'ast ImplItemFn) {}
 }
 
 fn signature_evidence(
@@ -196,7 +460,7 @@ const DATA_EXTRACTORS: [&str; 10] = [
 
 /// Words that make a type name request data or a service rather than an
 /// authorization extractor (`RoleUpdate`, `PermissionService`).
-const EXTRACTOR_EXCLUDED_WORDS: [&str; 16] = [
+const EXTRACTOR_EXCLUDED_WORDS: [&str; 26] = [
     "service",
     "services",
     "repository",
@@ -213,6 +477,16 @@ const EXTRACTOR_EXCLUDED_WORDS: [&str; 16] = [
     "info",
     "data",
     "config",
+    "source",
+    "sources",
+    "store",
+    "pool",
+    "client",
+    "state",
+    "context",
+    "cache",
+    "dispatcher",
+    "agent",
 ];
 
 /// Records handler arguments whose type is an authorization extractor
@@ -313,7 +587,12 @@ fn classify_extractor_name(name: &str) -> Option<(AuthEvidenceKind, AuthStrength
         Some((AuthEvidenceKind::RoleCheck, AuthStrength::Medium))
     } else if classify_route_configuration_name(name)
         == Some(RouteConfigurationName::Authentication)
+        || (words.len() >= 2
+            && has_word(&["user", "principal", "identity", "caller", "auth", "authenticated"]))
     {
+        // A handler parameter is an extractor, so a type naming the caller
+        // (`LocalUserView`, `ReqPrincipal`, `ActixAuth`) identifies them. A
+        // bare `User` or `Auth` may be a domain value, and is not counted.
         Some((AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak))
     } else {
         None
@@ -1258,13 +1537,21 @@ pub(crate) fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthS
         .iter()
         .any(|prefix| lower.starts_with(prefix));
 
-    let classification = if is_one_of(&[
-        "require_auth",
-        "is_authenticated",
-        "require_authenticated_user",
-        "current_user",
-        "authenticated_user",
-    ]) {
+    // `host.validate_secret(..)?`, `verify_api_token(..)`: a presented
+    // credential is checked, which identifies the caller.
+    let credential_check = (uses_check_prefix || lower.starts_with("validate_"))
+        && ["secret", "token", "signature", "credentials", "password", "apikey"]
+            .contains(&last)
+        && !has_token(&["access", "csrf", "reset"]);
+    let classification = if credential_check
+        || is_one_of(&[
+            "require_auth",
+            "is_authenticated",
+            "require_authenticated_user",
+            "current_user",
+            "authenticated_user",
+        ])
+    {
         (AuthEvidenceKind::IdentityExtraction, AuthStrength::Weak)
     } else if is_one_of(&["authorize", "authorise", "is_authorized", "permit"])
         || ["authorize_", "authorise_", "is_authorized_"]
@@ -1908,6 +2195,69 @@ pub(crate) fn unrecognized_component(expr: &Expr) -> Option<String> {
         .find(|name| !is_benign_component(name))
 }
 
+/// Words that name authentication in a middleware or guard function:
+/// `reject_anonymous_users`, `Authentication`, `jwt_validator`.
+const AUTHENTICATION_COMPONENT_WORDS: [&str; 10] = [
+    "auth",
+    "authn",
+    "authentication",
+    "authenticate",
+    "authenticated",
+    "anonymous",
+    "jwt",
+    "bearer",
+    "oauth",
+    "login",
+];
+
+/// Whether a component name (snake_case or CamelCase) names authentication,
+/// and nothing that makes it an error handler or a logger.
+pub(crate) fn names_authentication(name: &str) -> bool {
+    let words: Vec<String> = if name.contains('_') || !name.chars().any(char::is_uppercase) {
+        name.split('_')
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        camel_case_words(name)
+    };
+    let has = |candidates: &[&str]| words.iter().any(|word| candidates.contains(&word.as_str()));
+    has(&AUTHENTICATION_COMPONENT_WORDS) && !has(&CONFIGURATION_EXCLUDED_WORDS)
+}
+
+/// Whether a component name names authorization: a variable or function
+/// such as `coordinator_authorization_middleware` or `require_admin_role`
+/// passed to `.wrap(..)`.
+pub(crate) fn names_authorization(name: &str) -> bool {
+    let words: Vec<String> = if name.contains('_') || !name.chars().any(char::is_uppercase) {
+        name.split('_')
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        camel_case_words(name)
+    };
+    let has = |candidates: &[&str]| words.iter().any(|word| candidates.contains(&word.as_str()));
+    has(&CONFIGURATION_AUTHORIZATION_WORDS) && !has(&CONFIGURATION_EXCLUDED_WORDS)
+}
+
+/// Whether a middleware expression is enabled only by configuration:
+/// `Condition::new(flag, Inner)`, `ConditionEx::from_option(..)`.
+pub(crate) fn is_conditional_component(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => matches!(&*call.func, Expr::Path(path)
+            if path.path.segments.iter().any(|segment| is_condition_wrapper(&segment.ident.to_string()))),
+        Expr::Reference(reference) => is_conditional_component(&reference.expr),
+        Expr::Paren(paren) => is_conditional_component(&paren.expr),
+        Expr::Group(group) => is_conditional_component(&group.expr),
+        _ => false,
+    }
+}
+
+fn is_condition_wrapper(name: &str) -> bool {
+    name == "Condition" || name == "ConditionEx"
+}
+
 fn is_benign_component(name: &str) -> bool {
     INFRASTRUCTURE_COMPONENTS.contains(&name)
         || camel_case_words(name)
@@ -1922,6 +2272,7 @@ fn component_heads(expr: &Expr) -> Vec<String> {
                 return call.args.iter().flat_map(component_heads).collect();
             };
             // `Condition::new(enabled, Inner)`: the flag is not a component.
+            // `ConditionEx::from_option(inner)`: the option holds it.
             if path
                 .path
                 .segments
@@ -1930,11 +2281,25 @@ fn component_heads(expr: &Expr) -> Vec<String> {
             {
                 return call.args.iter().skip(1).flat_map(component_heads).collect();
             }
+            if path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "ConditionEx")
+            {
+                return call.args.iter().flat_map(component_heads).collect();
+            }
             match component_name(&path.path) {
                 Some(name) => vec![name],
                 None => call.args.iter().flat_map(component_heads).collect(),
             }
         }
+        // `keys.map(|keys| AuthTransform::new(keys))`: the component is
+        // built in the closure.
+        Expr::MethodCall(call) if call.method == "map" => match call.args.first() {
+            Some(Expr::Closure(closure)) => component_heads(&closure.body),
+            _ => component_heads(&call.receiver),
+        },
         Expr::MethodCall(call) => component_heads(&call.receiver),
         Expr::Path(path) => component_name(&path.path).into_iter().collect(),
         Expr::Closure(_) => vec!["<closure>".into()],

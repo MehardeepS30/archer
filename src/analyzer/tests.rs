@@ -3467,9 +3467,14 @@ fn f05_builders_held_in_variables_keep_their_prefix_guards_and_routes() {
     ));
     assert_eq!(route_at(&report, "/admin/users").scope_prefix, "/admin");
     route_at(&report, "/orphan/x");
+    // `/orphan/x` registers handler `a`, which `/ops/a` registers behind
+    // `AdminGuard`.
     assert_eq!(
         reported(&report),
-        [finding(MissingAuthorization, "GET", "/ops/d")]
+        [
+            finding(MissingAuthorization, "GET", "/ops/d"),
+            finding(InconsistentRegistration, "GET", "/orphan/x"),
+        ]
     );
 }
 
@@ -3769,4 +3774,203 @@ fn text_findings_name_category_severity_and_reason() {
         "{text}"
     );
     assert!(text.contains("Why: No authentication"), "{text}");
+}
+
+#[test]
+fn f17_auth_named_middleware_authenticates_unless_conditional() {
+    let report = drift_fixture(
+        "f17",
+        include_str!("../../tests/fixtures/probes/drift/f17_auth_named_middleware.rs"),
+    );
+    assert!(has_evidence(
+        route_at(&report, "/admin/logout"),
+        AuthEvidenceKind::IdentityExtraction,
+        "reject_anonymous_users"
+    ));
+    assert!(has_evidence(
+        route_at(&report, "/internal/stats"),
+        AuthEvidenceKind::Unknown,
+        "ApiKeyAuth"
+    ));
+    assert_eq!(reported(&report), []);
+}
+
+#[test]
+fn f18_identity_handed_to_unanalyzed_code_is_unverified_not_missing() {
+    let report = drift_fixture(
+        "f18",
+        include_str!("../../tests/fixtures/probes/drift/f18_delegated_identity.rs"),
+    );
+    assert!(
+        route_at(&report, "/collections/d")
+            .authorization
+            .iter()
+            .any(|evidence| evidence.kind == AuthEvidenceKind::Delegated)
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(UnverifiedProtection, "POST", "/collections/d"),
+            finding(MissingAuthorization, "POST", "/collections/e"),
+        ]
+    );
+}
+
+#[test]
+fn f19_one_handler_registered_with_and_without_a_scope_layer() {
+    let report = drift_fixture(
+        "f19",
+        include_str!("../../tests/fixtures/probes/drift/f19_duplicate_registration.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(InconsistentRegistration, "POST", "/newsletters")]
+    );
+    let detail = &report.finding_details[0];
+    assert_eq!(detail.severity, Severity::High);
+    assert!(detail.rationale.contains("/admin/newsletters"));
+}
+
+#[test]
+fn f20_lone_read_in_a_nested_scope_is_compared_with_the_enclosing_scope() {
+    let report = drift_fixture(
+        "f20",
+        include_str!("../../tests/fixtures/probes/drift/f20_scope_tree_fallback.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "GET", "/admin/tagline/list")]
+    );
+}
+
+#[test]
+fn f21_helper_parameter_types_and_creates_are_not_drift() {
+    let report = drift_fixture(
+        "f21",
+        include_str!("../../tests/fixtures/probes/drift/f21_helper_types_and_creates.rs"),
+    );
+    assert!(
+        route_at(&report, "/ogc/map/tiles/{id}")
+            .authorization
+            .iter()
+            .all(|evidence| evidence.kind != AuthEvidenceKind::RoleCheck)
+    );
+    assert_eq!(reported(&report), []);
+}
+
+#[test]
+fn f22_test_modules_are_not_scanned_and_coverage_is_reported() {
+    let report = drift_fixture(
+        "f22",
+        include_str!("../../tests/fixtures/probes/drift/f22_test_modules_and_coverage.rs"),
+    );
+    let paths: Vec<_> = report.routes.iter().map(|route| route.path.as_str()).collect();
+    assert_eq!(paths, ["/"]);
+    assert_eq!(report.coverage.likely_handlers, 2);
+    assert_eq!(report.coverage.routed_handlers, 1);
+    assert!(report.coverage.unrouted_examples[0].ends_with("orphaned"));
+}
+
+#[test]
+fn handlers_resolve_into_other_workspace_crates() {
+    let repo = TempRepo::new(
+        "cross-crate",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"routes\", \"api\"]\n"),
+            ("routes/Cargo.toml", "[package]\nname = \"app-routes\"\n"),
+            (
+                "routes/src/lib.rs",
+                "use actix_web::web;
+                 use app_api::admin::{ban, purge};
+                 pub fn config(cfg: &mut web::ServiceConfig) {
+                     cfg.service(web::scope(\"/admin\")
+                         .route(\"/ban\", web::post().to(ban))
+                         .route(\"/purge\", web::post().to(purge))
+                         .route(\"/list\", web::post().to(app_api::admin::list)));
+                 }",
+            ),
+            ("api/Cargo.toml", "[package]\nname = \"app-api\"\n"),
+            ("api/src/lib.rs", "pub mod admin;"),
+            (
+                "api/src/admin.rs",
+                "pub async fn ban(u: LocalUserView) { is_admin(&u)?; }
+                 pub async fn purge(u: LocalUserView) { is_admin(&u)?; }
+                 pub async fn list(u: LocalUserView) {}",
+            ),
+        ],
+    );
+    let report = repo.analyze();
+    for path in ["/admin/ban", "/admin/purge"] {
+        let route = route_at(&report, path);
+        assert_eq!(resolution(route), &HandlerResolution::Imported, "{path}");
+        assert!(has_evidence(route, AuthEvidenceKind::RoleCheck, "is_admin"), "{path}");
+    }
+    assert_eq!(
+        resolution(route_at(&report, "/admin/list")),
+        &HandlerResolution::Qualified
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "POST", "/admin/list")]
+    );
+}
+
+#[test]
+fn library_names_come_from_lib_then_package() {
+    use super::library_name;
+    assert_eq!(
+        library_name("[package]\nname = \"lemmy-api\"\n").as_deref(),
+        Some("lemmy_api")
+    );
+    assert_eq!(
+        library_name("[package]\nname = \"x\"\n[lib]\nname = \"y_lib\"\n").as_deref(),
+        Some("y_lib")
+    );
+    assert_eq!(library_name("[workspace]\nmembers = []\n"), None);
+}
+
+#[test]
+fn credential_checks_identify_the_caller() {
+    assert_eq!(
+        classify_check_name("validate_secret").map(|(kind, _)| kind),
+        Some(AuthEvidenceKind::IdentityExtraction)
+    );
+    assert_eq!(classify_check_name("validate_reset_token"), None);
+}
+
+#[test]
+fn f23_named_authorization_layers_and_resource_method_guards() {
+    let report = drift_fixture(
+        "f23",
+        include_str!(
+            "../../tests/fixtures/probes/drift/f23_named_authorization_and_resource_guards.rs"
+        ),
+    );
+    assert!(has_evidence(
+        route_at(&report, "/coordinate/b"),
+        AuthEvidenceKind::AuthorizationMiddleware,
+        "coordinator_authorization_middleware"
+    ));
+    assert_eq!(route_at(&report, "/form/{id}").method, "GET");
+    assert_eq!(reported(&report), []);
+}
+
+#[test]
+fn files_of_test_only_modules_are_not_scanned() {
+    let repo = TempRepo::new(
+        "test-module-file",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/lib.rs",
+                "#[cfg(test)]\nmod tests;\npub fn config(cfg: &mut web::ServiceConfig) { cfg.route(\"/a\", web::get().to(a)); }\nasync fn a() {}",
+            ),
+            (
+                "src/tests.rs",
+                "fn app() { App::new().configure(crate::config).route(\"/fixture\", web::get().to(crate::a)); }",
+            ),
+        ],
+    );
+    let paths: Vec<_> = repo.analyze().routes.into_iter().map(|route| route.path).collect();
+    assert_eq!(paths, ["/a"]);
 }

@@ -39,7 +39,10 @@ pub(crate) fn build_analysis_layers_with(
         for key in [
             place.key(GroupLevel::Resource),
             place.key(GroupLevel::Namespace),
-        ] {
+        ]
+        .into_iter()
+        .chain(place.subtrees().map(|prefix| place.subtree_key(prefix)))
+        {
             members.entry(key).or_default().push(index);
         }
     }
@@ -49,10 +52,9 @@ pub(crate) fn build_analysis_layers_with(
     let mut order: Vec<GroupKey> = Vec::new();
     let mut judged: Vec<(usize, GroupKey, Option<GroupKey>)> = Vec::new();
     for (index, place) in placed.iter().enumerate() {
-        let Some(level) = comparison_level(place, &class_size) else {
+        let Some(own) = comparison_key(place, &class_size) else {
             continue;
         };
-        let own = place.key(level);
         let reads = (place.class == MethodClass::Write).then(|| GroupKey {
             class: MethodClass::Read,
             ..own.clone()
@@ -66,8 +68,8 @@ pub(crate) fn build_analysis_layers_with(
                 let weights: Vec<f64> = indices
                     .iter()
                     .map(|&member| match key.level {
-                        GroupLevel::Resource => 1.0,
-                        GroupLevel::Namespace => {
+                        GroupLevel::Resource | GroupLevel::Handler => 1.0,
+                        GroupLevel::Namespace | GroupLevel::Subtree => {
                             1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1)
                                 as f64
                         }
@@ -98,6 +100,8 @@ pub(crate) fn build_analysis_layers_with(
             match key.level {
                 GroupLevel::Resource => "resource",
                 GroupLevel::Namespace => "namespace",
+                GroupLevel::Subtree => "scope tree",
+                GroupLevel::Handler => "handler",
             },
             key.prefix
         );
@@ -139,10 +143,28 @@ pub(crate) fn build_analysis_layers_with(
         }) else {
             continue;
         };
-        let expected = basis.expected;
-        let Some(expected) = expected else {
+        let Some(mut expected) = basis.expected else {
             continue;
         };
+        // Ownership is checked against the record a route serves, so it is
+        // expected only of the routes of one resource. Across a namespace
+        // (`/admin/password`, `/admin/logout`), peers' ownership checks say
+        // that their callers are identified, not that every route has a
+        // record to own.
+        if expected == EvidenceTier::Resource && basis_key.level != GroupLevel::Resource {
+            expected = EvidenceTier::Identity;
+        }
+        // A create (`POST /messages`) makes the record its caller will own;
+        // there is nothing to own yet. Peers' ownership checks on edits and
+        // deletes say only that the caller must be identified.
+        if expected == EvidenceTier::Resource
+            && route.method == "POST"
+            && !basis.peers.iter().any(|peer| {
+                peer.method == "POST" && peer.best_tier() >= EvidenceTier::Resource
+            })
+        {
+            expected = EvidenceTier::Identity;
+        }
         let tier = route.best_tier();
         let category = if tier < expected {
             if unverified_beyond_peers(route, basis, options) {
@@ -186,8 +208,143 @@ pub(crate) fn build_analysis_layers_with(
             route, category, expected, basis, basis_key, basis_id, options,
         ));
     }
+    inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings)
+}
+
+/// One handler definition registered for the same method at several paths,
+/// where one registration lacks guards or middleware that another carries:
+/// `POST /newsletters` at the root next to `POST /admin/newsletters` inside
+/// an authenticated scope. The handler's own evidence is the same in both,
+/// so the difference is exactly what the scopes add. This needs no peer
+/// group, so it also covers routes at the root, which are never grouped.
+fn inconsistent_registrations(
+    routes: &[Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+    finding_details: &mut Vec<Finding>,
+) {
+    let key = |evidence: &AuthEvidence| {
+        (
+            format!("{:?}", evidence.kind),
+            evidence.mechanism.clone(),
+            evidence.file.clone(),
+            evidence.line,
+        )
+    };
+    let mut by_handler: Vec<((usize, &str), Vec<&Route>)> = Vec::new();
+    for route in unique_routes(routes.iter().filter(|route| {
+        !has_unresolved_segment(&route.path)
+            && !is_authentication_route(route)
+            && !is_well_known_public_route(route)
+    })) {
+        let Some(definition) = route.origin.definition else {
+            continue;
+        };
+        let id = (definition, route.method.as_str());
+        match by_handler.iter_mut().find(|(existing, _)| *existing == id) {
+            Some((_, registered)) => registered.push(route),
+            None => by_handler.push((id, vec![route])),
+        }
+    }
+    for (_, registrations) in by_handler {
+        let paths: HashSet<&str> = registrations.iter().map(|route| route.path.as_str()).collect();
+        if paths.len() < 2 {
+            continue;
+        }
+        for route in &registrations {
+            let own: HashSet<_> = route.authorization.iter().map(key).collect();
+            // The best other registration whose protection strictly includes
+            // this one's and adds a recognized authentication or
+            // authorization layer (an unknown component alone is not enough).
+            let Some((stronger, missing)) = registrations
+                .iter()
+                .filter(|other| other.path != route.path)
+                .filter_map(|other| {
+                    let theirs: HashSet<_> = other.authorization.iter().map(key).collect();
+                    if !own.is_subset(&theirs) {
+                        return None;
+                    }
+                    let missing: Vec<&AuthEvidence> = other
+                        .authorization
+                        .iter()
+                        .filter(|evidence| !own.contains(&key(evidence)))
+                        .collect();
+                    missing
+                        .iter()
+                        .any(|evidence| EvidenceTier::of(&evidence.kind) > EvidenceTier::None)
+                        .then_some((*other, missing))
+                })
+                .max_by_key(|(other, _)| other.best_tier())
+            else {
+                continue;
+            };
+            let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+            let handler = route.handler.as_deref().unwrap_or("?");
+            let mechanisms: Vec<String> = missing
+                .iter()
+                .map(|evidence| format!("`{}`", evidence.mechanism))
+                .collect();
+            peer_groups.push(PeerGroup {
+                id: id.clone(),
+                description: format!("{} registrations of handler {handler}", route.method),
+                prefix: stronger.path.clone(),
+                level: GroupLevel::Handler,
+                method_class: MethodClass::of(&route.method),
+                routes: registrations.iter().map(|route| (*route).into()).collect(),
+            });
+            let invariant = AuthorizationInvariant {
+                peer_group_id: id.clone(),
+                description: format!(
+                    "Every registration of `{handler}` carries {}.",
+                    mechanisms.join(", ")
+                ),
+                total_routes: registrations.len(),
+                routes_with_authorization: registrations
+                    .iter()
+                    .filter(|route| route.is_authorized())
+                    .count(),
+                routes_without_authorization: registrations
+                    .iter()
+                    .filter(|route| !route.is_authorized())
+                    .count(),
+                evidence_patterns: mechanisms.clone(),
+                strength: AuthStrength::Strong,
+                expected_tier: Some(stronger.best_tier()),
+                dominant_requirement: None,
+            };
+            let severity = if missing.iter().any(|evidence| {
+                EvidenceTier::of(&evidence.kind) >= EvidenceTier::Identity
+                    && evidence.symbol.as_deref().is_some_and(|symbol| {
+                        symbol.starts_with(".wrap") || symbol.starts_with(".guard")
+                    })
+            }) || missing.iter().any(|evidence| evidence.is_authorization())
+            {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
+            invariants.push(invariant.clone());
+            finding_details.push(Finding {
+                peer_group_id: id,
+                category: FindingCategory::InconsistentRegistration,
+                severity,
+                rationale: format!(
+                    "`{handler}` is also registered at {} {} behind {}, which this registration lacks.",
+                    stronger.method,
+                    stronger.path,
+                    mechanisms.join(", ")
+                ),
+                invariant,
+                suspicious_route: (*route).into(),
+                suspicious_route_tier: route.best_tier(),
+                expected_tier: stronger.best_tier(),
+                suspicious_route_evidence: route.authorization.clone(),
+                authorized_peer_routes: vec![stronger.into()],
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,10 +367,41 @@ impl Placement {
             level,
             prefix: match level {
                 GroupLevel::Resource => self.resource.clone(),
-                GroupLevel::Namespace => self.namespace.clone(),
+                GroupLevel::Namespace | GroupLevel::Subtree | GroupLevel::Handler => {
+                    self.namespace.clone()
+                }
             },
             class: self.class,
         }
+    }
+
+    fn subtree_key(&self, prefix: String) -> GroupKey {
+        GroupKey {
+            level: GroupLevel::Subtree,
+            prefix,
+            class: self.class,
+        }
+    }
+
+    /// The namespace and its enclosing prefixes, nearest first, that can
+    /// head a scope tree: not the root, and not only generic segments
+    /// (`/api/v4`), which would pool a whole API.
+    fn subtrees(&self) -> impl Iterator<Item = String> + use<> {
+        let segments: Vec<&str> = self
+            .namespace
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let prefixes: Vec<String> = (1..=segments.len())
+            .rev()
+            .filter(|&length| {
+                segments[..length]
+                    .iter()
+                    .any(|segment| !is_generic_segment(segment) && !is_dynamic_segment(segment))
+            })
+            .map(|length| format!("/{}", segments[..length].join("/")))
+            .collect();
+        prefixes.into_iter()
     }
 }
 
@@ -229,10 +417,14 @@ pub(crate) struct GroupKey {
 /// its namespace, when that is wider than the resource and not the bare root.
 /// A resource whose routes all lack evidence is thereby treated as public
 /// by design, not escalated.
-fn comparison_level(
+///
+/// A namespace that holds no other route of the class gives way to the
+/// nearest enclosing scope tree that does, so a lone read in
+/// `/admin/tagline` is compared with the reads under `/admin`.
+fn comparison_key(
     place: &Placement,
     class_size: &impl Fn(&GroupKey) -> usize,
-) -> Option<GroupLevel> {
+) -> Option<GroupKey> {
     let resource = place.key(GroupLevel::Resource);
     let reads = GroupKey {
         class: MethodClass::Read,
@@ -241,12 +433,22 @@ fn comparison_level(
     let informative = class_size(&resource) >= 2
         || (place.class == MethodClass::Write && class_size(&reads) >= 2);
     if informative {
-        Some(GroupLevel::Resource)
-    } else if place.namespace != place.resource && place.namespace != "/" {
-        Some(GroupLevel::Namespace)
-    } else {
-        None
+        return Some(resource);
     }
+    if place.namespace == place.resource || place.namespace == "/" {
+        return None;
+    }
+    let namespace = place.key(GroupLevel::Namespace);
+    let own_size = class_size(&namespace);
+    if own_size >= 2 {
+        return Some(namespace);
+    }
+    place
+        .subtrees()
+        .skip_while(|prefix| *prefix == place.namespace)
+        .map(|prefix| place.subtree_key(prefix))
+        .find(|key| class_size(key) > own_size.max(1))
+        .or(Some(namespace))
 }
 
 /// What a peer group establishes.
@@ -385,6 +587,10 @@ fn capitalized(text: &str) -> String {
 /// could not be analyzed.
 fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &AnalysisOptions) -> bool {
     !route.unverified.is_empty()
+        || route
+            .authorization
+            .iter()
+            .any(|evidence| evidence.kind == AuthEvidenceKind::Delegated)
         || route.authorization.iter().any(|evidence| {
             evidence.kind == AuthEvidenceKind::Unknown
                 && !group.common_unknowns.contains(&evidence.mechanism)
@@ -439,6 +645,10 @@ fn finding(
                 group.dominant_requirement.as_deref().unwrap_or("?")
             ),
         ),
+        FindingCategory::InconsistentRegistration => (
+            Severity::Medium,
+            "The same handler is registered elsewhere with protection this route lacks.".into(),
+        ),
         FindingCategory::UnverifiedProtection => (
             Severity::Low,
             format!(
@@ -451,8 +661,16 @@ fn finding(
                         route
                             .authorization
                             .iter()
-                            .filter(|evidence| evidence.kind == AuthEvidenceKind::Unknown)
-                            .map(|evidence| format!("unrecognized `{}`", evidence.mechanism))
+                            .filter(|evidence| {
+                                matches!(
+                                    evidence.kind,
+                                    AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated
+                                )
+                            })
+                            .map(|evidence| match evidence.kind {
+                                AuthEvidenceKind::Delegated => evidence.mechanism.clone(),
+                                _ => format!("unrecognized `{}`", evidence.mechanism),
+                            })
                     )
                     .collect::<Vec<_>>()
                     .join("; ")
@@ -706,7 +924,12 @@ fn static_segments(path: &str) -> Vec<String> {
 /// segments before it are generic or about accounts. `/admin/settings/auth`
 /// and `/admin/users/{id}/token` manage something and are analysed.
 pub(crate) fn is_authentication_route(route: &Route) -> bool {
-    const ENDPOINTS: [&str; 16] = [
+    const ENDPOINTS: [&str; 21] = [
+        "device",
+        "revoke",
+        "certs",
+        "jwks",
+        "captcha",
         "auth",
         "login",
         "logout",
@@ -732,7 +955,9 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
     let Some((last, before)) = statics.split_last() else {
         return false;
     };
-    ENDPOINTS.contains(&last.as_str())
+    // `password_reset`, `request-reset`, `email_confirm`.
+    last.split(['_', '-'])
+        .any(|word| ENDPOINTS.contains(&word))
         && before.iter().all(|segment| {
             is_generic_segment(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str())
         })

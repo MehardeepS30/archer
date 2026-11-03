@@ -94,6 +94,20 @@ fn run(cli: &Cli) -> Result<bool> {
         }
     }
     println!("Route candidates: {}", report.routes.len());
+    let coverage = &report.coverage;
+    println!(
+        "Handler coverage: {} of {} functions that look like handlers are routed",
+        coverage.routed_handlers, coverage.likely_handlers
+    );
+    if coverage.unresolved_handlers > 0 || coverage.unresolved_paths > 0 {
+        println!(
+            "  routes with unresolved handlers: {}; with unresolved paths: {}",
+            coverage.unresolved_handlers, coverage.unresolved_paths
+        );
+    }
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
     println!();
 
     for route in &report.routes {

@@ -82,13 +82,21 @@ pub(crate) struct HandlerIndex<'a> {
     pub(crate) scopes: HashMap<ModuleKey, ModuleScope>,
     pub(crate) modules: HashSet<ModuleKey>,
     pub(crate) file_modules: HashMap<PathBuf, ModuleKey>,
+    /// Library crates of the scanned workspace by the name other crates use
+    /// for them (`lemmy_api` for package `lemmy_api` or `lemmy-api`), so that
+    /// `use lemmy_api::site::purge` resolves into that crate.
+    pub(crate) crates: HashMap<String, PathBuf>,
 }
 
 impl<'a> HandlerIndex<'a> {
     pub(crate) fn build(
         files: impl IntoIterator<Item = (&'a Path, ModuleKey, &'a syn::File)>,
+        crates: HashMap<String, PathBuf>,
     ) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            crates,
+            ..Self::default()
+        };
         for (file, (crate_key, mut module), syntax) in files {
             for depth in 0..=module.len() {
                 index
@@ -157,7 +165,7 @@ impl<'a> HandlerIndex<'a> {
     ) {
         let own = &self.definitions[current].own;
         let contributed = (current != root)
-            .then_some(own.evidence.iter())
+            .then_some(own.body_evidence.iter())
             .into_iter()
             .flatten()
             .chain(
@@ -254,7 +262,10 @@ impl<'a> HandlerIndex<'a> {
 
     #[cfg(test)]
     pub(crate) fn single_file(file: &'a Path, syntax: &'a syn::File) -> Self {
-        Self::build([(file, (file.to_path_buf(), Vec::new()), syntax)])
+        Self::build(
+            [(file, (file.to_path_buf(), Vec::new()), syntax)],
+            HashMap::new(),
+        )
     }
 
     pub(crate) fn add_items(
@@ -346,17 +357,6 @@ impl<'a> HandlerIndex<'a> {
             .filter(move |&index| self.definitions[index].crate_key == crate_key)
     }
 
-    /// Resolves a handler expression from the module that registers the route.
-    pub(crate) fn resolve_handler(
-        &self,
-        crate_key: &Path,
-        module: &[String],
-        target: &HandlerTarget,
-    ) -> (Option<&HandlerDefinition>, HandlerResolution) {
-        let (index, resolution) = self.resolve_handler_index(crate_key, module, target);
-        (index.map(|index| &self.definitions[index]), resolution)
-    }
-
     /// The value of a string constant named by `segments` as written in
     /// `module`: defined there, brought in by one explicit `use`, or
     /// module-qualified.
@@ -367,9 +367,9 @@ impl<'a> HandlerIndex<'a> {
         segments: &[String],
     ) -> Option<String> {
         let (name, qualifier) = segments.split_last()?;
-        let lookup = |module: &[String]| {
+        let lookup = |(crate_key, module): &ModuleKey| {
             self.consts
-                .get(&(crate_key.to_path_buf(), module.to_vec(), name.clone()))
+                .get(&(crate_key.clone(), module.clone(), name.clone()))
                 .cloned()
         };
         if !qualifier.is_empty() {
@@ -379,7 +379,7 @@ impl<'a> HandlerIndex<'a> {
             };
             return lookup(&self.resolve_module(crate_key, module, &qualifier, 0)?);
         }
-        if let Some(value) = lookup(module) {
+        if let Some(value) = lookup(&(crate_key.to_path_buf(), module.to_vec())) {
             return Some(value);
         }
         let [import] = self.scope(crate_key, module)?.imports.get(name)?.as_slice() else {
@@ -442,7 +442,7 @@ impl<'a> HandlerIndex<'a> {
             };
             let mut visited = HashSet::new();
             let lookup =
-                match self.resolve_item(crate_key, &qualifier_module, name, &mut visited, 0) {
+                match self.resolve_item(&qualifier_module.0, &qualifier_module.1, name, &mut visited, 0) {
                     Lookup::Found(index, _) => Lookup::Found(index, HandlerResolution::Qualified),
                     other => other,
                 };
@@ -454,10 +454,13 @@ impl<'a> HandlerIndex<'a> {
             Lookup::Ambiguous(candidates) => (None, self.ambiguous(candidates)),
             Lookup::NotFound { explicit: true } => (None, HandlerResolution::Unresolved),
             Lookup::NotFound { explicit: false } => {
+                let search_crate = qualifier_module
+                    .as_ref()
+                    .map_or(crate_key, |(qualifier_crate, _)| qualifier_crate.as_path());
                 let candidates: Vec<usize> = self
-                    .definitions_named(crate_key, name)
+                    .definitions_named(search_crate, name)
                     .filter(|&index| {
-                        qualifier_module.as_ref().is_none_or(|qualifier| {
+                        qualifier_module.as_ref().is_none_or(|(_, qualifier)| {
                             self.definitions[index].module.starts_with(qualifier)
                         })
                     })
@@ -487,10 +490,12 @@ impl<'a> HandlerIndex<'a> {
         crate_key: &Path,
         module: &[String],
         name: &str,
-        visited: &mut HashSet<(Vec<String>, String)>,
+        visited: &mut HashSet<(PathBuf, Vec<String>, String)>,
         depth: usize,
     ) -> Lookup {
-        if depth > MAX_RESOLUTION_DEPTH || !visited.insert((module.to_vec(), name.to_owned())) {
+        if depth > MAX_RESOLUTION_DEPTH
+            || !visited.insert((crate_key.to_path_buf(), module.to_vec(), name.to_owned()))
+        {
             return Lookup::NotFound { explicit: true };
         }
 
@@ -520,7 +525,9 @@ impl<'a> HandlerIndex<'a> {
             .globs
             .iter()
             .filter_map(|glob| self.resolve_module(crate_key, module, glob, depth + 1))
-            .map(|glob_module| self.resolve_item(crate_key, &glob_module, name, visited, depth + 1))
+            .map(|(glob_crate, glob_module)| {
+                self.resolve_item(&glob_crate, &glob_module, name, visited, depth + 1)
+            })
             .collect();
         combine_lookups(lookups, HandlerResolution::GlobImported)
             .unwrap_or(Lookup::NotFound { explicit: false })
@@ -531,7 +538,7 @@ impl<'a> HandlerIndex<'a> {
         crate_key: &Path,
         module: &[String],
         path: &UsePath,
-        visited: &mut HashSet<(Vec<String>, String)>,
+        visited: &mut HashSet<(PathBuf, Vec<String>, String)>,
         depth: usize,
     ) -> Lookup {
         let Some((name, prefix)) = path.segments.split_last() else {
@@ -545,7 +552,13 @@ impl<'a> HandlerIndex<'a> {
             leading_colon: path.leading_colon,
         };
         match self.resolve_module(crate_key, module, &prefix, depth) {
-            Some(target) => match self.resolve_item(crate_key, &target, name, visited, depth) {
+            Some((target_crate, target)) => match self.resolve_item(
+                &target_crate,
+                &target,
+                name,
+                visited,
+                depth,
+            ) {
                 Lookup::NotFound { .. } => Lookup::NotFound { explicit: true },
                 lookup => lookup,
             },
@@ -553,24 +566,29 @@ impl<'a> HandlerIndex<'a> {
         }
     }
 
-    /// Resolves a module path written in `module` to an absolute module path
-    /// within the crate. Paths into other crates return `None`.
+    /// Resolves a module path written in `module` to an absolute module:
+    /// its crate and its path within that crate. A path whose first segment
+    /// names another library crate of the workspace resolves into that
+    /// crate; paths into crates outside the scan return `None`.
     pub(crate) fn resolve_module(
         &self,
         crate_key: &Path,
         module: &[String],
         path: &UsePath,
         depth: usize,
-    ) -> Option<Vec<String>> {
-        if path.leading_colon || depth > MAX_RESOLUTION_DEPTH {
+    ) -> Option<ModuleKey> {
+        if depth > MAX_RESOLUTION_DEPTH {
             return None;
         }
         let segments = &path.segments;
-        let (mut resolved, rest): (Vec<String>, &[String]) =
+        let external = |name: &str| self.crates.get(name).map(|key| (key.clone(), Vec::new()));
+        let ((target_crate, mut resolved), rest): (ModuleKey, &[String]) = if path.leading_colon {
+            ((external(segments.first()?)?), &segments[1..])
+        } else {
             match segments.first().map(String::as_str) {
-                None => return Some(module.to_vec()),
-                Some("crate") => (Vec::new(), &segments[1..]),
-                Some("self") => (module.to_vec(), &segments[1..]),
+                None => return Some((crate_key.to_path_buf(), module.to_vec())),
+                Some("crate") => ((crate_key.to_path_buf(), Vec::new()), &segments[1..]),
+                Some("self") => ((crate_key.to_path_buf(), module.to_vec()), &segments[1..]),
                 Some("super") => {
                     let supers = segments
                         .iter()
@@ -580,7 +598,10 @@ impl<'a> HandlerIndex<'a> {
                         return None;
                     }
                     (
-                        module[..module.len() - supers].to_vec(),
+                        (
+                            crate_key.to_path_buf(),
+                            module[..module.len() - supers].to_vec(),
+                        ),
                         &segments[supers..],
                     )
                 }
@@ -588,9 +609,11 @@ impl<'a> HandlerIndex<'a> {
                     let mut child = module.to_vec();
                     child.push(first.to_owned());
                     if self.is_module(crate_key, &child) {
-                        (child, &segments[1..])
-                    } else {
-                        let imports = self.scope(crate_key, module)?.imports.get(first)?;
+                        ((crate_key.to_path_buf(), child), &segments[1..])
+                    } else if let Some(imports) = self
+                        .scope(crate_key, module)
+                        .and_then(|scope| scope.imports.get(first))
+                    {
                         let [import] = imports.as_slice() else {
                             return None;
                         };
@@ -598,11 +621,17 @@ impl<'a> HandlerIndex<'a> {
                             self.resolve_module(crate_key, module, import, depth + 1)?,
                             &segments[1..],
                         )
+                    } else {
+                        // Since the 2018 edition, a dependency's name is in
+                        // scope in every module.
+                        (external(first)?, &segments[1..])
                     }
                 }
-            };
+            }
+        };
         resolved.extend(rest.iter().cloned());
-        self.is_module(crate_key, &resolved).then_some(resolved)
+        self.is_module(&target_crate, &resolved)
+            .then_some((target_crate, resolved))
     }
 }
 

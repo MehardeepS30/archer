@@ -429,6 +429,7 @@ impl<'a> RouteVisitor<'a> {
         } else {
             find_handler_closure(&node.args)
         };
+        let mut resolved_definition = None;
         let (handler_evidence, handler_resolution) = match &target {
             None => (Vec::new(), None),
             Some(HandlerTarget::Other) if closure.is_some() => (
@@ -441,9 +442,12 @@ impl<'a> RouteVisitor<'a> {
                 None => {
                     let (definition, resolution) =
                         self.index
-                            .resolve_handler(&self.crate_key, &self.module, target);
+                            .resolve_handler_index(&self.crate_key, &self.module, target);
+                    resolved_definition = definition;
                     (
-                        definition.map_or_else(Vec::new, |definition| definition.evidence.clone()),
+                        definition.map_or_else(Vec::new, |definition| {
+                            self.index.definitions[definition].evidence.clone()
+                        }),
                         Some(resolution),
                     )
                 }
@@ -477,8 +481,15 @@ impl<'a> RouteVisitor<'a> {
             handler.as_deref(),
         );
 
+        // `web::resource(p).guard(guard::Method(Method::GET)).to(h)`: the
+        // resource's method guards decide what its handler answers.
+        let method = if name == "to" {
+            resource_guard_method(&node.receiver).unwrap_or_else(|| "UNKNOWN".into())
+        } else {
+            extract_http_method(node)
+        };
         self.routes.push(Route {
-            method: extract_http_method(node),
+            method,
             path,
             scope_prefix: prefix,
             handler,
@@ -492,6 +503,7 @@ impl<'a> RouteVisitor<'a> {
                 position: span_position(node.method.span()),
                 attribute: None,
                 enclosing: self.enclosing,
+                definition: resolved_definition,
             },
         });
     }
@@ -741,6 +753,7 @@ impl RouteVisitor<'_> {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),
                     enclosing: None,
+                    definition,
                 },
             });
         }
@@ -914,6 +927,25 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
 
 /// Reads a method guard: `guard::Get()`, `actix_web::guard::Post()`, or
 /// `guard::Method(Method::PUT)`. Other guards return `None`.
+/// The one method a resource's own `.guard(..)` calls restrict it to.
+pub(crate) fn resource_guard_method(receiver: &Expr) -> Option<String> {
+    let mut methods = Vec::new();
+    let mut expr = receiver;
+    while let Expr::MethodCall(call) = expr {
+        if call.method == "guard"
+            && let Some(method) = call.args.first().and_then(method_guard)
+        {
+            methods.push(method);
+        }
+        expr = &call.receiver;
+    }
+    methods.dedup();
+    match methods.as_slice() {
+        [method] => Some(method.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn method_guard(expr: &Expr) -> Option<String> {
     let Expr::Call(call) = expr else {
         return None;
@@ -1052,15 +1084,38 @@ pub(crate) fn configuration_call_evidence(
             // Neither authorization, authentication, nor a known harmless
             // component: it may protect the route, so it is kept as unknown.
             if let Some(name) = unrecognized_component(arg) {
+                // Wrapped around the routes, a component named for
+                // authentication (`reject_anonymous_users`, `Authentication`)
+                // is authentication middleware: the `.wrap` is its shape.
+                // Enabled only by configuration (`Condition`), whether it
+                // runs is decided at runtime, so it stays unknown.
+                let conditional = is_conditional_component(arg);
+                let wrapped = method.method != "guard" && !conditional;
+                let authorizes = wrapped && names_authorization(&name);
+                let authenticates = wrapped && !authorizes && names_authentication(&name);
+                let mut requirements = Vec::new();
+                if authorizes {
+                    requirements = name_keys(&name);
+                }
                 evidence.push(AuthEvidence {
-                    kind: AuthEvidenceKind::Unknown,
+                    kind: if authorizes {
+                        AuthEvidenceKind::AuthorizationMiddleware
+                    } else if authenticates {
+                        AuthEvidenceKind::IdentityExtraction
+                    } else {
+                        AuthEvidenceKind::Unknown
+                    },
                     mechanism: name.clone(),
-                    symbol: Some(format!(".{}({name})", method.method)),
+                    symbol: Some(if conditional {
+                        format!(".{}(conditional {name})", method.method)
+                    } else {
+                        format!(".{}({name})", method.method)
+                    }),
                     file: file.to_path_buf(),
                     line: arg.span().start().line,
                     handler: handler.map(str::to_owned),
                     strength: AuthStrength::Weak,
-                    requirements: Vec::new(),
+                    requirements,
                 });
             }
             continue;

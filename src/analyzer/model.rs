@@ -16,6 +16,12 @@ pub enum AuthEvidenceKind {
     /// route, so a route carrying one is never reported as unprotected, only
     /// as unverified.
     Unknown,
+    /// The caller's identity or an authentication object is handed to code
+    /// Archer does not analyze: a method call such as `toc(&auth)` or
+    /// `principal.validate_admin_session()`, or an `auth::ApiKeyAuth` passed
+    /// to a request wrapper. Checks may happen there, so a route carrying
+    /// this is reported only as unverified.
+    Delegated,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -36,6 +42,7 @@ impl std::fmt::Display for AuthEvidenceKind {
             Self::OwnershipCheck => "ownership check",
             Self::ManualAuthorizationCheck => "manual authorization check",
             Self::Unknown => "unrecognized guard or middleware",
+            Self::Delegated => "identity passed to code Archer does not analyze",
         })
     }
 }
@@ -139,6 +146,8 @@ pub(crate) struct RouteOrigin {
     /// The module-level function whose own body (not a `.configure` expansion
     /// of it) produced the route.
     pub(crate) enclosing: Option<usize>,
+    /// The handler definition the route resolved to, if any.
+    pub(crate) definition: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +198,12 @@ pub enum GroupLevel {
     Resource,
     /// A declared scope, or for unscoped routes their leading segment(s).
     Namespace,
+    /// A declared scope together with the scopes nested in it, used when a
+    /// route's own scope holds no other route of its class: `/admin` for a
+    /// lone read in `/admin/tagline`.
+    Subtree,
+    /// Registrations of one handler definition at several paths.
+    Handler,
 }
 
 /// Reads and writes of one resource are compared separately: reads are often
@@ -270,6 +285,9 @@ pub enum FindingCategory {
     /// The route falls short of its peers, but carries a guard, middleware,
     /// or handler that Archer cannot analyze. Needs manual review.
     UnverifiedProtection,
+    /// The same handler is registered at another path behind guards or
+    /// middleware that this registration lacks.
+    InconsistentRegistration,
 }
 
 impl std::fmt::Display for FindingCategory {
@@ -280,6 +298,7 @@ impl std::fmt::Display for FindingCategory {
             Self::WeakerAuthorization => "weaker authorization",
             Self::DifferentAuthorization => "different authorization requirement",
             Self::UnverifiedProtection => "unverified protection",
+            Self::InconsistentRegistration => "inconsistent registration of one handler",
         })
     }
 }
@@ -325,7 +344,7 @@ impl EvidenceTier {
             | AuthEvidenceKind::ManualAuthorizationCheck => Self::Privilege,
             AuthEvidenceKind::OwnershipCheck => Self::Resource,
             AuthEvidenceKind::IdentityExtraction => Self::Identity,
-            AuthEvidenceKind::Unknown => Self::None,
+            AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated => Self::None,
         }
     }
 }
@@ -437,10 +456,30 @@ pub struct Report {
     pub routes: Vec<Route>,
     pub peer_groups: Vec<PeerGroup>,
     pub invariants: Vec<AuthorizationInvariant>,
+    /// How much of the repository's request handling the routes cover.
+    pub coverage: Coverage,
     /// Text renderings of `finding_details`, for the CLI and tests; the JSON
     /// report carries only the structured findings.
     #[serde(skip)]
     #[cfg_attr(not(test), allow(dead_code))]
     pub findings: Vec<String>,
     pub finding_details: Vec<Finding>,
+}
+
+/// How much of the repository's request handling Archer's routes cover. A
+/// low share means routes are registered in a way Archer cannot read, such
+/// as a custom routing macro, and that the findings speak for few handlers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Coverage {
+    /// Free functions that look like request handlers: async, taking an
+    /// Actix extractor or returning a response.
+    pub likely_handlers: usize,
+    /// Of those, the ones some route names as its handler.
+    pub routed_handlers: usize,
+    /// A few of the unrouted ones, as `file:line name`.
+    pub unrouted_examples: Vec<String>,
+    /// Routes whose handler could not be resolved, or matched several.
+    pub unresolved_handlers: usize,
+    /// Routes whose path holds a part that is not a literal or a constant.
+    pub unresolved_paths: usize,
 }
