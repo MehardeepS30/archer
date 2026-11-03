@@ -36,6 +36,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
         file: PathBuf::from("fixture.rs"),
         unverified: Vec::new(),
         requirement: Requirement::default(),
+        resource_keys: Vec::new(),
         origin: RouteOrigin::default(),
     }
 }
@@ -793,6 +794,7 @@ fn access_token_and_access_log_helpers_are_not_authorization() {
         file: PathBuf::from("access.rs"),
         unverified: Vec::new(),
         requirement: Requirement::default(),
+        resource_keys: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!token_route.is_authorized());
@@ -1224,6 +1226,7 @@ fn identity_extraction_is_not_authorization() {
         file: PathBuf::from("identity.rs"),
         unverified: Vec::new(),
         requirement: Requirement::default(),
+        resource_keys: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!route.is_authorized());
@@ -4104,4 +4107,36 @@ fn role_lists_and_ownership_are_compared_as_fields() {
             (FindingCategory::WeakerAuthorization, "GET".to_string(), "/reports/yearly".to_string()),
         ]
     );
+}
+
+#[test]
+fn routes_serving_the_same_data_are_compared_across_paths() {
+    let report = drift_fixture(
+        "f30",
+        include_str!("../../tests/fixtures/probes/drift/f30_same_resource_links.rs"),
+    );
+    let keys = |path: &str| -> Vec<String> {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap_or_else(|| panic!("no route {path}"))
+            .resource_keys
+            .clone()
+    };
+    assert!(keys("/catalog/item/{id}/{rev}").contains(&"calls crate::store::load_revision".to_string()));
+    assert!(keys("/studio/item/{id}").contains(&"calls crate::store::load_item".to_string()));
+    // One shared error constructor is not a resource link.
+    assert!(keys("/catalog/item/{id}").contains(&"calls crate::store::not_found".to_string()));
+    assert_eq!(
+        reported(&report),
+        [(
+            FindingCategory::SameResourceWeakerProtection,
+            "GET".to_string(),
+            "/catalog/item/{id}/{rev}".to_string()
+        )]
+    );
+    let finding = &report.finding_details[0];
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(finding.authorized_peer_routes[0].path, "/studio/item/{id}");
 }

@@ -132,6 +132,10 @@ pub struct Route {
     pub unverified: Vec<String>,
     /// What the route's evidence requires of a caller, field by field.
     pub requirement: Requirement,
+    /// What links the route to routes serving the same data: its handler
+    /// definition, repository functions it calls, model types it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_keys: Vec<String>,
     /// Extraction bookkeeping that is not part of the report.
     #[serde(skip)]
     pub(crate) origin: RouteOrigin,
@@ -256,6 +260,9 @@ pub enum GroupLevel {
     Subtree,
     /// Registrations of one handler definition at several paths.
     Handler,
+    /// Routes linked by the data they serve: a shared handler, repository
+    /// function, or model type, whatever their paths.
+    Linked,
 }
 
 /// Reads and writes of one resource are compared separately: reads are often
@@ -340,6 +347,10 @@ pub enum FindingCategory {
     /// The same handler is registered at another path behind guards or
     /// middleware that this registration lacks.
     InconsistentRegistration,
+    /// The route serves the same data as other routes (a shared handler,
+    /// repository function, or model type) but requires less of the caller:
+    /// no login, no role, or no ownership check where they have one.
+    SameResourceWeakerProtection,
 }
 
 impl std::fmt::Display for FindingCategory {
@@ -351,6 +362,7 @@ impl std::fmt::Display for FindingCategory {
             Self::DifferentAuthorization => "different authorization requirement",
             Self::UnverifiedProtection => "unverified protection",
             Self::InconsistentRegistration => "inconsistent registration of one handler",
+            Self::SameResourceWeakerProtection => "same resource, weaker protection",
         })
     }
 }

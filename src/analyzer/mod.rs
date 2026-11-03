@@ -5,6 +5,7 @@ mod evidence;
 mod handlers;
 mod middleware;
 mod model;
+mod resources;
 mod routes;
 #[cfg(test)]
 mod tests;
@@ -187,6 +188,15 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
             }
         }
         route.requirement = Requirement::of(route);
+    }
+
+    let keys = resources::resource_keys(
+        &index,
+        parsed_files.iter().map(|(_, _, syntax)| syntax),
+        &routes,
+    );
+    for (route, keys) in routes.iter_mut().zip(keys) {
+        route.resource_keys = keys;
     }
 
     let (peer_groups, invariants, finding_details, findings) =

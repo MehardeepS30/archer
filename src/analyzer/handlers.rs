@@ -222,7 +222,7 @@ impl<'a> HandlerIndex<'a> {
 
     /// Repository functions that a function's body calls by path, with
     /// whether the call's result is enforced.
-    fn resolved_calls(&self, definition: usize) -> ResolvedCalls {
+    pub(crate) fn resolved_calls(&self, definition: usize) -> ResolvedCalls {
         let caller = &self.definitions[definition];
         let resolve = |target: &HandlerTarget| match self.resolve_handler_index(
             &caller.crate_key,

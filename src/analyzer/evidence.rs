@@ -687,13 +687,19 @@ fn reads_caller_identity(expr: &Expr) -> bool {
         Expr::MethodCall(call) => Some(call.method.to_string()),
         _ => None,
     };
-    name.is_some_and(|name| {
-        let lower = name.to_ascii_lowercase();
-        lower
-            .split('_')
-            .any(|word| CALLER_SOURCE_WORDS.contains(&word))
-            || lower.contains("user_id")
-    })
+    name.is_some_and(|name| names_caller_source(&name))
+}
+
+/// Whether a function or type is named for the caller's identity:
+/// `get_username_from_session`, `current_user_id`, `Claims`.
+pub(crate) fn names_caller_source(name: &str) -> bool {
+    let words: Vec<String> = if name.contains('_') || !name.chars().any(char::is_uppercase) {
+        name.to_ascii_lowercase().split('_').map(str::to_owned).collect()
+    } else {
+        camel_case_words(name)
+    };
+    words.iter().any(|word| CALLER_SOURCE_WORDS.contains(&word.as_str()))
+        || words.windows(2).any(|pair| pair[0] == "user" && pair[1] == "id")
 }
 
 impl AuthEvidenceVisitor {

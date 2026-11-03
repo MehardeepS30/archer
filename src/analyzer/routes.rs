@@ -500,6 +500,7 @@ impl<'a> RouteVisitor<'a> {
             file: self.file.clone(),
             unverified,
             requirement: Requirement::default(),
+            resource_keys: Vec::new(),
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
                 attribute: None,
@@ -751,6 +752,7 @@ impl RouteVisitor<'_> {
                 file: self.file.clone(),
                 unverified: Vec::new(),
                 requirement: Requirement::default(),
+                resource_keys: Vec::new(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),

@@ -59,7 +59,7 @@ pub(crate) fn build_analysis_layers_with(
         let weights: Vec<f64> = indices
             .iter()
             .map(|&member| match key.level {
-                GroupLevel::Resource | GroupLevel::Handler => 1.0,
+                GroupLevel::Resource | GroupLevel::Handler | GroupLevel::Linked => 1.0,
                 GroupLevel::Namespace | GroupLevel::Subtree => {
                     1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1) as f64
                 }
@@ -121,6 +121,7 @@ pub(crate) fn build_analysis_layers_with(
                 GroupLevel::Namespace => "namespace",
                 GroupLevel::Subtree => "scope tree",
                 GroupLevel::Handler => "handler",
+                GroupLevel::Linked => "linked routes",
             },
             key.prefix
         );
@@ -234,6 +235,7 @@ pub(crate) fn build_analysis_layers_with(
         ));
     }
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings)
 }
@@ -372,6 +374,192 @@ fn inconsistent_registrations(
     }
 }
 
+/// What `stronger` requires of a caller that `route` does not: a login, a
+/// role, or an ownership check. A route that checks ownership is not held to
+/// a linked route's role (owners reach their own records, admins every
+/// record), and a route with a role is not held to ownership.
+fn stronger_fields(route: &Requirement, stronger: &Requirement, same_handler: bool) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if stronger.authenticated && !route.authenticated {
+        fields.push("a logged-in caller");
+    }
+    // Administrative routes act on everyone's records by design, so a role
+    // carries over only between registrations of one handler.
+    if same_handler && !stronger.roles.is_empty() && route.roles.is_empty() && !route.ownership {
+        fields.push("a role");
+    }
+    if stronger.ownership && !route.ownership && route.roles.is_empty() {
+        fields.push("an ownership check");
+    }
+    fields
+}
+
+/// How strongly two routes are linked: `usize::MAX` for one handler, else
+/// the number of repository functions and model types both take request
+/// data into. A single shared function or type (an error constructor, a
+/// converter) is too weak a link to compare on, so it counts as none.
+fn link_strength(route: &Route, other: &Route) -> usize {
+    let shared: Vec<&String> = route
+        .resource_keys
+        .iter()
+        .filter(|key| other.resource_keys.contains(key))
+        .collect();
+    if shared.iter().any(|key| key.starts_with("handler ")) {
+        return usize::MAX;
+    }
+    if shared.len() >= 2 { shared.len() } else { 0 }
+}
+
+/// Routes that serve the same data as routes requiring more of the caller,
+/// whatever their paths: the resource-link comparison. A route is reported
+/// when a dominant share of the routes linked to it, of its method class,
+/// require something it lacks. Routes already reported by peer groups are
+/// left alone.
+fn same_resource_weaker(
+    routes: &[Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+    finding_details: &mut Vec<Finding>,
+    options: &AnalysisOptions,
+) {
+    let eligible: Vec<&Route> = unique_routes(routes.iter().filter(|route| {
+        !route.resource_keys.is_empty()
+            && !has_unresolved_segment(&route.path)
+            && !is_authentication_route(route)
+            && !is_well_known_public_route(route)
+    }));
+    let reported: HashSet<_> = finding_details
+        .iter()
+        .map(|finding| {
+            let route = &finding.suspicious_route;
+            (route.method.clone(), route.path.clone(), route.handler.clone())
+        })
+        .collect();
+    for route in &eligible {
+        if reported.contains(&(route.method.clone(), route.path.clone(), route.handler.clone())) {
+            continue;
+        }
+        let class = MethodClass::of(&route.method);
+        let linked: Vec<&Route> = eligible
+            .iter()
+            .copied()
+            .filter(|other| {
+                route_identity(other) != route_identity(route)
+                    && MethodClass::of(&other.method) == class
+                    && other.path != route.path
+                    && link_strength(route, other) > 0
+            })
+            .collect();
+        if linked.is_empty() {
+            continue;
+        }
+        let requirement = Requirement::of(route);
+        let stronger: Vec<(&Route, Vec<&'static str>)> = linked
+            .iter()
+            .map(|other| {
+                let same_handler = link_strength(route, other) == usize::MAX;
+                (*other, stronger_fields(&requirement, &Requirement::of(other), same_handler))
+            })
+            .filter(|(_, fields)| !fields.is_empty())
+            .collect();
+        // Pairwise, one stronger link is support enough; the share must
+        // still dominate the route's links.
+        let share = stronger.len() as f64 / linked.len() as f64;
+        if stronger.is_empty() || share + 1e-9 < options.dominance_threshold {
+            continue;
+        }
+        let mut fields: Vec<&str> = stronger.iter().flat_map(|(_, fields)| fields.iter().copied()).collect();
+        fields.sort();
+        fields.dedup();
+        let shared: Vec<String> = route
+            .resource_keys
+            .iter()
+            .filter(|key| stronger.iter().any(|(other, _)| other.resource_keys.contains(key)))
+            .cloned()
+            .collect();
+        // Protection that cannot be evaluated and that the stronger routes
+        // do not share may close the gap: review, not a finding.
+        let unverified_own = !route.unverified.is_empty()
+            || route.authorization.iter().any(|evidence| {
+                matches!(evidence.kind, AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated)
+                    && !stronger.iter().all(|(other, _)| {
+                        other.authorization.iter().any(|theirs| {
+                            theirs.kind == evidence.kind && theirs.mechanism == evidence.mechanism
+                        })
+                    })
+            });
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut members: Vec<RouteReference> = vec![(*route).into()];
+        members.extend(linked.iter().map(|other| (*other).into()));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!("{class} routes linked to {} {} by {}", route.method, route.path, shared.join(", ")),
+            prefix: route.path.clone(),
+            level: GroupLevel::Linked,
+            method_class: class,
+            routes: members,
+        });
+        let expected = stronger
+            .iter()
+            .map(|(other, _)| other.best_tier())
+            .max()
+            .unwrap_or(EvidenceTier::Identity);
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!(
+                "Routes serving the same data ({}) require {}.",
+                shared.join(", "),
+                fields.join(" and ")
+            ),
+            total_routes: linked.len() + 1,
+            routes_with_authorization: linked.iter().filter(|other| other.is_authorized()).count()
+                + usize::from(route.is_authorized()),
+            routes_without_authorization: linked.iter().filter(|other| !other.is_authorized()).count()
+                + usize::from(!route.is_authorized()),
+            evidence_patterns: fields.iter().map(|field| field.to_string()).collect(),
+            strength: AuthStrength::Medium,
+            expected_tier: Some(expected),
+            dominant_requirement: None,
+        };
+        invariants.push(invariant.clone());
+        let (category, severity, rationale) = if unverified_own {
+            (
+                FindingCategory::UnverifiedProtection,
+                Severity::Low,
+                format!(
+                    "Serves the same data as {} ({}), which require {}; it has protection Archer cannot verify. Review manually.",
+                    stronger.iter().map(|(other, _)| format!("{} {}", other.method, other.path)).collect::<Vec<_>>().join(", "),
+                    shared.join(", "),
+                    fields.join(" and ")
+                ),
+            )
+        } else {
+            (
+                FindingCategory::SameResourceWeakerProtection,
+                Severity::Medium,
+                format!(
+                    "Serves the same data as {} ({}), which require {} that this route lacks.",
+                    stronger.iter().map(|(other, _)| format!("{} {}", other.method, other.path)).collect::<Vec<_>>().join(", "),
+                    shared.join(", "),
+                    fields.join(" and ")
+                ),
+            )
+        };
+        finding_details.push(Finding {
+            peer_group_id: id,
+            category,
+            severity,
+            rationale,
+            invariant,
+            suspicious_route: (*route).into(),
+            suspicious_route_tier: route.best_tier(),
+            expected_tier: expected,
+            suspicious_route_evidence: route.authorization.clone(),
+            authorized_peer_routes: stronger.iter().map(|(other, _)| (*other).into()).collect(),
+        });
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
     build_analysis_layers(routes).3
@@ -392,7 +580,7 @@ impl Placement {
             level,
             prefix: match level {
                 GroupLevel::Resource => self.resource.clone(),
-                GroupLevel::Namespace | GroupLevel::Subtree | GroupLevel::Handler => {
+                GroupLevel::Namespace | GroupLevel::Subtree | GroupLevel::Handler | GroupLevel::Linked => {
                     self.namespace.clone()
                 }
             },
@@ -796,6 +984,10 @@ fn finding(
         FindingCategory::InconsistentRegistration => (
             Severity::Medium,
             "The same handler is registered elsewhere with protection this route lacks.".into(),
+        ),
+        FindingCategory::SameResourceWeakerProtection => (
+            Severity::Medium,
+            "Routes serving the same data require more of the caller than this route.".into(),
         ),
         FindingCategory::UnverifiedProtection => (
             Severity::Low,
