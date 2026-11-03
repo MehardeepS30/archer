@@ -36,9 +36,9 @@ Evidence-Backed Findings
 
 1. **Route extraction:** Scans Rust source files and extracts recognized Actix-Web route definitions, HTTP methods, paths, and source locations, then resolves each route's handler to a single function definition, including handlers defined in other files.
 2. **Authorization evidence analysis:** Looks for recognized authorization-related evidence in route configurations, middleware or guards, and the resolved handler's code.
-3. **Structural peer grouping:** Groups comparable routes so authorization patterns can be evaluated in context.
-4. **Invariant inference:** Identifies authorization patterns consistently present among comparable routes.
-5. **Drift detection:** Flags routes without recognized authorization evidence in peer groups that contain at least two authorized routes.
+3. **Structural peer grouping:** Groups the read and write routes of each resource (`/admin/users`, `/admin/users/{id}`, ...), and falls back to the whole namespace (scope) for resources too small to compare. See [Drift detection](#drift-detection).
+4. **Invariant inference:** Finds the evidence tier (identity, resource ownership, privilege) and the requirement (such as `admin`) that a dominant share of each group reaches.
+5. **Drift detection:** Flags routes below their group's tier (missing authentication, missing or weaker authorization), routes that require a different privilege, and gaps that only Archer's blind spots could explain (unverified protection).
 6. **Evidence reporting:** Presents suspicious routes alongside supporting peer routes and the inferred invariant.
 
 ## Key Features
@@ -153,6 +153,30 @@ If the routes are considered comparable and the evidence supports a consistent a
 
 This does **not** automatically establish that the endpoint is exploitable. Authorization may be enforced through mechanisms that ARCHER does not recognize, including custom abstractions or protections outside the analyzed source.
 
+## Drift detection
+
+**Peer groups.** A route's *namespace* is its declared scope. Outside any scope, it is the leading generic segments (`/api`, `/api/v1`), or else the first segment (`/admin`). Its *resource* is the namespace plus the next static segment, so `/admin/users`, `/admin/users/{id}`, and `/admin/users/{id}/roles` share the resource `/admin/users`. Reads (GET/HEAD/OPTIONS/TRACE) and writes (POST/PUT/PATCH/DELETE, any, unknown) are grouped separately. A route is compared with its resource when the resource holds another route of its class (or, for a write, two reads). Otherwise it is compared with its namespace, where each resource counts once.
+
+**Tiers.** Evidence is ranked none < identity < resource (ownership) < privilege (role, permission, authorization guard or middleware, explicit authorize). A group's expected tier is the highest one reached by at least `--min-support` routes making up at least `--threshold` of the group. A write is also held to the tier its resource's reads reach, and, when a write is alone in its namespace, to a privilege tier its namespace's reads require.
+
+**Findings.**
+
+| Category | Meaning | Severity |
+|---|---|---|
+| `MissingAuthentication` | No evidence; peers at least authenticate | high |
+| `MissingAuthorization` | At most identity; peers reach resource or privilege | high (privilege) / medium |
+| `WeakerAuthorization` | Ownership only; peers check a privilege | medium |
+| `DifferentAuthorization` | Same tier, but not the requirement a dominant share of peers checks (`viewer` where peers require `admin`) | medium |
+| `UnverifiedProtection` | Falls short, but has an unrecognized guard or middleware, or a handler that could not be analyzed, that its peers do not share | low |
+
+**Requirements** are normalized subjects read from names (`require_admin`, `AdminUser`, `AdminGuard` all give `admin`), literals (`#[has_roles("ROLE_ADMIN")]`, `has_role(&u, "admin")`), variants (`Role::Admin`), and type parameters (`RequireRole<Admin>`). Routes with per-route permissions (`reports:sales`, `reports:stock`) have no dominant requirement and are never reported as different.
+
+**Enforcement.** Extractors, authorization attributes, and imperative calls (`require_*`, `ensure_*`, `check_*`, `verify_*`, `assert_*`, `authorize*`) count when they run. Predicates (`is_admin`, `has_role`, role comparisons, `matches!`, flag fields, ownership comparisons such as `post.owner_id != user.id`) count only where their value decides a rejection: an `if`/`match`/`while` condition with a rejecting branch, `let ... else`, `ensure!`/`assert!`, an expression under `?`, a returned `Result`, or a `let` binding later used in such a condition. A display badge, a struct field copy, or `if is_admin(&u) { log(..) }` is not protection. A `bool` helper (`fn can_manage(u) -> bool { u.role == Role::Admin }`) lends its predicate only to callers that enforce it. Ownership comparisons inside `filter`/`retain`/`find` closures scope data and count; role comparisons there select records and do not.
+
+**Unknown components.** A `.wrap`/`.guard`/`wrap_fn` argument that is neither authorization, authentication, nor known infrastructure (`Logger`, `Compress`, `Cors`, `DefaultHeaders`, `NormalizePath`, `ErrorHandlers`, tracing, metrics, sessions, rate limiting, CSRF, routing guards) is recorded as `Unknown`. `IdentityMiddleware` and `SessionMiddleware` make an identity available without requiring one, so they are not authentication.
+
+**Exemptions.** Authentication endpoints (`login`, `logout`, `register`, `token`, `refresh`, `callback`, `reset`, ...) and health, metrics, version, and API-documentation endpoints are left out only when every segment before them is generic or about accounts (`/api/v1/auth/login`, `/healthz`). `/admin/metrics` and `/admin/settings/auth` are analysed.
+
 ## Implementation Details
 
 ### Current implementation
@@ -163,7 +187,7 @@ The analyzer (`src/analyzer.rs`):
 - extracts `.route(...)` / `.resource(...)` registrations and `#[get]`/`#[post]`/... attribute routes, with nested `web::scope(...)` and `.service(...)` prefixes;
 - resolves each route's `.to(...)` handler to a single definition (see below) and attaches that definition's authorization evidence;
 - records typed evidence (role, permission, ownership, guard, middleware, manual check, identity) with file, line, handler, and strength; identity extraction alone is not authorization;
-- groups structurally comparable routes (same scope prefix, method, segment count, and dynamic-segment shape), infers an invariant per group, and reports unauthorized routes in groups with at least two authorized peers.
+- groups routes by resource and method class, falling back to their namespace, infers the dominant tier and requirement per group, and reports routes that fall short of it (see [Drift detection](#drift-detection)).
 
 ### Handler resolution
 
@@ -177,6 +201,7 @@ Each route reports `handler_path` (the path as written) and `handler_resolution`
 | `GlobImported` | Exactly one matching glob import | yes |
 | `Qualified` | `handlers::x`, `crate::`, `self::`, `super::`, or an imported module alias | yes |
 | `UniqueName` | Path rules found nothing; exactly one compatible definition exists in the crate | yes |
+| `Closure` | A closure written at the route; its parameters and body are read in place | yes |
 | `Ambiguous` | Several definitions match; `candidates` lists their Rust paths | no |
 | `Unresolved` | No single definition could be identified | no |
 
@@ -192,7 +217,7 @@ Bare names are first resolved lexically, innermost scope first:
 Evidence comes from the resolved handler's body, from the route's own `.guard(...)` arguments, and from the `.guard(...)` and `.wrap(...)` calls of its scope and every enclosing scope. A scope's middleware applies to all of that scope's routes and nested scopes wherever the call appears in its builder chain, and never to sibling scopes or to a sibling route's own guards. All of it is kept: guard or middleware evidence never replaces handler evidence. Route paths and handler names are never evidence.
 
 - **Helper calls and method calls** are classified by their snake_case words. Exact names such as `require_admin`, `has_role`, `is_admin`, `check_permission`, `authorize`, and `owns` count, as do `require_`/`check_`/`verify_`/`assert_`/`ensure_` names whose words include a role (`admin`, `manager`, `role`), permission, owner, or a final `access` (`verify_resource_access`), and `authorize_*` names.
-- **Macro invocations** in a handler body, as statements (`require_admin!(user);`) or inside expressions (`if !has_role!(user, "admin") { ... }`), are classified by the macro's own name with the same rules, using the last path segment (`auth::require_admin!`). The evidence `symbol` keeps the macro path with a trailing `!`. Macro arguments are opaque, so `assert!(is_admin(&user))` and logging or formatting macros (`info!`, `format!`) are not evidence.
+- **Macro invocations** in a handler body, as statements (`require_admin!(user);`) or inside expressions (`if !has_role!(user, "admin") { ... }`), are classified by the macro's own name with the same rules, using the last path segment (`auth::require_admin!`). The evidence `symbol` keeps the macro path with a trailing `!`. The conditions of `ensure!`/`assert!`/`assert_eq!` are read as enforced checks; `debug_assert!` and logging or formatting macros (`info!`, `format!`) are not evidence. String literals in macros such as `sqlx::query!` count as ownership evidence when they filter on an owner column (`WHERE ... owner_id = $1`).
 - Names ending in a data, lookup, or logging word are not checks: `ensure_admin_exists`, `check_admin_token`, `role_name`, `permissions_list`, `check_access_log`. Token validation, user lookups, and OAuth state checks (`verify_access_token`, `check_username`, `ensure_user_exists`, `verify_oauth_state`) are not authorization.
 - Authentication helpers (`require_auth`, `is_authenticated`, `require_authenticated_user`) and identity values (`Claims`, `Identity`) are recorded as weak identity evidence, which never makes a route authorized.
 - **Guard and middleware types** need an authorization word (`admin`, `role`, `permission`, `authorization`, `acl`, `rbac`) and a guard-like word (`Guard`, `Middleware`, `Filter`, `Require`, `Check`, `Only`, ...): `AdminGuard`, `RequireAdmin`, `AdminAuthMiddleware`. Authentication-only types (`AuthMiddleware`, `AuthGuard`, `JwtGuard`, `HttpAuthentication`) are identity evidence. Error-mapping and logging types (`UnauthorizedHandler`, `AuthorizationErrorMiddleware`, `RoleLogger`) and unrelated types such as `PermissionsPolicy` are ignored. Guard functions such as `guard::fn_guard(check_admin)` use the helper-name rules.
@@ -202,7 +227,7 @@ Evidence comes from the resolved handler's body, from the route's own `.guard(..
 ARCHER never merges evidence from same-named functions and never guesses:
 - several candidates (through globs, duplicates, or the fallback) produce `Ambiguous` with no evidence;
 - `UniqueName` is used only when no path rule matched, never after an ambiguity, an explicit import that leaves the crate, or a qualifier that is not a module of this crate; a written qualifier must prefix the candidate's module;
-- absolute (`::x`) and other-crate paths, `impl` methods (`Type::method`), closures, and shadowed names are `Unresolved`;
+- absolute (`::x`) and other-crate paths, `impl` methods (`Type::method`), and shadowed names are `Unresolved`, and such a route is reported only as unverified, never as missing authorization;
 - evidence inside functions, `impl` methods, or `trait` methods declared within a handler body belongs to them, not to the enclosing handler.
 
 ## Testing
@@ -223,7 +248,7 @@ For reproducible evaluation, run ARCHER against controlled fixtures with known a
 
 ### Validation status
 
-- `cargo test --offline --locked`: 35 tests pass.
+- `cargo test --offline --locked`: 105 unit tests and 3 CLI tests pass, including 16 drift fixtures in `tests/fixtures/probes/drift/`.
 - A synthetic single-file integration fixture produces its expected 16 routes, 3 peer groups, and the one intended `GET /api/admin/payments` finding.
 - These are controlled synthetic checks. They do not establish accuracy or generalization on real-world Actix-Web codebases. Historical benchmark figures in `docs/evaluation/` were produced by an earlier engine version and have not been rerun.
 
@@ -232,14 +257,14 @@ For reproducible evaluation, run ARCHER against controlled fixtures with known a
 ARCHER is an evolving research prototype, and its results depend on the authorization patterns and Actix-Web constructs it can recognize.
 
 - Helper recognition is a name-based heuristic; custom authorization abstractions may not be detected, and a recognized name does not prove what a helper does. Middleware whose name says only "auth" is treated as authentication, even if it also enforces permissions.
-- Scope middleware is linked only through builder chains in one expression: `.wrap(...)` on an `App` or scope does not reach routes registered in another function (`App::new().wrap(X).configure(routes)`) or through a `ServiceConfig` passed elsewhere.
-- Calls are not followed: a handler that calls a protected helper with an unrecognized name has no recognized evidence.
+- Scope middleware follows builder chains, `.configure(f)`, route-factory functions, and builders held in local variables (`let admin = web::scope("/admin").wrap(G);`). Builders stored in struct fields, statics, or passed as function arguments are not followed.
+- Calls to repository free functions are followed three levels deep; method calls (`self.policy.check()`) are not.
 - Macros are not expanded: a recognized macro name is evidence only of what its name says, a macro with an unrecognized name contributes nothing even if it enforces authorization, and calls written inside macro arguments are not seen. Attribute macros on handlers (such as `#[protect(...)]`) are not recognized.
 - Not modeled: `use` declarations inside function bodies, macro-generated items and bindings, `#[path]` modules, `impl`-method handlers, cross-crate workspace dependencies, Rust 2015 crate-relative paths, and attribute routes registered through `.service(handler)` inside a scope (their scope prefix is not applied).
 - `main.rs` and `lib.rs` share one namespace; same-named functions in both are `Ambiguous`.
-- Local closures used as handlers carry no evidence.
-- Structural similarity does not guarantee that two routes should have identical authorization requirements.
-- Peer groups require at least two authorized routes; there is no majority threshold, so every unauthorized route in a qualifying group is reported.
+- Structural similarity does not guarantee that two routes should have identical authorization requirements. Intentionally public reads next to protected writes are not reported, and nor are resources whose routes are all public; a lone public route in a protected namespace is.
+- A group needs `--min-support` (default 2) routes reaching its tier, making up `--threshold` (default 0.6) of it. So a two-route group with one protected route is not reported by default.
+- Enforcement is judged syntactically: a check counts when its result reaches a rejection (`return`, `?`, `Err`, a forbidden or unauthorized response, a panic) in the same function or in a called helper. Rejections that happen through custom control flow (callbacks, error-mapping traits) are not seen.
 - Missing recognized evidence does not necessarily mean authorization is absent.
 - Inferred invariants may produce false positives or miss genuine authorization inconsistencies.
 - Findings should be validated against the application's intended access-control policy and runtime behavior.

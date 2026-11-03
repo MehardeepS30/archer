@@ -6,8 +6,8 @@ use std::{
 };
 use syn::{
     Arm, BinOp, Block, Expr, ExprCall, ExprClosure, ExprForLoop, ExprIf, ExprLit, ExprMethodCall,
-    ExprWhile, FnArg, ImplItemFn, Item, ItemFn, ItemMod, Lit, Pat, ReturnType, Signature, Stmt,
-    TraitItemFn, Type, TypeParamBound,
+    ExprPath, ExprWhile, FnArg, ImplItemFn, Item, ItemFn, ItemMod, Lit, Pat, ReturnType, Signature,
+    Stmt, TraitItemFn, Type, TypeParamBound,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -27,13 +27,21 @@ pub(crate) struct BlockScope {
     /// path and stay out of `HandlerIndex`. `None` marks a name that cannot be
     /// resolved to one function: a duplicate `fn`, or a `const`/`static`.
     pub(crate) items: HashMap<String, Option<Vec<AuthEvidence>>>,
+    /// Builders bound to a variable in this block, such as `let admin =
+    /// web::scope("/admin").wrap(AdminGuard);`, with any earlier binding they
+    /// extend substituted in. Wherever the variable is used, the builder is
+    /// read as if written there.
+    pub(crate) builders: HashMap<String, Expr>,
+    /// Bound builders not yet used; visited when the block ends so that
+    /// their routes are not lost.
+    pub(crate) unused_builders: Vec<String>,
 }
 
 impl BlockScope {
     pub(crate) fn with_locals(locals: HashSet<String>) -> Self {
         Self {
             locals,
-            items: HashMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -60,6 +68,8 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) enclosing: Option<usize>,
     /// `.configure` targets being expanded, innermost last.
     pub(crate) expanding: Vec<usize>,
+    /// Builder variables being read in place, innermost last.
+    pub(crate) expanding_builders: Vec<String>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -93,7 +103,151 @@ impl<'a> RouteVisitor<'a> {
             configured: Vec::new(),
             enclosing: None,
             expanding: Vec::new(),
+            expanding_builders: Vec::new(),
         }
+    }
+
+    /// The innermost builder bound to `name`, with the index of its block
+    /// scope, unless a value binding shadows it.
+    pub(crate) fn builder_binding(&self, name: &str) -> Option<(usize, &Expr)> {
+        for (index, scope) in self.block_scopes.iter().enumerate().rev() {
+            if let Some(builder) = scope.builders.get(name) {
+                return Some((index, builder));
+            }
+            if scope.locals.contains(name) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// `expr` with the builder variable its chain starts from substituted,
+    /// if it starts from one: `admin.route(..)` for `let admin =
+    /// web::scope("/admin").wrap(G);` becomes `web::scope("/admin").wrap(G).route(..)`.
+    pub(crate) fn substituted(&self, expr: &Expr) -> Option<Expr> {
+        let Expr::Path(path) = chain_root_expr(expr) else {
+            return None;
+        };
+        let name = path.path.get_ident()?.to_string();
+        let (_, builder) = self.builder_binding(&name)?;
+        Some(substitute_root(expr, builder))
+    }
+
+    /// A copy of a method call with builder variables substituted in its
+    /// receiver chain and arguments (`.route("/x", admin_get.to(h))`), or
+    /// `None` when it uses none.
+    pub(crate) fn resolve_call(&self, node: &ExprMethodCall) -> Option<ExprMethodCall> {
+        let receiver = self.substituted(&node.receiver);
+        let arguments: Vec<Option<Expr>> =
+            node.args.iter().map(|arg| self.substituted(arg)).collect();
+        if receiver.is_none() && arguments.iter().all(Option::is_none) {
+            return None;
+        }
+        let mut call = node.clone();
+        if let Some(receiver) = receiver {
+            call.receiver = Box::new(receiver);
+        }
+        for (slot, argument) in call.args.iter_mut().zip(arguments) {
+            if let Some(argument) = argument {
+                *slot = argument;
+            }
+        }
+        Some(call)
+    }
+
+    /// The builder an expression evaluates to, with builder variables
+    /// substituted, if it is one: a chain starting from `web::scope`,
+    /// `web::resource`, a route constructor such as `web::get()`, `App::new()`,
+    /// or a variable holding one of these.
+    pub(crate) fn builder_value(&self, expr: &Expr) -> Option<Expr> {
+        if let Some(substituted) = self.substituted(expr) {
+            return Some(substituted);
+        }
+        is_builder_constructor(chain_root_expr(expr)).then(|| expr.clone())
+    }
+
+    /// Records `let name = <builder>;` or `name = <builder>;` instead of
+    /// visiting it; the builder is read where the variable is used.
+    pub(crate) fn bind_builder(&mut self, statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Local(local) => {
+                let Some(init) = &local.init else {
+                    return false;
+                };
+                if init.diverge.is_some() {
+                    return false;
+                }
+                let Some(name) = simple_binding(&local.pat) else {
+                    return false;
+                };
+                let Some(builder) = self.builder_value(&init.expr) else {
+                    return false;
+                };
+                self.mark_extended(&init.expr);
+                // A builder rebinding the same name (`let s = s.route(..)`)
+                // already contains the earlier one.
+                let scope = self.block_scopes.last_mut().expect("inside a block");
+                scope.builders.insert(name.clone(), builder);
+                scope.unused_builders.retain(|unused| *unused != name);
+                scope.unused_builders.push(name.clone());
+                scope.locals.insert(name);
+                true
+            }
+            Stmt::Expr(Expr::Assign(assign), _) => {
+                let Some(name) = (match &*assign.left {
+                    Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+                    _ => None,
+                }) else {
+                    return false;
+                };
+                let Some((index, _)) = self.builder_binding(&name) else {
+                    return false;
+                };
+                let Some(builder) = self.builder_value(&assign.right) else {
+                    return false;
+                };
+                self.mark_extended(&assign.right);
+                let scope = &mut self.block_scopes[index];
+                scope.builders.insert(name.clone(), builder);
+                scope.unused_builders.retain(|unused| *unused != name);
+                scope.unused_builders.push(name);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A builder extended into another (`let b = a.route(..)`) is used by it.
+    fn mark_extended(&mut self, expr: &Expr) {
+        if let Expr::Path(path) = chain_root_expr(expr)
+            && let Some(name) = path.path.get_ident().map(ToString::to_string)
+            && let Some((index, _)) = self.builder_binding(&name)
+        {
+            self.block_scopes[index]
+                .unused_builders
+                .retain(|unused| *unused != name);
+        }
+    }
+
+    /// Drops a builder binding of the current block, first reading it in
+    /// place if it was never used, so that its routes are still reported.
+    fn retire_builder(&mut self, name: &str) {
+        let scope = self.block_scopes.last_mut().expect("inside a block");
+        let was_unused = scope.unused_builders.iter().any(|unused| unused == name);
+        scope.unused_builders.retain(|unused| unused != name);
+        let Some(builder) = scope.builders.get(name).cloned() else {
+            return;
+        };
+        if was_unused {
+            self.expanding_builders.push(name.to_string());
+            <Self as Visit<'_>>::visit_expr(self, &builder);
+            self.expanding_builders.pop();
+        }
+        self.block_scopes
+            .last_mut()
+            .expect("inside a block")
+            .builders
+            .remove(name);
     }
 
     /// The definition a `.service`/`.configure` argument names, unless it is
@@ -239,6 +393,9 @@ impl<'a> RouteVisitor<'a> {
         if name != "route" && name != "resource" && name != "to" {
             return;
         }
+        // Builders held in variables are read as if written in place.
+        let resolved = self.resolve_call(node);
+        let node = resolved.as_ref().unwrap_or(node);
 
         // `cfg.route("/path", builder)` names its path; `web::resource("/path")
         // .route(builder)` and `web::resource("/path").to(handler)` take it
@@ -267,8 +424,17 @@ impl<'a> RouteVisitor<'a> {
         } else {
             find_handler(&node.args)
         };
+        let closure = if name == "to" {
+            node.args.first().and_then(as_closure)
+        } else {
+            find_handler_closure(&node.args)
+        };
         let (handler_evidence, handler_resolution) = match &target {
             None => (Vec::new(), None),
+            Some(HandlerTarget::Other) if closure.is_some() => (
+                closure_evidence(&self.file, closure.expect("checked above"), "<closure>"),
+                Some(HandlerResolution::Closure),
+            ),
             Some(target) => match self.block_local_handler(target) {
                 Some(Some(evidence)) => (evidence.to_vec(), Some(HandlerResolution::Local)),
                 Some(None) => (Vec::new(), Some(HandlerResolution::Unresolved)),
@@ -284,6 +450,22 @@ impl<'a> RouteVisitor<'a> {
             },
         };
         let handler = target.as_ref().and_then(HandlerTarget::name);
+        let written = target.as_ref().and_then(HandlerTarget::written);
+        let unverified = match (&target, &handler_resolution) {
+            (Some(HandlerTarget::Other), Some(HandlerResolution::Closure)) => Vec::new(),
+            (Some(HandlerTarget::Other), _) => {
+                vec!["handler is an expression Archer cannot follow".to_string()]
+            }
+            (_, Some(HandlerResolution::Ambiguous { .. })) => vec![format!(
+                "handler `{}` matches several definitions",
+                written.as_deref().unwrap_or("?")
+            )],
+            (_, Some(HandlerResolution::Unresolved)) => vec![format!(
+                "handler `{}` could not be resolved",
+                written.as_deref().unwrap_or("?")
+            )],
+            _ => Vec::new(),
+        };
         let mut authorization =
             classify_authorization(node, handler.as_deref(), &handler_evidence, &self.file);
         // Middleware and guards of this route's scope, wherever they appear in
@@ -300,11 +482,12 @@ impl<'a> RouteVisitor<'a> {
             path,
             scope_prefix: prefix,
             handler,
-            handler_path: target.as_ref().and_then(HandlerTarget::written),
+            handler_path: written,
             handler_resolution,
             authorization,
             line: path_line,
             file: self.file.clone(),
+            unverified,
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
                 attribute: None,
@@ -426,6 +609,18 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         }
         self.block_scopes.push(scope);
         for statement in &node.stmts {
+            if self.bind_builder(statement) {
+                continue;
+            }
+            if let Stmt::Local(local) = statement {
+                // A value binding shadows a builder of the same name; an
+                // unused builder is read before it goes out of reach.
+                let mut names = HashSet::new();
+                pattern_bindings(&local.pat, &mut names);
+                for name in names {
+                    self.retire_builder(&name);
+                }
+            }
             self.visit_stmt(statement);
             if let Stmt::Local(local) = statement {
                 let scope = self
@@ -435,7 +630,44 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
                 pattern_bindings(&local.pat, &mut scope.locals);
             }
         }
+        let unused = std::mem::take(
+            &mut self
+                .block_scopes
+                .last_mut()
+                .expect("block scope pushed above")
+                .unused_builders,
+        );
+        for name in unused {
+            if let Some(builder) = self
+                .block_scopes
+                .last()
+                .and_then(|scope| scope.builders.get(&name))
+                .cloned()
+            {
+                self.expanding_builders.push(name);
+                <Self as Visit<'_>>::visit_expr(self, &builder);
+                self.expanding_builders.pop();
+            }
+        }
         self.block_scopes.pop();
+    }
+
+    /// A variable that holds a builder is read as the builder, here.
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        if let Some(name) = node.path.get_ident().map(ToString::to_string)
+            && !self.expanding_builders.contains(&name)
+            && let Some((scope, builder)) = self.builder_binding(&name)
+        {
+            let builder = builder.clone();
+            self.block_scopes[scope]
+                .unused_builders
+                .retain(|unused| *unused != name);
+            self.expanding_builders.push(name);
+            <Self as Visit<'_>>::visit_expr(self, &builder);
+            self.expanding_builders.pop();
+            return;
+        }
+        visit::visit_expr_path(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
@@ -445,7 +677,9 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         let root = chain_root(node);
         let starts_chain = self.chain_scopes.last().map(|(chain, _)| *chain) != Some(root);
         if starts_chain {
-            let evidence = chain_configuration_evidence(node, &self.file);
+            let resolved = self.resolve_call(node);
+            let evidence =
+                chain_configuration_evidence(resolved.as_ref().unwrap_or(node), &self.file);
             self.chain_scopes.push((root, evidence));
         }
 
@@ -502,6 +736,7 @@ impl RouteVisitor<'_> {
                 handler: Some(handler),
                 line: path_literal.span().start().line,
                 file: self.file.clone(),
+                unverified: Vec::new(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),
@@ -814,8 +1049,26 @@ pub(crate) fn configuration_call_evidence(
     };
     for arg in &method.args {
         let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
+            // Neither authorization, authentication, nor a known harmless
+            // component: it may protect the route, so it is kept as unknown.
+            if let Some(name) = unrecognized_component(arg) {
+                evidence.push(AuthEvidence {
+                    kind: AuthEvidenceKind::Unknown,
+                    mechanism: name.clone(),
+                    symbol: Some(format!(".{}({name})", method.method)),
+                    file: file.to_path_buf(),
+                    line: arg.span().start().line,
+                    handler: handler.map(str::to_owned),
+                    strength: AuthStrength::Weak,
+                    requirements: Vec::new(),
+                });
+            }
             continue;
         };
+        let mut requirements = name_keys(&identifier.name);
+        requirements.extend(keys_in_expr(arg));
+        requirements.sort();
+        requirements.dedup();
         // Authentication-only guards and middleware establish who the caller
         // is, not what they may do.
         let (kind, strength) = match class {
@@ -834,6 +1087,7 @@ pub(crate) fn configuration_call_evidence(
             line: identifier.line,
             handler: handler.map(str::to_owned),
             strength,
+            requirements,
         });
     }
 }
@@ -1012,6 +1266,17 @@ impl RouteVisitor<'_> {
                         None => String::new(),
                     };
                 }
+                Expr::Path(path) => {
+                    let builder = path
+                        .path
+                        .get_ident()
+                        .and_then(|name| self.builder_binding(&name.to_string()))
+                        .map(|(_, builder)| builder.clone());
+                    break match builder {
+                        Some(builder) => self.scope_prefix(&builder),
+                        None => String::new(),
+                    };
+                }
                 _ => break String::new(),
             }
         };
@@ -1030,6 +1295,14 @@ impl RouteVisitor<'_> {
             Expr::MethodCall(method) => self.resource_path(&method.receiver),
             Expr::Paren(paren) => self.resource_path(&paren.expr),
             Expr::Group(group) => self.resource_path(&group.expr),
+            Expr::Path(path) => {
+                let builder = path
+                    .path
+                    .get_ident()
+                    .and_then(|name| self.builder_binding(&name.to_string()))
+                    .map(|(_, builder)| builder.clone())?;
+                self.resource_path(&builder)
+            }
             Expr::Call(call)
                 if matches!(
                     &*call.func,
@@ -1193,4 +1466,96 @@ pub(crate) fn join_paths(prefix: &str, path: &str) -> String {
         (false, true) => format!("/{prefix}"),
         (false, false) => format!("/{prefix}/{path}"),
     }
+}
+
+/// The expression a method-call chain starts from, through parentheses.
+pub(crate) fn chain_root_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::MethodCall(call) => chain_root_expr(&call.receiver),
+        Expr::Paren(paren) => chain_root_expr(&paren.expr),
+        Expr::Group(group) => chain_root_expr(&group.expr),
+        _ => expr,
+    }
+}
+
+/// A copy of `expr` whose chain starts from `replacement` instead of its root.
+pub(crate) fn substitute_root(expr: &Expr, replacement: &Expr) -> Expr {
+    match expr {
+        Expr::MethodCall(call) => {
+            let mut call = call.clone();
+            call.receiver = Box::new(substitute_root(&call.receiver, replacement));
+            Expr::MethodCall(call)
+        }
+        Expr::Paren(paren) => substitute_root(&paren.expr, replacement),
+        Expr::Group(group) => substitute_root(&group.expr, replacement),
+        _ => replacement.clone(),
+    }
+}
+
+/// `web::scope(..)`, `web::resource(..)`, `web::get()` and the other route
+/// constructors, `App::new()`, `Scope::new(..)`, `Resource::new(..)`, `Route::new()`.
+pub(crate) fn is_builder_constructor(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        [.., last] if last == "scope" || last == "resource" => true,
+        [.., owner, new]
+            if new == "new" && ["App", "Scope", "Resource", "Route"].contains(&owner.as_str()) =>
+        {
+            true
+        }
+        [.., module, method] if module == "web" => {
+            ROUTE_METHOD_CONSTRUCTORS.contains(&method.as_str())
+                || method == "method"
+                || method == "route"
+        }
+        _ => false,
+    }
+}
+
+/// The name a `let` pattern binds when it binds exactly one name:
+/// `admin`, `mut scope`, `admin: Scope`.
+fn simple_binding(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(ident) if ident.subpat.is_none() => Some(ident.ident.to_string()),
+        Pat::Type(typed) => simple_binding(&typed.pat),
+        _ => None,
+    }
+}
+
+fn as_closure(expr: &Expr) -> Option<&ExprClosure> {
+    match expr {
+        Expr::Closure(closure) => Some(closure),
+        Expr::Paren(paren) => as_closure(&paren.expr),
+        Expr::Group(group) => as_closure(&group.expr),
+        _ => None,
+    }
+}
+
+/// The closure a route builder's `.to(...)` takes, if it takes one.
+pub(crate) fn find_handler_closure(
+    exprs: &syn::punctuated::Punctuated<Expr, syn::token::Comma>,
+) -> Option<&ExprClosure> {
+    fn in_expr(expr: &Expr) -> Option<&ExprClosure> {
+        match expr {
+            Expr::MethodCall(method) if method.method == "to" => as_closure(method.args.first()?),
+            Expr::MethodCall(method) => method
+                .args
+                .iter()
+                .find_map(in_expr)
+                .or_else(|| in_expr(&method.receiver)),
+            _ => None,
+        }
+    }
+    exprs.iter().find_map(in_expr)
 }

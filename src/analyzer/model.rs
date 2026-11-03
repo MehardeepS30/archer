@@ -12,7 +12,9 @@ pub enum AuthEvidenceKind {
     IdentityExtraction,
     OwnershipCheck,
     ManualAuthorizationCheck,
-    #[allow(dead_code)]
+    /// A guard or middleware that Archer cannot classify. It may protect the
+    /// route, so a route carrying one is never reported as unprotected, only
+    /// as unverified.
     Unknown,
 }
 
@@ -33,7 +35,7 @@ impl std::fmt::Display for AuthEvidenceKind {
             Self::IdentityExtraction => "identity extraction (not authorization)",
             Self::OwnershipCheck => "ownership check",
             Self::ManualAuthorizationCheck => "manual authorization check",
-            Self::Unknown => "unknown",
+            Self::Unknown => "unrecognized guard or middleware",
         })
     }
 }
@@ -57,6 +59,11 @@ pub struct AuthEvidence {
     pub line: usize,
     pub handler: Option<String>,
     pub strength: AuthStrength,
+    /// Normalized subjects the check requires, such as `admin` for
+    /// `require_admin`, `AdminUser`, `#[has_roles("ADMIN")]`, or
+    /// `user.role == Role::Admin`. Empty when no subject can be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<String>,
 }
 
 impl AuthEvidence {
@@ -91,6 +98,9 @@ pub enum HandlerResolution {
     Qualified,
     /// Path rules found nothing; the crate holds exactly one compatible definition.
     UniqueName,
+    /// The handler is a closure written at the route; its own parameters and
+    /// body are the evidence.
+    Closure,
     /// Several definitions match; no evidence is attached.
     Ambiguous { candidates: Vec<String> },
     /// No definition could be identified; no evidence is attached.
@@ -108,6 +118,11 @@ pub struct Route {
     pub authorization: Vec<AuthEvidence>,
     pub line: usize,
     pub file: PathBuf,
+    /// Why the route's protection cannot be fully judged statically, such as
+    /// an unresolved handler. A route with reasons is never reported as
+    /// missing authorization, only as unverified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified: Vec<String>,
     /// Extraction bookkeeping that is not part of the report.
     #[serde(skip)]
     pub(crate) origin: RouteOrigin,
@@ -134,6 +149,7 @@ pub struct RouteReference {
     pub file: PathBuf,
     pub line: usize,
     pub authorized: bool,
+    pub tier: EvidenceTier,
     pub authorization: Vec<AuthEvidence>,
 }
 
@@ -146,6 +162,7 @@ impl From<&Route> for RouteReference {
             file: route.file.clone(),
             line: route.line,
             authorized: route.is_authorized(),
+            tier: route.best_tier(),
             authorization: route.authorization.clone(),
         }
     }
@@ -155,9 +172,52 @@ impl From<&Route> for RouteReference {
 pub struct PeerGroup {
     pub id: String,
     pub description: String,
-    /// The full-path prefix the group's routes share; see `peer_prefix`.
+    /// The path prefix the group's routes share: a resource such as
+    /// `/admin/users`, or a namespace such as `/admin`; see `GroupLevel`.
     pub prefix: String,
+    pub level: GroupLevel,
+    pub method_class: MethodClass,
     pub routes: Vec<RouteReference>,
+}
+
+/// How specific a peer group is. Routes are compared with the routes of
+/// their own resource; a route whose resource has too few comparable routes
+/// is compared with its whole namespace instead.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GroupLevel {
+    /// One resource: `/admin/users`, `/admin/users/{id}`, `/admin/users/{id}/roles`.
+    Resource,
+    /// A declared scope, or for unscoped routes their leading segment(s).
+    Namespace,
+}
+
+/// Reads and writes of one resource are compared separately: reads are often
+/// public where writes are not. Writes are additionally held to the tier
+/// their resource's reads reach.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MethodClass {
+    /// GET, HEAD, OPTIONS, TRACE.
+    Read,
+    /// POST, PUT, PATCH, DELETE, and routes answering any or an unknown method.
+    Write,
+}
+
+impl std::fmt::Display for MethodClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        })
+    }
+}
+
+impl MethodClass {
+    pub fn of(method: &str) -> Self {
+        match method {
+            "GET" | "HEAD" | "OPTIONS" | "TRACE" => Self::Read,
+            _ => Self::Write,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,12 +229,20 @@ pub struct AuthorizationInvariant {
     pub routes_without_authorization: usize,
     pub evidence_patterns: Vec<String>,
     pub strength: AuthStrength,
+    /// The tier a dominant share of the group reaches, if any.
+    pub expected_tier: Option<EvidenceTier>,
+    /// A requirement (such as `admin`) that a dominant share of the group's
+    /// privilege-tier routes carries.
+    pub dominant_requirement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub peer_group_id: String,
     pub category: FindingCategory,
+    pub severity: Severity,
+    /// One sentence on why the route was reported.
+    pub rationale: String,
     pub invariant: AuthorizationInvariant,
     pub suspicious_route: RouteReference,
     /// The best tier of the suspicious route's own evidence.
@@ -188,15 +256,53 @@ pub struct Finding {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum FindingCategory {
+    /// The route has no evidence at all while its peers at least
+    /// authenticate the caller.
+    MissingAuthentication,
     /// The route has no authorization evidence while its peers do.
     MissingAuthorization,
     /// The route has authorization evidence, but of a lower tier than its
     /// peers', such as an ownership check where peers check a role.
     WeakerAuthorization,
+    /// The route checks a privilege, but not the one its peers require, such
+    /// as `viewer` where peers require `admin`.
+    DifferentAuthorization,
+    /// The route falls short of its peers, but carries a guard, middleware,
+    /// or handler that Archer cannot analyze. Needs manual review.
+    UnverifiedProtection,
+}
+
+impl std::fmt::Display for FindingCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingAuthentication => "missing authentication",
+            Self::MissingAuthorization => "missing authorization",
+            Self::WeakerAuthorization => "weaker authorization",
+            Self::DifferentAuthorization => "different authorization requirement",
+            Self::UnverifiedProtection => "unverified protection",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
 }
 
 /// How much a piece of evidence restricts access, ordered weakest first.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvidenceTier {
     /// No recognized evidence.
     None,
@@ -240,6 +346,19 @@ impl Route {
         self.authorization
             .iter()
             .any(AuthEvidence::is_authorization)
+    }
+
+    /// Requirement subjects of the route's privilege-tier evidence.
+    pub fn privilege_requirements(&self) -> Vec<&str> {
+        let mut requirements: Vec<&str> = self
+            .authorization
+            .iter()
+            .filter(|evidence| EvidenceTier::of(&evidence.kind) == EvidenceTier::Privilege)
+            .flat_map(|evidence| evidence.requirements.iter().map(String::as_str))
+            .collect();
+        requirements.sort_unstable();
+        requirements.dedup();
+        requirements
     }
 
     /// The highest tier among the route's evidence.

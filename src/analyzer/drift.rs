@@ -26,57 +26,300 @@ pub(crate) fn build_analysis_layers_with(
     Vec<Finding>,
     Vec<String>,
 ) {
-    // `same_peer_group` is an equivalence on routes that are neither
-    // authentication endpoints nor unresolved, so peers are bucketed by its key
-    // in one pass, in order of first appearance. Comparing every pair made
-    // grouping cubic in the number of routes.
-    let mut buckets: Vec<Vec<&Route>> = Vec::new();
-    let mut bucket_of: HashMap<PeerKey, usize> = HashMap::new();
-    for route in routes {
-        if is_authentication_route(route) || has_unresolved_segment(&route.path) {
-            continue;
+    let candidates: Vec<&Route> = unique_routes(routes.iter().filter(|route| {
+        !is_authentication_route(route)
+            && !is_well_known_public_route(route)
+            && !has_unresolved_segment(&route.path)
+    }));
+    let placed: Vec<Placement> = candidates.iter().map(|route| placement(route)).collect();
+
+    // Routes of each (level, prefix, class), in order of first appearance.
+    let mut members: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+    for (index, place) in placed.iter().enumerate() {
+        for key in [
+            place.key(GroupLevel::Resource),
+            place.key(GroupLevel::Namespace),
+        ] {
+            members.entry(key).or_default().push(index);
         }
-        let bucket = *bucket_of.entry(peer_key(route)).or_insert_with(|| {
-            buckets.push(Vec::new());
-            buckets.len() - 1
-        });
-        buckets[bucket].push(route);
     }
-    let grouped_routes: Vec<Vec<&Route>> = buckets
-        .into_iter()
-        .map(unique_routes)
-        .filter(|peers| peers.len() >= 2 && peers.iter().any(|peer| peer.is_authorized()))
-        .collect();
+    let class_size = |key: &GroupKey| members.get(key).map_or(0, Vec::len);
+
+    let mut stats: HashMap<GroupKey, GroupStats> = HashMap::new();
+    let mut order: Vec<GroupKey> = Vec::new();
+    let mut judged: Vec<(usize, GroupKey, Option<GroupKey>)> = Vec::new();
+    for (index, place) in placed.iter().enumerate() {
+        let Some(level) = comparison_level(place, &class_size) else {
+            continue;
+        };
+        let own = place.key(level);
+        let reads = (place.class == MethodClass::Write).then(|| GroupKey {
+            class: MethodClass::Read,
+            ..own.clone()
+        });
+        for key in std::iter::once(&own).chain(reads.as_ref()) {
+            if !stats.contains_key(key) {
+                let indices: Vec<usize> = members.get(key).cloned().unwrap_or_default();
+                let peers: Vec<&Route> = indices.iter().map(|&member| candidates[member]).collect();
+                // Across a namespace, each resource counts once: a resource
+                // with many routes must not outvote its single-route siblings.
+                let weights: Vec<f64> = indices
+                    .iter()
+                    .map(|&member| match key.level {
+                        GroupLevel::Resource => 1.0,
+                        GroupLevel::Namespace => {
+                            1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1)
+                                as f64
+                        }
+                    })
+                    .collect();
+                if peers.len() >= 2
+                    && peers
+                        .iter()
+                        .any(|peer| peer.best_tier() > EvidenceTier::None)
+                {
+                    order.push(key.clone());
+                }
+                stats.insert(key.clone(), GroupStats::of(peers, weights, options));
+            }
+        }
+        judged.push((index, own, reads));
+    }
 
     let mut peer_groups = Vec::new();
     let mut invariants = Vec::new();
-    let mut finding_details = Vec::new();
-    let mut findings = Vec::new();
-
-    for (index, peers) in grouped_routes.iter().enumerate() {
-        let id = format!("peer-group-{:03}", index + 1);
-        let first = peers[0];
+    let mut ids: HashMap<&GroupKey, String> = HashMap::new();
+    for (position, key) in order.iter().enumerate() {
+        let id = format!("peer-group-{:03}", position + 1);
+        let group = &stats[key];
         let description = format!(
-            "{} {} routes under {}",
-            first.method,
-            route_shape_description(first),
-            if first.scope_prefix.is_empty() {
-                "/"
-            } else {
-                &first.scope_prefix
-            }
+            "{} routes of {} {}",
+            key.class,
+            match key.level {
+                GroupLevel::Resource => "resource",
+                GroupLevel::Namespace => "namespace",
+            },
+            key.prefix
         );
-        let references: Vec<RouteReference> = peers.iter().map(|route| (*route).into()).collect();
         peer_groups.push(PeerGroup {
             id: id.clone(),
-            description: description.clone(),
-            prefix: peer_prefix(first),
-            routes: references.clone(),
+            description,
+            prefix: key.prefix.clone(),
+            level: key.level,
+            method_class: key.class,
+            routes: group.peers.iter().map(|route| (*route).into()).collect(),
         });
+        invariants.push(group.invariant(&id, key));
+        ids.insert(key, id);
+    }
 
-        let authorized = peers.iter().filter(|route| route.is_authorized()).count();
-        let unauthorized = peers.len() - authorized;
-        let mut evidence_patterns: Vec<String> = peers
+    let mut finding_details = Vec::new();
+    for (index, own, reads) in judged {
+        let route = candidates[index];
+        // The groups this route is held to: its own class, and for a write
+        // the reads of the same resource. Writes are never less protected.
+        // Across a whole namespace, reads say less about an unrelated
+        // resource's writes; they are only held to reads that require a
+        // privilege (an `/admin` namespace), not to merely authenticated
+        // reads, where public writes such as webhooks are common.
+        let entries: Vec<(&GroupStats, &GroupKey, &String)> = std::iter::once(&own)
+            .chain(reads.as_ref())
+            .filter_map(|key| ids.get(key).map(|id| (&stats[key], key, id)))
+            .filter(|(group, key, _)| {
+                key.class == place_class(route)
+                    || key.level == GroupLevel::Resource
+                    || group.expected == Some(EvidenceTier::Privilege)
+            })
+            .collect();
+        let Some(&(basis, basis_key, basis_id)) = entries.iter().max_by_key(|(group, key, _)| {
+            (
+                group.expected,
+                std::cmp::Reverse(key.class != MethodClass::of(&route.method)),
+            )
+        }) else {
+            continue;
+        };
+        let expected = basis.expected;
+        let Some(expected) = expected else {
+            continue;
+        };
+        let tier = route.best_tier();
+        let category = if tier < expected {
+            if unverified_beyond_peers(route, basis, options) {
+                FindingCategory::UnverifiedProtection
+            } else {
+                match (expected, tier) {
+                    (EvidenceTier::Identity, _) => FindingCategory::MissingAuthentication,
+                    (_, EvidenceTier::None | EvidenceTier::Identity) => {
+                        FindingCategory::MissingAuthorization
+                    }
+                    _ => FindingCategory::WeakerAuthorization,
+                }
+            }
+        } else if expected == EvidenceTier::Privilege && tier == EvidenceTier::Privilege {
+            let requirements = route.privilege_requirements();
+            let missing = entries.iter().copied().find(|(group, _, _)| {
+                group
+                    .dominant_requirement
+                    .as_deref()
+                    .is_some_and(|required| {
+                        !requirements.is_empty() && !requirements.contains(&required)
+                    })
+            });
+            let Some((group, key, id)) = missing else {
+                continue;
+            };
+            finding_details.push(finding(
+                route,
+                FindingCategory::DifferentAuthorization,
+                expected,
+                group,
+                key,
+                id,
+                options,
+            ));
+            continue;
+        } else {
+            continue;
+        };
+        finding_details.push(finding(
+            route, category, expected, basis, basis_key, basis_id, options,
+        ));
+    }
+    let findings = finding_details.iter().map(format_finding).collect();
+    (peer_groups, invariants, finding_details, findings)
+}
+
+#[cfg(test)]
+pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
+    build_analysis_layers(routes).3
+}
+
+/// Where a route sits: its namespace (declared scope, or leading segments),
+/// its resource within the namespace, and its method class.
+#[derive(Debug, Clone)]
+pub(crate) struct Placement {
+    pub(crate) namespace: String,
+    pub(crate) resource: String,
+    pub(crate) class: MethodClass,
+}
+
+impl Placement {
+    fn key(&self, level: GroupLevel) -> GroupKey {
+        GroupKey {
+            level,
+            prefix: match level {
+                GroupLevel::Resource => self.resource.clone(),
+                GroupLevel::Namespace => self.namespace.clone(),
+            },
+            class: self.class,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GroupKey {
+    pub(crate) level: GroupLevel,
+    pub(crate) prefix: String,
+    pub(crate) class: MethodClass,
+}
+
+/// The level at which a route is compared. Its resource, when the resource
+/// holds another route of its class (or, for a write, two reads); otherwise
+/// its namespace, when that is wider than the resource and not the bare root.
+/// A resource whose routes all lack evidence is thereby treated as public
+/// by design, not escalated.
+fn comparison_level(
+    place: &Placement,
+    class_size: &impl Fn(&GroupKey) -> usize,
+) -> Option<GroupLevel> {
+    let resource = place.key(GroupLevel::Resource);
+    let reads = GroupKey {
+        class: MethodClass::Read,
+        ..resource.clone()
+    };
+    let informative = class_size(&resource) >= 2
+        || (place.class == MethodClass::Write && class_size(&reads) >= 2);
+    if informative {
+        Some(GroupLevel::Resource)
+    } else if place.namespace != place.resource && place.namespace != "/" {
+        Some(GroupLevel::Namespace)
+    } else {
+        None
+    }
+}
+
+/// What a peer group establishes.
+pub(crate) struct GroupStats<'a> {
+    pub(crate) peers: Vec<&'a Route>,
+    /// The highest tier that a dominant share of the group reaches.
+    pub(crate) expected: Option<EvidenceTier>,
+    /// A requirement carried by a dominant share of the group's
+    /// privilege-tier routes that name one.
+    pub(crate) dominant_requirement: Option<String>,
+    /// Unrecognized components most of the group carries, such as a
+    /// scope-wide middleware. They cannot explain why one route differs.
+    pub(crate) common_unknowns: Vec<String>,
+    pub(crate) authorized: usize,
+}
+
+impl<'a> GroupStats<'a> {
+    fn of(peers: Vec<&'a Route>, weights: Vec<f64>, options: &AnalysisOptions) -> Self {
+        let expected = group_tier(&peers, &weights, options);
+        let mut counts: HashMap<&str, f64> = HashMap::new();
+        let mut naming = 0.0;
+        for (peer, weight) in peers.iter().zip(&weights) {
+            if peer.best_tier() != EvidenceTier::Privilege {
+                continue;
+            }
+            let requirements = peer.privilege_requirements();
+            if requirements.is_empty() {
+                continue;
+            }
+            naming += weight;
+            for requirement in requirements {
+                *counts.entry(requirement).or_default() += weight;
+            }
+        }
+        let mut ranked: Vec<(&str, f64)> = counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+        let dominant_requirement = ranked
+            .first()
+            .filter(|(_, count)| is_dominant_weight(*count, naming, options))
+            .map(|(requirement, _)| requirement.to_string());
+        let total: f64 = weights.iter().sum();
+        let mut unknown_counts: HashMap<&str, f64> = HashMap::new();
+        for (peer, weight) in peers.iter().zip(&weights) {
+            let mut seen = HashSet::new();
+            for evidence in &peer.authorization {
+                if evidence.kind == AuthEvidenceKind::Unknown
+                    && seen.insert(evidence.mechanism.as_str())
+                {
+                    *unknown_counts
+                        .entry(evidence.mechanism.as_str())
+                        .or_default() += weight;
+                }
+            }
+        }
+        let mut common_unknowns: Vec<String> = unknown_counts
+            .into_iter()
+            .filter(|(_, count)| *count / total >= options.dominance_threshold)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        common_unknowns.sort();
+        let authorized = peers.iter().filter(|peer| peer.is_authorized()).count();
+        Self {
+            peers,
+            expected,
+            dominant_requirement,
+            common_unknowns,
+            authorized,
+        }
+    }
+
+    fn invariant(&self, id: &str, key: &GroupKey) -> AuthorizationInvariant {
+        let mut evidence_patterns: Vec<String> = self
+            .peers
             .iter()
             .flat_map(|route| {
                 route
@@ -87,129 +330,205 @@ pub(crate) fn build_analysis_layers_with(
             .collect();
         evidence_patterns.sort();
         evidence_patterns.dedup();
-        let strength = invariant_strength(authorized, peers.len(), options);
-        let invariant = AuthorizationInvariant {
-            peer_group_id: id.clone(),
-            description: format!(
-                "Peer routes under {} consistently contain authorization evidence.",
-                if first.scope_prefix.is_empty() {
-                    "/"
-                } else {
-                    &first.scope_prefix
-                }
-            ),
-            total_routes: peers.len(),
-            routes_with_authorization: authorized,
-            routes_without_authorization: unauthorized,
-            evidence_patterns,
-            strength,
-        };
-        invariants.push(invariant.clone());
-
-        if !is_dominant(authorized, peers.len(), options) {
-            continue;
-        }
-        let expected_tier = dominant_tier(peers, options);
-        for route in peers.iter().filter(|route| !route.is_authorized()) {
-            let authorized_peer_routes: Vec<RouteReference> = peers
+        let reaching = self.expected.map_or(0, |tier| {
+            self.peers
                 .iter()
-                .filter(|peer| peer.is_authorized())
-                .map(|peer| (*peer).into())
-                .collect();
-            let finding = Finding {
-                peer_group_id: id.clone(),
-                category: FindingCategory::MissingAuthorization,
-                invariant: invariant.clone(),
-                suspicious_route: (*route).into(),
-                suspicious_route_tier: route.best_tier(),
-                expected_tier,
-                suspicious_route_evidence: route.authorization.clone(),
-                authorized_peer_routes,
-            };
-            findings.push(format_finding(&finding));
-            finding_details.push(finding);
-        }
-
-        // Authorized routes whose best evidence is below the tier their peers
-        // reach, such as an ownership check among role-checked peers.
-        for route in peers
-            .iter()
-            .filter(|route| route.is_authorized() && route.best_tier() < expected_tier)
-        {
-            let finding = Finding {
-                peer_group_id: id.clone(),
-                category: FindingCategory::WeakerAuthorization,
-                invariant: invariant.clone(),
-                suspicious_route: (*route).into(),
-                suspicious_route_tier: route.best_tier(),
-                expected_tier,
-                suspicious_route_evidence: route.authorization.clone(),
-                authorized_peer_routes: peers
-                    .iter()
-                    .filter(|peer| peer.best_tier() >= expected_tier)
-                    .map(|peer| (*peer).into())
-                    .collect(),
-            };
-            findings.push(format_finding(&finding));
-            finding_details.push(finding);
+                .filter(|peer| peer.best_tier() >= tier)
+                .count()
+        });
+        AuthorizationInvariant {
+            peer_group_id: id.into(),
+            description: match self.expected {
+                Some(tier) => format!(
+                    "{} routes under {} reach at least {} evidence ({} of {}){}.",
+                    capitalized(&key.class.to_string()),
+                    key.prefix,
+                    tier,
+                    reaching,
+                    self.peers.len(),
+                    self.dominant_requirement
+                        .as_ref()
+                        .map(|requirement| format!(", requiring `{requirement}`"))
+                        .unwrap_or_default()
+                ),
+                None => format!(
+                    "{} routes under {} share no dominant protection.",
+                    capitalized(&key.class.to_string()),
+                    key.prefix
+                ),
+            },
+            total_routes: self.peers.len(),
+            routes_with_authorization: self.authorized,
+            routes_without_authorization: self.peers.len() - self.authorized,
+            evidence_patterns,
+            strength: invariant_strength(reaching, self.peers.len(), self.expected.is_some()),
+            expected_tier: self.expected,
+            dominant_requirement: self.dominant_requirement.clone(),
         }
     }
-
-    (peer_groups, invariants, finding_details, findings)
 }
 
-#[cfg(test)]
-pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
-    build_analysis_layers(routes).3
+fn place_class(route: &Route) -> MethodClass {
+    MethodClass::of(&route.method)
 }
 
-/// The highest tier that a dominant share of the group reaches. Computed
-/// only for groups whose authorized routes are dominant, so it is at least
-/// the tier of the weakest authorization evidence.
-pub(crate) fn dominant_tier(peers: &[&Route], options: &AnalysisOptions) -> EvidenceTier {
-    [EvidenceTier::Privilege, EvidenceTier::Resource]
-        .into_iter()
-        .find(|tier| {
-            let reaching = peers
-                .iter()
-                .filter(|peer| peer.best_tier() >= *tier)
-                .count();
-            is_dominant(reaching, peers.len(), options)
+fn capitalized(text: &str) -> String {
+    let mut characters = text.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the route carries something Archer cannot judge that its peers
+/// do not share: its own unrecognized guard or middleware, or a handler that
+/// could not be analyzed.
+fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &AnalysisOptions) -> bool {
+    !route.unverified.is_empty()
+        || route.authorization.iter().any(|evidence| {
+            evidence.kind == AuthEvidenceKind::Unknown
+                && !group.common_unknowns.contains(&evidence.mechanism)
         })
-        .unwrap_or(EvidenceTier::Resource)
 }
 
-/// Whether authorized routes are common enough in a group for its
-/// unauthorized routes to be reported: at least `min_support` of them, making
-/// up at least `dominance_threshold` of the group.
-pub(crate) fn is_dominant(authorized: usize, total: usize, options: &AnalysisOptions) -> bool {
-    total > 0
-        && authorized >= options.min_support
-        && authorized as f64 / total as f64 >= options.dominance_threshold
+fn finding(
+    route: &Route,
+    category: FindingCategory,
+    expected: EvidenceTier,
+    group: &GroupStats,
+    key: &GroupKey,
+    id: &str,
+    _options: &AnalysisOptions,
+) -> Finding {
+    let tier = route.best_tier();
+    let route_class = MethodClass::of(&route.method);
+    let compared = if key.class != route_class {
+        format!("the {} routes of {}", key.class, key.prefix)
+    } else {
+        format!("its {} peers under {}", key.class, key.prefix)
+    };
+    let (severity, rationale) = match category {
+        FindingCategory::MissingAuthentication => (
+            Severity::High,
+            format!(
+                "No authentication or authorization evidence, while {compared} at least authenticate the caller."
+            ),
+        ),
+        FindingCategory::MissingAuthorization => (
+            if expected == EvidenceTier::Privilege {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            format!("Best evidence is {tier}, while {compared} reach {expected}."),
+        ),
+        FindingCategory::WeakerAuthorization => (
+            Severity::Medium,
+            format!("Best evidence is {tier}, while {compared} reach {expected}."),
+        ),
+        FindingCategory::DifferentAuthorization => (
+            Severity::Medium,
+            format!(
+                "Checks {} where {compared} require `{}`.",
+                route
+                    .privilege_requirements()
+                    .iter()
+                    .map(|requirement| format!("`{requirement}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                group.dominant_requirement.as_deref().unwrap_or("?")
+            ),
+        ),
+        FindingCategory::UnverifiedProtection => (
+            Severity::Low,
+            format!(
+                "Recognized evidence is {tier}, while {compared} reach {expected}; it also has protection Archer cannot verify ({}). Review manually.",
+                route
+                    .unverified
+                    .iter()
+                    .cloned()
+                    .chain(
+                        route
+                            .authorization
+                            .iter()
+                            .filter(|evidence| evidence.kind == AuthEvidenceKind::Unknown)
+                            .map(|evidence| format!("unrecognized `{}`", evidence.mechanism))
+                    )
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
+    };
+    let invariant = group.invariant(id, key);
+    Finding {
+        peer_group_id: id.into(),
+        category,
+        severity,
+        rationale,
+        invariant,
+        suspicious_route: route.into(),
+        suspicious_route_tier: tier,
+        expected_tier: expected,
+        suspicious_route_evidence: route.authorization.clone(),
+        authorized_peer_routes: group
+            .peers
+            .iter()
+            .filter(|peer| route_identity(peer) != route_identity(route))
+            .filter(|peer| match category {
+                FindingCategory::DifferentAuthorization => group
+                    .dominant_requirement
+                    .as_deref()
+                    .is_some_and(|required| peer.privilege_requirements().contains(&required)),
+                _ => peer.best_tier() >= expected,
+            })
+            .map(|peer| (*peer).into())
+            .collect(),
+    }
+}
+
+/// The highest tier that a dominant share of the group reaches, each route
+/// counting with its weight.
+pub(crate) fn group_tier(
+    peers: &[&Route],
+    weights: &[f64],
+    options: &AnalysisOptions,
+) -> Option<EvidenceTier> {
+    let total: f64 = weights.iter().sum();
+    [
+        EvidenceTier::Privilege,
+        EvidenceTier::Resource,
+        EvidenceTier::Identity,
+    ]
+    .into_iter()
+    .find(|tier| {
+        let reaching: f64 = peers
+            .iter()
+            .zip(weights)
+            .filter(|(peer, _)| peer.best_tier() >= *tier)
+            .map(|(_, weight)| weight)
+            .sum();
+        is_dominant_weight(reaching, total, options)
+    })
+}
+
+/// `is_dominant` for weighted counts.
+fn is_dominant_weight(reaching: f64, total: f64, options: &AnalysisOptions) -> bool {
+    const EPSILON: f64 = 1e-9;
+    total > 0.0
+        && reaching + EPSILON >= options.min_support as f64
+        && reaching / total + EPSILON >= options.dominance_threshold
 }
 
 /// `Strong` for a unanimous group or a dominant one with three or more
-/// authorized routes, `Medium` for any other dominant group, `Weak` for a
-/// pattern too rare to report on.
-pub(crate) fn invariant_strength(
-    authorized: usize,
-    total: usize,
-    options: &AnalysisOptions,
-) -> AuthStrength {
-    if authorized == total || (authorized >= 3 && is_dominant(authorized, total, options)) {
+/// routes reaching its tier, `Medium` for any other dominant group, `Weak`
+/// for a pattern too rare to report on.
+fn invariant_strength(reaching: usize, total: usize, dominant: bool) -> AuthStrength {
+    if dominant && (reaching == total || reaching >= 3) {
         AuthStrength::Strong
-    } else if is_dominant(authorized, total, options) {
+    } else if dominant {
         AuthStrength::Medium
     } else {
         AuthStrength::Weak
-    }
-}
-
-pub(crate) fn route_shape_description(route: &Route) -> String {
-    if dynamic_segment_shape(route).iter().any(|dynamic| *dynamic) {
-        "parameterized".into()
-    } else {
-        "static".into()
     }
 }
 
@@ -229,17 +548,18 @@ pub fn format_finding(finding: &Finding) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let category = match finding.category {
-        FindingCategory::MissingAuthorization => String::new(),
-        FindingCategory::WeakerAuthorization => format!(
-            "  Category: weaker authorization (best evidence tier {}, peers reach {})\n",
-            finding.suspicious_route_tier, finding.expected_tier
-        ),
-    };
+    let category = format!(
+        "  Category: {} (severity {}; best evidence tier {}, peers reach {})\n  Why: {}\n",
+        finding.category,
+        finding.severity,
+        finding.suspicious_route_tier,
+        finding.expected_tier,
+        finding.rationale
+    );
     format!(
         "{}  Suspicious route: {} {} ({}:{})\n\
   Inferred invariant: {}\n\
-  Authorized peer evidence ({} route(s)):\n{}\n\
+  Peer evidence ({} route(s)):\n{}\n\
   Suspicious route evidence: {}.",
         category,
         route.method,
@@ -273,60 +593,99 @@ pub(crate) fn format_evidence(authorization: &[AuthEvidence]) -> String {
         .join("; ")
 }
 
-/// What two routes must share to be peers: declared scope prefix, structural
-/// prefix, method, and the static/dynamic shape of their path (which fixes
-/// the segment count).
-pub(crate) type PeerKey = (String, String, String, Vec<bool>);
-
-pub(crate) fn peer_key(route: &Route) -> PeerKey {
-    (
-        route.scope_prefix.clone(),
-        peer_prefix(route),
-        route.method.clone(),
-        dynamic_segment_shape(route),
-    )
-}
-
+/// Whether two routes are compared with each other at the resource level:
+/// both are analysed, share a resource, and share a method class.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn same_peer_group(route: &Route, candidate: &Route) -> bool {
-    if has_unresolved_segment(&route.path) || has_unresolved_segment(&candidate.path) {
+    let analysed = |route: &Route| {
+        !has_unresolved_segment(&route.path)
+            && !is_authentication_route(route)
+            && !is_well_known_public_route(route)
+    };
+    if !analysed(route) || !analysed(candidate) {
         return false;
     }
-    if peer_key(route) != peer_key(candidate) {
-        return false;
-    }
-
-    if is_authentication_route(route) || is_authentication_route(candidate) {
-        return route.path == candidate.path;
-    }
-
-    true
+    let (left, right) = (placement(route), placement(candidate));
+    left.resource == right.resource && left.class == right.class
 }
 
-/// The segments of a route's full path before its last static segment:
-/// `/admin` for `/admin/users` and `/admin/users/{id}`. Routes written with
-/// full paths outside any scope (`/admin/users`, `/public/docs`) are only
-/// peers when this prefix matches.
-pub(crate) fn peer_prefix(route: &Route) -> String {
+/// Version and API-root segments that say nothing about what a route serves:
+/// `api`, `rest`, `rpc`, `v1`, `v2beta`, `2024-01`.
+pub(crate) fn is_generic_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    ["api", "apis", "rest", "rpc", "json"].contains(&lower.as_str())
+        || (lower.starts_with('v')
+            && lower[1..].starts_with(|character: char| character.is_ascii_digit()))
+        || lower
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '-' || character == '.')
+}
+
+/// A route's namespace and resource. The namespace is its declared scope;
+/// outside any scope, its leading generic segments (`/api/v1`), or else its
+/// first segment (`/admin`). The resource is the namespace plus the next
+/// meaningful static segment: `/admin/users` for `/admin/users`,
+/// `/admin/users/{id}`, and `/admin/users/{id}/roles`. Parameters are
+/// normalized, so `/t/{id}/x` and `/t/{tenant}/x` share a resource.
+pub(crate) fn placement(route: &Route) -> Placement {
     let segments: Vec<&str> = route
         .path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    let end = segments
-        .iter()
-        .rposition(|segment| !is_dynamic_segment(segment))
-        .unwrap_or(0);
-    format!("/{}", segments[..end].join("/"))
-}
-
-pub(crate) fn dynamic_segment_shape(route: &Route) -> Vec<bool> {
-    route
-        .path
+    let scope_segments = route
+        .scope_prefix
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(is_dynamic_segment)
-        .collect()
+        .count()
+        .min(segments.len());
+    let namespace_length = if scope_segments > 0 {
+        scope_segments
+    } else {
+        let generic = segments
+            .iter()
+            .take_while(|segment| is_generic_segment(segment))
+            .count();
+        if generic > 0 {
+            generic
+        } else {
+            usize::from(
+                segments
+                    .first()
+                    .is_some_and(|segment| !is_dynamic_segment(segment)),
+            )
+        }
+    };
+    let resource_length = segments[namespace_length..]
+        .iter()
+        .position(|segment| !is_dynamic_segment(segment) && !is_generic_segment(segment))
+        .map_or(segments.len().max(namespace_length), |offset| {
+            namespace_length + offset + 1
+        });
+    let prefix = |length: usize| {
+        let normalized: Vec<&str> = segments[..length]
+            .iter()
+            .map(|segment| {
+                if is_dynamic_segment(segment) {
+                    "{}"
+                } else {
+                    segment
+                }
+            })
+            .collect();
+        format!("/{}", normalized.join("/"))
+    };
+    Placement {
+        namespace: prefix(namespace_length),
+        resource: prefix(resource_length),
+        class: MethodClass::of(&route.method),
+    }
+}
+
+/// The resource prefix of a route; see `placement`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn peer_prefix(route: &Route) -> String {
+    placement(route).resource
 }
 
 pub(crate) fn is_dynamic_segment(segment: &str) -> bool {
@@ -334,20 +693,84 @@ pub(crate) fn is_dynamic_segment(segment: &str) -> bool {
         || (segment.starts_with('<') && segment.ends_with('>'))
 }
 
-/// An authentication endpoint such as `/auth/login` or `/api/token/{id}`:
-/// its last static segment names one. Other routes under an `/auth` or
-/// `/token` prefix (`/auth/admin/purge`) are analysed like any route.
+/// Static segments of a path, in order.
+fn static_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty() && !is_dynamic_segment(segment))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// An authentication endpoint such as `/auth/login`, `/api/token/{id}`, or
+/// `/users/password/reset`: its last static segment names one, and the
+/// segments before it are generic or about accounts. `/admin/settings/auth`
+/// and `/admin/users/{id}/token` manage something and are analysed.
 pub(crate) fn is_authentication_route(route: &Route) -> bool {
-    let authentication_names = [
-        "auth", "login", "logout", "register", "signup", "signin", "token", "refresh",
+    const ENDPOINTS: [&str; 16] = [
+        "auth",
+        "login",
+        "logout",
+        "register",
+        "signup",
+        "signin",
+        "signout",
+        "token",
+        "refresh",
+        "callback",
+        "authorize",
+        "reset",
+        "forgot",
+        "verify",
+        "confirm",
+        "password",
     ];
-    route
-        .path
-        .split('/')
-        .rfind(|segment| !segment.is_empty() && !is_dynamic_segment(segment))
-        .is_some_and(|segment| {
-            authentication_names.contains(&segment.to_ascii_lowercase().as_str())
+    const ACCOUNT_CONTEXT: [&str; 17] = [
+        "auth", "oauth", "oauth2", "session", "sessions", "account", "accounts", "user", "users",
+        "identity", "sso", "saml", "oidc", "me", "password", "jwt", "token",
+    ];
+    let statics = static_segments(&route.path);
+    let Some((last, before)) = statics.split_last() else {
+        return false;
+    };
+    ENDPOINTS.contains(&last.as_str())
+        && before.iter().all(|segment| {
+            is_generic_segment(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str())
         })
+}
+
+/// Health, readiness, version, metrics, and API-documentation endpoints at
+/// the root or under a generic prefix (`/health`, `/api/v1/openapi.json`).
+/// Under a namespace such as `/admin/metrics` they are analysed.
+pub(crate) fn is_well_known_public_route(route: &Route) -> bool {
+    const PUBLIC: [&str; 19] = [
+        "health",
+        "healthz",
+        "healthcheck",
+        "ready",
+        "readyz",
+        "readiness",
+        "live",
+        "livez",
+        "liveness",
+        "ping",
+        "status",
+        "version",
+        "metrics",
+        "docs",
+        "swagger",
+        "swagger-ui",
+        "openapi",
+        "openapi.json",
+        "favicon.ico",
+    ];
+    if route.path.split('/').any(is_dynamic_segment) {
+        return false;
+    }
+    let statics = static_segments(&route.path);
+    let Some((last, before)) = statics.split_last() else {
+        return false;
+    };
+    PUBLIC.contains(&last.as_str()) && before.iter().all(|segment| is_generic_segment(segment))
 }
 
 pub(crate) fn unique_routes<'a, I>(routes: I) -> Vec<&'a Route>

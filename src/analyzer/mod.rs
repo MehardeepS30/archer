@@ -144,6 +144,16 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
 
+    // Requirement subjects describe what a privilege check requires; on
+    // identity or unrecognized evidence they would only be noise.
+    for route in &mut routes {
+        for evidence in &mut route.authorization {
+            if EvidenceTier::of(&evidence.kind) != EvidenceTier::Privilege {
+                evidence.requirements.clear();
+            }
+        }
+    }
+
     let (peer_groups, invariants, finding_details, findings) =
         build_analysis_layers_with(&routes, options);
 

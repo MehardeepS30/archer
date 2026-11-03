@@ -4,10 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-use syn::{
-    Item, ItemFn, UseTree,
-    visit::{self, Visit},
-};
+use syn::{Item, ItemFn, UseTree};
 
 use super::{evidence::*, model::*, routes::*};
 
@@ -24,7 +21,18 @@ pub(crate) struct HandlerDefinition {
     pub(crate) crate_key: PathBuf,
     pub(crate) module: Vec<String>,
     pub(crate) name: String,
+    /// The function's own evidence combined with its helpers'.
     pub(crate) evidence: Vec<AuthEvidence>,
+    /// The function's own evidence and calls, before helpers are combined.
+    pub(crate) own: FunctionEvidence,
+}
+
+/// Resolved calls of one function: `(callee, enforced)` for its body, and
+/// the callees in its returned predicate.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedCalls {
+    pub(crate) calls: Vec<(usize, bool)>,
+    pub(crate) predicate_calls: Vec<usize>,
 }
 
 impl HandlerDefinition {
@@ -99,52 +107,31 @@ impl<'a> HandlerIndex<'a> {
     /// Adds to each function the evidence of the repository functions it
     /// calls, up to `MAX_HELPER_DEPTH` calls deep, so that a handler whose
     /// check sits in a wrapper (`ensure_can_manage(&user)` calling
-    /// `require_admin`) is not reported as unauthorized. Only calls that
-    /// resolve by Rust's scoping rules count; a unique-name guess does not,
-    /// since wrongly added evidence would hide a finding. The evidence keeps
-    /// the callee's location; its symbol names the call path.
+    /// `require_admin`) is not reported as unauthorized. A helper's own
+    /// enforced checks count wherever it is called; the predicate a `bool`
+    /// helper returns (`fn can_edit(u) -> bool { u.role == Role::Admin }`)
+    /// counts only where the caller enforces it. Only calls that resolve by
+    /// Rust's scoping rules count; a unique-name guess does not, since wrongly
+    /// added evidence would hide a finding. The evidence keeps the callee's
+    /// location; its symbol names the call path.
     pub(crate) fn add_helper_evidence(&mut self) {
-        let callees: Vec<Vec<usize>> = (0..self.definitions.len())
-            .map(|definition| self.callees(definition))
+        let resolved: Vec<ResolvedCalls> = (0..self.definitions.len())
+            .map(|definition| self.resolved_calls(definition))
             .collect();
         let combined: Vec<Vec<AuthEvidence>> = (0..self.definitions.len())
             .map(|definition| {
-                let mut evidence = self.definitions[definition].evidence.clone();
-                let mut visited = HashSet::from([definition]);
-                let mut frontier: Vec<(usize, String)> = callees[definition]
-                    .iter()
-                    .map(|&callee| (callee, self.definitions[callee].name.clone()))
-                    .collect();
-                for _ in 0..MAX_HELPER_DEPTH {
-                    let mut next = Vec::new();
-                    for (callee, via) in frontier {
-                        if !visited.insert(callee) {
-                            continue;
-                        }
-                        for found in &self.definitions[callee].evidence {
-                            let mut found = found.clone();
-                            found.handler = Some(self.definitions[definition].name.clone());
-                            found.symbol = Some(format!(
-                                "{via} -> {}",
-                                found.symbol.as_deref().unwrap_or(&found.mechanism)
-                            ));
-                            if !evidence.iter().any(|existing| {
-                                existing.kind == found.kind
-                                    && existing.file == found.file
-                                    && existing.line == found.line
-                            }) {
-                                evidence.push(found);
-                            }
-                        }
-                        next.extend(callees[callee].iter().map(|&deeper| {
-                            (
-                                deeper,
-                                format!("{via} -> {}", self.definitions[deeper].name),
-                            )
-                        }));
-                    }
-                    frontier = next;
-                }
+                let mut evidence = self.definitions[definition].own.evidence.clone();
+                let mut stack = vec![definition];
+                self.gather(
+                    definition,
+                    definition,
+                    String::new(),
+                    false,
+                    0,
+                    &resolved,
+                    &mut stack,
+                    &mut evidence,
+                );
                 evidence
             })
             .collect();
@@ -153,22 +140,116 @@ impl<'a> HandlerIndex<'a> {
         }
     }
 
-    /// Repository functions that a function's body calls by path.
-    fn callees(&self, definition: usize) -> Vec<usize> {
-        let mut calls = CallVisitor::default();
-        calls.visit_block(&self.items[definition].block);
-        let caller = &self.definitions[definition];
-        let mut callees = Vec::new();
-        for target in calls.targets {
-            if let (Some(callee), resolution) =
-                self.resolve_handler_index(&caller.crate_key, &caller.module, &target)
-                && !matches!(resolution, HandlerResolution::UniqueName)
-                && !callees.contains(&callee)
-            {
-                callees.push(callee);
+    /// Adds the evidence that `current`, reached from `root` through `via`,
+    /// contributes: its own enforced checks, its returned predicate when the
+    /// caller enforces it, and its callees' in turn.
+    #[allow(clippy::too_many_arguments)]
+    fn gather(
+        &self,
+        root: usize,
+        current: usize,
+        via: String,
+        predicate: bool,
+        depth: usize,
+        resolved: &[ResolvedCalls],
+        stack: &mut Vec<usize>,
+        out: &mut Vec<AuthEvidence>,
+    ) {
+        let own = &self.definitions[current].own;
+        let contributed = (current != root)
+            .then_some(own.evidence.iter())
+            .into_iter()
+            .flatten()
+            .chain(
+                predicate
+                    .then_some(own.predicate_evidence.iter())
+                    .into_iter()
+                    .flatten(),
+            );
+        for found in contributed {
+            let mut found = found.clone();
+            found.handler = Some(self.definitions[root].name.clone());
+            found.symbol = Some(format!(
+                "{via} -> {}",
+                found.symbol.as_deref().unwrap_or(&found.mechanism)
+            ));
+            if !out.iter().any(|existing| {
+                existing.kind == found.kind
+                    && existing.file == found.file
+                    && existing.line == found.line
+            }) {
+                out.push(found);
             }
         }
-        callees
+        if depth == MAX_HELPER_DEPTH {
+            return;
+        }
+        let calls = &resolved[current];
+        let next: Vec<(usize, bool)> = calls
+            .calls
+            .iter()
+            .copied()
+            .chain(
+                predicate
+                    .then_some(calls.predicate_calls.iter().map(|&callee| (callee, true)))
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect();
+        for (callee, enforced) in next {
+            if stack.contains(&callee) {
+                continue;
+            }
+            stack.push(callee);
+            let name = &self.definitions[callee].name;
+            let via = if via.is_empty() {
+                name.clone()
+            } else {
+                format!("{via} -> {name}")
+            };
+            self.gather(root, callee, via, enforced, depth + 1, resolved, stack, out);
+            stack.pop();
+        }
+    }
+
+    /// Repository functions that a function's body calls by path, with
+    /// whether the call's result is enforced.
+    fn resolved_calls(&self, definition: usize) -> ResolvedCalls {
+        let caller = &self.definitions[definition];
+        let resolve = |target: &HandlerTarget| match self.resolve_handler_index(
+            &caller.crate_key,
+            &caller.module,
+            target,
+        ) {
+            (Some(callee), resolution)
+                if !matches!(resolution, HandlerResolution::UniqueName) && callee != definition =>
+            {
+                Some(callee)
+            }
+            _ => None,
+        };
+        let mut resolved = ResolvedCalls::default();
+        for call in &caller.own.calls {
+            if let Some(callee) = resolve(&call.target) {
+                let enforced = call.use_ == Use::Enforcing;
+                match resolved
+                    .calls
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == callee)
+                {
+                    Some((_, existing)) => *existing |= enforced,
+                    None => resolved.calls.push((callee, enforced)),
+                }
+            }
+        }
+        for target in &caller.own.predicate_calls {
+            if let Some(callee) = resolve(target)
+                && !resolved.predicate_calls.contains(&callee)
+            {
+                resolved.predicate_calls.push(callee);
+            }
+        }
+        resolved
     }
 
     #[cfg(test)]
@@ -197,7 +278,8 @@ impl<'a> HandlerIndex<'a> {
                         crate_key: crate_key.to_path_buf(),
                         module: module.clone(),
                         name,
-                        evidence: handler_evidence(file, function),
+                        evidence: Vec::new(),
+                        own: function_evidence(file, function),
                     });
                 }
                 Item::Mod(item_mod) => {
@@ -522,27 +604,6 @@ impl<'a> HandlerIndex<'a> {
         resolved.extend(rest.iter().cloned());
         self.is_module(crate_key, &resolved).then_some(resolved)
     }
-}
-
-/// Paths called as functions in a body, outside nested function items.
-#[derive(Default)]
-struct CallVisitor {
-    targets: Vec<HandlerTarget>,
-}
-
-impl<'ast> Visit<'ast> for CallVisitor {
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let Some(target) = handler_target(&node.func) {
-            self.targets.push(target);
-        }
-        visit::visit_expr_call(self, node);
-    }
-
-    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
-
-    fn visit_impl_item_fn(&mut self, _: &'ast syn::ImplItemFn) {}
-
-    fn visit_trait_item_fn(&mut self, _: &'ast syn::TraitItemFn) {}
 }
 
 /// Merges lookups through several imports. Distinct definitions, or any

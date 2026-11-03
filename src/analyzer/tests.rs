@@ -19,6 +19,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
             line: 1,
             handler: None,
             strength: AuthStrength::Strong,
+            requirements: Vec::new(),
         }]
     } else {
         Vec::new()
@@ -33,6 +34,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
         authorization,
         line: 1,
         file: PathBuf::from("fixture.rs"),
+        unverified: Vec::new(),
         origin: RouteOrigin::default(),
     }
 }
@@ -50,17 +52,22 @@ fn route_with_handler(
 }
 
 #[test]
-fn peer_groups_require_matching_scope_method_and_shape() {
-    let suspicious = route("GET", "/admin/payments", "/admin", "NONE");
-    let same_group = route("GET", "/admin/users", "/admin", "PRESENT");
-    let different_method = route("POST", "/admin/orders", "/admin", "PRESENT");
-    let different_shape = route("GET", "/admin/reports/daily", "/admin", "PRESENT");
-    let different_scope = route("GET", "/public/users", "/public", "PRESENT");
+fn peer_groups_share_a_resource_and_a_method_class() {
+    let list = route("GET", "/admin/users", "/admin", "NONE");
+    let item = route("GET", "/admin/users/{id}", "/admin", "PRESENT");
+    let roles = route("GET", "/admin/users/{id}/roles", "/admin", "PRESENT");
+    let delete = route("DELETE", "/admin/users/{id}", "/admin", "PRESENT");
+    let other_resource = route("GET", "/admin/orders", "/admin", "PRESENT");
+    let other_scope = route("GET", "/public/users", "/public", "PRESENT");
 
-    assert!(same_peer_group(&suspicious, &same_group));
-    assert!(!same_peer_group(&suspicious, &different_method));
-    assert!(!same_peer_group(&suspicious, &different_shape));
-    assert!(!same_peer_group(&suspicious, &different_scope));
+    // Path shape no longer separates a resource's routes.
+    assert!(same_peer_group(&list, &item));
+    assert!(same_peer_group(&list, &roles));
+    // Reads and writes are compared separately.
+    assert!(!same_peer_group(&item, &delete));
+    assert!(!same_peer_group(&list, &other_resource));
+    assert!(!same_peer_group(&list, &other_scope));
+    assert_eq!(peer_prefix(&roles), "/admin/users");
 }
 
 #[test]
@@ -82,13 +89,18 @@ fn authentication_register_and_logout_are_not_peers() {
 }
 
 #[test]
-fn structurally_similar_protected_routes_remain_peers() {
+fn single_route_resources_are_compared_across_their_namespace() {
     let users = route("GET", "/api/admin/users", "/api/admin", "PRESENT");
     let orders = route("GET", "/api/admin/orders", "/api/admin", "PRESENT");
     let payments = route("GET", "/api/admin/payments", "/api/admin", "NONE");
 
-    assert!(same_peer_group(&users, &orders));
-    assert!(same_peer_group(&payments, &users));
+    assert!(!same_peer_group(&users, &orders));
+    let (groups, _, details, _) = build_analysis_layers(&[users, orders, payments]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].level, GroupLevel::Namespace);
+    assert_eq!(groups[0].prefix, "/api/admin");
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].suspicious_route.path, "/api/admin/payments");
 }
 
 #[test]
@@ -169,20 +181,33 @@ fn authentication_routes_do_not_create_report_layers() {
 }
 
 #[test]
-fn drift_finding_excludes_structural_non_peers() {
-    let routes = vec![
+fn lone_writes_are_held_to_privileged_reads_but_not_to_authenticated_ones() {
+    let mut routes = vec![
         route("GET", "/admin/payments", "/admin", "NONE"),
         route("GET", "/admin/users", "/admin", "PRESENT"),
         route("GET", "/admin/orders", "/admin", "PRESENT"),
         route("GET", "/admin/reports", "/admin", "PRESENT"),
         route("POST", "/admin/audit", "/admin", "NONE"),
     ];
+    let identity = |method: &str, path: &str| {
+        let mut route = route(method, path, "/api", "PRESENT");
+        route.authorization[0].kind = AuthEvidenceKind::IdentityExtraction;
+        route
+    };
+    routes.extend([
+        identity("GET", "/api/orders"),
+        identity("GET", "/api/invoices"),
+        identity("GET", "/api/profile"),
+        route("POST", "/api/webhooks", "/api", "NONE"),
+    ]);
 
-    let findings = infer_prototype_drift(&routes);
-
-    assert_eq!(findings.len(), 1);
-    assert!(findings[0].contains("/admin/payments"));
-    assert!(!findings[0].contains("/admin/audit"));
+    let details = build_analysis_layers(&routes).2;
+    let mut reported: Vec<_> = details
+        .iter()
+        .map(|detail| detail.suspicious_route.path.as_str())
+        .collect();
+    reported.sort();
+    assert_eq!(reported, ["/admin/audit", "/admin/payments"]);
 }
 
 #[test]
@@ -411,10 +436,23 @@ fn resource_routes_take_their_path_from_the_resource() {
         .unwrap();
     assert_eq!(users.line, 9);
 
+    // Both methods of the unprotected resource fall short: the read of its
+    // namespace peers, the write of the privilege the namespace's reads need.
     let (_, _, details, _) = build_analysis_layers(&visitor.routes);
-    assert_eq!(details.len(), 1);
-    assert_eq!(details[0].suspicious_route.path, "/admin/payments");
-    assert_eq!(details[0].suspicious_route.method, "GET");
+    let mut reported: Vec<_> = details
+        .iter()
+        .map(|detail| {
+            (
+                detail.suspicious_route.method.as_str(),
+                detail.suspicious_route.path.as_str(),
+            )
+        })
+        .collect();
+    reported.sort();
+    assert_eq!(
+        reported,
+        [("GET", "/admin/payments"), ("POST", "/admin/payments")]
+    );
 }
 
 #[test]
@@ -752,6 +790,7 @@ fn access_token_and_access_log_helpers_are_not_authorization() {
         authorization: handlers.get("token_only").cloned().unwrap_or_default(),
         line: 1,
         file: PathBuf::from("access.rs"),
+        unverified: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!token_route.is_authorized());
@@ -802,9 +841,9 @@ fn helper_names_separate_enforcement_from_lookups_and_authentication() {
 #[test]
 fn method_calls_use_word_rules_instead_of_substrings() {
     let syntax: syn::File = syn::parse_str(
-        "fn is_admin_method(user: User) { user.is_admin(); }
-         fn has_role_method(user: User) { user.has_role(\"admin\"); }
-         fn owns_method(user: User) { user.owns(&doc); }
+        "fn is_admin_method(user: User) { if !user.is_admin() { return; } }
+         fn has_role_method(user: User) { if !user.has_role(\"admin\") { return; } }
+         fn owns_method(user: User) { if !user.owns(&doc) { return; } }
          fn authorize_method(policy: Policy) { policy.authorize(&user); }
          fn claims_method(req: Req) { req.extract_claims(); }
          fn misleading_methods(user: User, stream: Stream, req: Req) {
@@ -1181,6 +1220,7 @@ fn identity_extraction_is_not_authorization() {
         authorization: handlers["profile"].clone(),
         line: 1,
         file: PathBuf::from("identity.rs"),
+        unverified: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!route.is_authorized());
@@ -2110,14 +2150,19 @@ cfg.route(\"/external\", web::get().to(other_crate::h))
         "/absolute",
         "/explicit-external-import",
         "/method",
-        "/closure",
         "/missing",
     ] {
         let route = route_at(&report, path);
         assert_eq!(resolution(route), &HandlerResolution::Unresolved, "{path}");
         assert!(route.authorization.is_empty(), "{path}");
         assert!(!route.is_authorized(), "{path}");
+        assert!(!route.unverified.is_empty(), "{path}");
     }
+    // A closure handler is analysed in place; this one checks nothing.
+    let closure = route_at(&report, "/closure");
+    assert_eq!(resolution(closure), &HandlerResolution::Closure);
+    assert!(closure.authorization.is_empty());
+    assert!(closure.unverified.is_empty());
 
     let method = route_at(&report, "/method");
     assert_eq!(method.handler.as_deref(), Some("list"));
@@ -2248,8 +2293,8 @@ fn statement_and_expression_macros_use_the_helper_name_rules() {
         r#"
         fn statement() { require_admin!(user); }
         fn braced() { check_admin! { user } }
-        fn expression() { let allowed = check_permission!(user, "reports:read"); if allowed {} }
-        fn tail() -> bool { has_role!(user, "manager") }
+        fn expression() { let allowed = check_permission!(user, "reports:read"); if !allowed { return; } }
+        fn tail() -> Result<(), E> { has_role!(user, "manager") }
         fn condition() { if !is_owner!(user, document) { return; } }
         fn ownership() { ensure_owner!(user, document); }
         fn authentication() { require_auth!(request); }
@@ -2341,7 +2386,6 @@ fn logging_formatting_and_unrelated_macros_are_not_evidence() {
             eprintln!("{}", message);
         }
         fn assertions(user: &User) {
-            assert!(is_admin(user));
             debug_assert!(has_role(user, "admin"));
             assert_eq!(user.role, "admin");
             let roles = vec![require_admin()];
@@ -3239,13 +3283,13 @@ fn recursive_helpers_do_not_loop() {
 #[test]
 fn large_peer_groups_are_grouped_without_pairwise_comparison() {
     let routes: String = (0..10_000)
-        .map(|index| format!("\n    cfg.route(\"/r{index}\", web::get().to(h));"))
+        .map(|index| format!("\n    cfg.route(\"/x/r{index}\", web::get().to(h));"))
         .collect();
     let report = fixture_report(
         "e1-large-group",
         &format!(
             "async fn h() {{}}\nasync fn admin(_u: AdminUser) {{}}\n\
-             fn config(cfg: &mut ServiceConfig) {{\n    cfg.route(\"/a\", web::get().to(admin));\n    cfg.route(\"/b\", web::get().to(admin));{routes}\n}}"
+             fn config(cfg: &mut ServiceConfig) {{\n    cfg.route(\"/x/a\", web::get().to(admin));\n    cfg.route(\"/x/b\", web::get().to(admin));{routes}\n}}"
         ),
     );
     assert_eq!(report.routes.len(), 10_002);
@@ -3303,4 +3347,426 @@ fn config_functions_reachable_only_from_themselves_keep_their_routes() {
     paths.sort();
     paths.dedup();
     assert_eq!(paths, ["/a", "/b", "/c"]);
+}
+
+// Drift-detection regression fixtures: each one pins a class of drift that
+// Archer must report, or a design it must not report as drift.
+
+fn drift_fixture(name: &str, source: &str) -> Report {
+    TempRepo::new(name, &[("main.rs", source)]).analyze()
+}
+
+/// `(category, method, path)` of each finding, sorted.
+fn reported(report: &Report) -> Vec<(FindingCategory, String, String)> {
+    let mut reported: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| {
+            (
+                finding.category,
+                finding.suspicious_route.method.clone(),
+                finding.suspicious_route.path.clone(),
+            )
+        })
+        .collect();
+    reported.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+    reported
+}
+
+fn finding(
+    category: FindingCategory,
+    method: &str,
+    path: &str,
+) -> (FindingCategory, String, String) {
+    (category, method.into(), path.into())
+}
+
+use FindingCategory::*;
+
+#[test]
+fn f01_a_write_missing_the_guard_its_resource_writes_have_is_reported() {
+    let report = drift_fixture(
+        "f01",
+        include_str!("../../tests/fixtures/probes/drift/f01_crud_write_missing_guard.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "DELETE", "/admin/users/{id}")]
+    );
+    assert_eq!(report.finding_details[0].severity, Severity::High);
+    assert_eq!(report.finding_details[0].authorized_peer_routes.len(), 2);
+}
+
+#[test]
+fn f02_a_public_route_among_authenticated_peers_is_missing_authentication() {
+    let report = drift_fixture(
+        "f02",
+        include_str!("../../tests/fixtures/probes/drift/f02_missing_authentication.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthentication, "GET", "/api/exports")]
+    );
+    assert_eq!(
+        report.finding_details[0].expected_tier,
+        EvidenceTier::Identity
+    );
+}
+
+#[test]
+fn f03_a_route_checking_a_different_role_than_its_peers_is_reported() {
+    let report = drift_fixture(
+        "f03",
+        include_str!("../../tests/fixtures/probes/drift/f03_different_role.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(DifferentAuthorization, "GET", "/admin/secrets")]
+    );
+    assert_eq!(
+        report.invariants[0].dominant_requirement.as_deref(),
+        Some("admin")
+    );
+    assert!(report.finding_details[0].rationale.contains("`viewer`"));
+}
+
+#[test]
+fn f04_checks_that_only_feed_display_or_logging_are_not_protection() {
+    let report = drift_fixture(
+        "f04",
+        include_str!("../../tests/fixtures/probes/drift/f04_mentions_are_not_checks.rs"),
+    );
+    for path in ["/admin/secrets", "/admin/reports", "/admin/exports"] {
+        assert!(route_at(&report, path).authorization.is_empty(), "{path}");
+    }
+    assert_eq!(
+        reported(&report),
+        [
+            finding(MissingAuthorization, "GET", "/admin/exports"),
+            finding(MissingAuthorization, "GET", "/admin/reports"),
+            finding(MissingAuthorization, "GET", "/admin/secrets"),
+        ]
+    );
+}
+
+#[test]
+fn f05_builders_held_in_variables_keep_their_prefix_guards_and_routes() {
+    let report = drift_fixture(
+        "f05",
+        include_str!("../../tests/fixtures/probes/drift/f05_builders_in_variables.rs"),
+    );
+    assert!(has_evidence(
+        route_at(&report, "/admin/users"),
+        AuthEvidenceKind::AuthorizationMiddleware,
+        "AdminGuard"
+    ));
+    assert!(has_evidence(
+        route_at(&report, "/ops/a"),
+        AuthEvidenceKind::AuthorizationGuard,
+        "AdminGuard"
+    ));
+    assert_eq!(route_at(&report, "/admin/users").scope_prefix, "/admin");
+    route_at(&report, "/orphan/x");
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "GET", "/ops/d")]
+    );
+}
+
+#[test]
+fn f06_closure_handlers_are_analysed_in_place() {
+    let report = drift_fixture(
+        "f06",
+        include_str!("../../tests/fixtures/probes/drift/f06_closure_handlers.rs"),
+    );
+    let stats = route_at(&report, "/admin/stats");
+    assert_eq!(stats.handler_resolution, Some(HandlerResolution::Closure));
+    assert!(has_evidence(
+        stats,
+        AuthEvidenceKind::RoleCheck,
+        "AdminUser"
+    ));
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "GET", "/admin/debug")]
+    );
+}
+
+#[test]
+fn f07_unrecognized_middleware_makes_a_gap_unverified_unless_peers_share_it() {
+    let report = drift_fixture(
+        "f07",
+        include_str!("../../tests/fixtures/probes/drift/f07_unrecognized_middleware.rs"),
+    );
+    assert!(has_evidence(
+        route_at(&report, "/admin/stats"),
+        AuthEvidenceKind::Unknown,
+        "StaffOnlyGate"
+    ));
+    // `Logger` is infrastructure, not unknown.
+    assert!(
+        !route_at(&report, "/admin/users")
+            .authorization
+            .iter()
+            .any(|evidence| evidence.kind == AuthEvidenceKind::Unknown)
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(UnverifiedProtection, "GET", "/admin/stats"),
+            finding(MissingAuthorization, "GET", "/team/stats"),
+        ]
+    );
+    let unverified = &report.finding_details[0];
+    assert_eq!(unverified.severity, Severity::Low);
+}
+
+#[test]
+fn f08_enforced_checks_count_in_every_common_form() {
+    let report = drift_fixture(
+        "f08",
+        include_str!("../../tests/fixtures/probes/drift/f08_enforcement_forms.rs"),
+    );
+    for route in &report.routes {
+        assert_eq!(route.best_tier(), EvidenceTier::Privilege, "{}", route.path);
+        assert_eq!(route.privilege_requirements(), ["admin"], "{}", route.path);
+    }
+    assert!(report.finding_details.is_empty());
+}
+
+#[test]
+fn f09_ownership_comparisons_queries_and_filters_are_resource_evidence() {
+    let report = drift_fixture(
+        "f09",
+        include_str!("../../tests/fixtures/probes/drift/f09_ownership.rs"),
+    );
+    for method in ["GET", "PUT", "DELETE"] {
+        let route = report
+            .routes
+            .iter()
+            .find(|route| route.method == method)
+            .unwrap();
+        assert_eq!(route.best_tier(), EvidenceTier::Resource, "{method}");
+    }
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "PATCH", "/api/posts/{id}")]
+    );
+    assert_eq!(report.finding_details[0].severity, Severity::Medium);
+}
+
+#[test]
+fn f10_public_reads_are_not_drift_but_writes_below_their_reads_are() {
+    let report = drift_fixture(
+        "f10",
+        include_str!("../../tests/fixtures/probes/drift/f10_public_reads_protected_writes.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(MissingAuthorization, "DELETE", "/blog/posts/{id}"),
+            finding(MissingAuthorization, "PUT", "/admin/settings/{key}"),
+        ]
+    );
+}
+
+#[test]
+fn f11_a_consistently_public_resource_is_not_drift_but_a_lone_one_is() {
+    let report = drift_fixture(
+        "f11",
+        include_str!("../../tests/fixtures/probes/drift/f11_public_resource_by_design.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthentication, "GET", "/portal/exports")]
+    );
+}
+
+#[test]
+fn f12_exemptions_cover_only_generic_auth_and_health_endpoints() {
+    let report = drift_fixture(
+        "f12",
+        include_str!("../../tests/fixtures/probes/drift/f12_exemptions.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(MissingAuthorization, "GET", "/admin/metrics"),
+            finding(MissingAuthorization, "GET", "/admin/settings/auth"),
+        ]
+    );
+}
+
+#[test]
+fn f13_identity_and_logging_middleware_neither_protect_nor_hide_drift() {
+    let report = drift_fixture(
+        "f13",
+        include_str!("../../tests/fixtures/probes/drift/f13_infrastructure_middleware.rs"),
+    );
+    assert!(report.routes.iter().all(|route| {
+        route
+            .authorization
+            .iter()
+            .all(|evidence| evidence.kind != AuthEvidenceKind::Unknown)
+    }));
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthentication, "GET", "/me/exports")]
+    );
+}
+
+#[test]
+fn f14_requirements_compare_across_mechanisms_but_not_per_route_permissions() {
+    let report = drift_fixture(
+        "f14",
+        include_str!("../../tests/fixtures/probes/drift/f14_requirement_keys.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(DifferentAuthorization, "GET", "/staff/d")]
+    );
+}
+
+#[test]
+fn f15_unresolved_and_opaque_handlers_are_unverified_not_missing() {
+    let report = drift_fixture(
+        "f15",
+        include_str!("../../tests/fixtures/probes/drift/f15_unresolved_handler.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(UnverifiedProtection, "GET", "/admin/plugins"),
+            finding(UnverifiedProtection, "GET", "/admin/stats"),
+        ]
+    );
+}
+
+#[test]
+fn f16_wrap_fn_closures_are_unknown_and_routing_guards_are_ignored() {
+    let report = drift_fixture(
+        "f16",
+        include_str!("../../tests/fixtures/probes/drift/f16_wrap_fn_and_guards.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [
+            finding(UnverifiedProtection, "GET", "/admin/hook"),
+            finding(MissingAuthorization, "GET", "/admin/json"),
+        ]
+    );
+}
+
+#[test]
+fn sql_literals_scope_to_the_caller_only_with_a_bound_owner_column() {
+    assert!(sql_scopes_to_caller(
+        "SELECT * FROM posts WHERE id = $1 AND owner_id = $2"
+    ));
+    assert!(sql_scopes_to_caller("delete from notes where user_id=?"));
+    assert!(!sql_scopes_to_caller(
+        "SELECT owner_id FROM posts WHERE id = $1"
+    ));
+    assert!(!sql_scopes_to_caller(
+        "SELECT * FROM posts WHERE co_owner_id = $1"
+    ));
+    assert!(!sql_scopes_to_caller("UPDATE posts SET user_id = $1"));
+}
+
+#[test]
+fn requirement_keys_normalize_names_literals_and_variants() {
+    assert_eq!(name_keys("require_admin"), ["admin"]);
+    assert_eq!(name_keys("AdminUser"), ["admin"]);
+    assert_eq!(name_keys("AdminGuard"), ["admin"]);
+    assert_eq!(name_keys("check_billing_admin"), ["billing_admin"]);
+    assert!(name_keys("check_role").is_empty());
+    assert!(name_keys("authorize").is_empty());
+    assert_eq!(normalize_key("ROLE_ADMIN").as_deref(), Some("admin"));
+    assert_eq!(normalize_key("Administrators").as_deref(), Some("admin"));
+    assert_eq!(literal_key("reports:read").as_deref(), Some("reports:read"));
+    assert!(literal_key("you are not allowed").is_none());
+    let expr: syn::Expr = syn::parse_str("user.roles.contains(&UserRole::SuperUser)").unwrap();
+    assert_eq!(keys_in_expr(&expr), ["super_user"]);
+}
+
+#[test]
+fn placement_uses_the_scope_then_generic_prefixes_then_the_first_segment() {
+    let place = |method: &str, path: &str, scope: &str| {
+        let placed = placement(&route(method, path, scope, "NONE"));
+        (placed.namespace, placed.resource, placed.class)
+    };
+    assert_eq!(
+        place("GET", "/admin/users/{id}/roles", "/admin"),
+        ("/admin".into(), "/admin/users".into(), MethodClass::Read)
+    );
+    assert_eq!(
+        place("DELETE", "/api/v1/orders/{id}", ""),
+        (
+            "/api/v1".into(),
+            "/api/v1/orders".into(),
+            MethodClass::Write
+        )
+    );
+    assert_eq!(
+        place("GET", "/admin/users", ""),
+        ("/admin".into(), "/admin/users".into(), MethodClass::Read)
+    );
+    assert_eq!(
+        place("GET", "/t/{tenant}/users", "/t/{tenant}"),
+        ("/t/{}".into(), "/t/{}/users".into(), MethodClass::Read)
+    );
+    assert_eq!(MethodClass::of("UNKNOWN"), MethodClass::Write);
+    assert_eq!(MethodClass::of("HEAD"), MethodClass::Read);
+}
+
+#[test]
+fn exemptions_require_a_generic_or_account_context() {
+    let exempt = |path: &str| {
+        let route = route("GET", path, "", "NONE");
+        (
+            is_authentication_route(&route),
+            is_well_known_public_route(&route),
+        )
+    };
+    assert_eq!(exempt("/api/v1/auth/login"), (true, false));
+    assert_eq!(exempt("/users/password/reset"), (true, false));
+    assert_eq!(exempt("/admin/users/{id}/token"), (false, false));
+    assert_eq!(exempt("/healthz"), (false, true));
+    assert_eq!(exempt("/api/openapi.json"), (false, true));
+    assert_eq!(exempt("/admin/metrics"), (false, false));
+    assert_eq!(exempt("/orders/{id}/status"), (false, false));
+}
+
+#[test]
+fn bool_helpers_lend_their_predicate_only_where_the_caller_enforces_it() {
+    let report = fixture_report(
+        "predicate-helpers",
+        "fn can_manage(u: &User) -> bool { u.role == Role::Admin || is_superuser(u) }
+         fn is_superuser(u: &User) -> bool { u.flags.superuser }
+         async fn enforced(u: User) -> Resp { if !can_manage(&u) { return forbidden(); } ok() }
+         async fn ignored(u: User) -> Resp { let label = if can_manage(&u) { \"a\" } else { \"b\" }; ok() }
+         async fn tried(u: User) -> Result<(), E> { ensure_admin(&u)?; Ok(()) }
+         fn ensure_admin(u: &User) -> Result<(), E> { if u.role != Role::Admin { return Err(E::Forbidden); } Ok(()) }
+         fn config(cfg: &mut ServiceConfig) {
+             cfg.route(\"/x/enforced\", web::get().to(enforced))
+                .route(\"/x/ignored\", web::get().to(ignored))
+                .route(\"/x/tried\", web::get().to(tried));
+         }",
+    );
+    assert!(route_at(&report, "/x/enforced").is_authorized());
+    assert!(!route_at(&report, "/x/ignored").is_authorized());
+    assert!(route_at(&report, "/x/tried").is_authorized());
+}
+
+#[test]
+fn text_findings_name_category_severity_and_reason() {
+    let report = drift_fixture(
+        "text-findings",
+        include_str!("../../tests/fixtures/probes/drift/f02_missing_authentication.rs"),
+    );
+    let text = &report.findings[0];
+    assert!(
+        text.contains("Category: missing authentication (severity high"),
+        "{text}"
+    );
+    assert!(text.contains("Why: No authentication"), "{text}");
 }

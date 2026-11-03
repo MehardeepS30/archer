@@ -1,35 +1,138 @@
 //! Authorization evidence inside handler bodies and in guard/middleware names.
 
 use quote::ToTokens;
-#[cfg(test)]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::{
-    BinOp, Expr, ExprAssign, ExprBinary, ExprCall, ExprField, ExprMethodCall, ExprPath, FnArg,
-    GenericArgument, ImplItemFn, ItemFn, Member, PathArguments, Token, TraitItemFn, Type, UnOp,
+    BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprClosure, ExprField, ExprIf,
+    ExprMatch, ExprMethodCall, ExprPath, ExprTry, ExprWhile, FnArg, GenericArgument, ImplItemFn,
+    ItemFn, Local, Member, Pat, PathArguments, ReturnType, Stmt, Token, TraitItemFn, Type, UnOp,
     punctuated::Punctuated,
     spanned::Spanned,
     visit::{self, Visit},
 };
 
-use super::model::*;
+use super::{
+    model::*,
+    routes::{HandlerTarget, handler_target, pattern_bindings},
+};
+
+/// Where an expression's value goes. This decides whether a check found in
+/// it restricts the request, or is only mentioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Use {
+    /// Evaluated for its effect: a statement, or a body's final value.
+    /// Imperative checks (`require_admin(&user)`) enforce here; predicates
+    /// (`is_admin(&user)`, `user.role == Role::Admin`) do not.
+    Statement,
+    /// Decides whether the request is rejected: the condition of an `if`,
+    /// `match`, or `while` with a rejecting branch, an `ensure!`/`assert!`
+    /// condition, a `let ... else`, or an expression under `?`.
+    Enforcing,
+    /// The predicate of a `filter`/`retain`/`find` closure: it scopes the
+    /// data returned, so ownership comparisons enforce; role comparisons
+    /// there select records (`users.filter(|u| u.role == Role::Admin)`).
+    Scoping,
+    /// Used as a value, such as a display flag or a struct field.
+    Value,
+}
+
+/// A call of a repository function from a body, with how its result is used.
+#[derive(Debug, Clone)]
+pub(crate) struct HelperCall {
+    pub(crate) target: HandlerTarget,
+    pub(crate) use_: Use,
+}
+
+/// Evidence of one function, split by how it reaches a caller.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FunctionEvidence {
+    /// Checks the function itself enforces.
+    pub(crate) evidence: Vec<AuthEvidence>,
+    /// Checks in the value a `bool` function returns (`fn can_edit(u) -> bool
+    /// { u.role == Role::Admin }`). They restrict access only where a caller
+    /// enforces that value.
+    pub(crate) predicate_evidence: Vec<AuthEvidence>,
+    pub(crate) calls: Vec<HelperCall>,
+    /// Repository functions called in a `bool` function's returned value.
+    pub(crate) predicate_calls: Vec<HandlerTarget>,
+}
 
 pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> {
+    function_evidence(file, item).evidence
+}
+
+pub(crate) fn function_evidence(file: &Path, item: &ItemFn) -> FunctionEvidence {
     let handler = item.sig.ident.to_string();
-    let mut evidence: Vec<AuthEvidence> = item
-        .attrs
-        .iter()
-        .filter_map(|attribute| attribute_evidence(attribute, file, &handler))
-        .collect();
-    for input in &item.sig.inputs {
-        if let FnArg::Typed(argument) = input {
-            extractor_evidence(&argument.ty, file, &handler, &mut evidence);
+    let mut evidence = signature_evidence(file, &handler, &item.attrs, &item.sig.inputs);
+    let mut visitor = AuthEvidenceVisitor::new(file, &handler);
+    visitor.returns_bool = returns_bool(&item.sig.output);
+    // A `Result` returned as the body's value is the caller's to propagate:
+    // `fn h() -> Result<..> { user.has_role("admin") }` rejects on `Err`.
+    let tail = if returns_result(&item.sig.output) {
+        Use::Enforcing
+    } else {
+        Use::Statement
+    };
+    visitor.visit_body(&item.block, tail);
+    evidence.extend(visitor.evidence);
+    FunctionEvidence {
+        evidence,
+        predicate_evidence: visitor.predicate_evidence,
+        calls: visitor.calls,
+        predicate_calls: visitor.predicate_calls,
+    }
+}
+
+/// Evidence of a closure written as a route handler,
+/// `.to(|admin: AdminUser| async move { ... })`: its extractor parameters
+/// and its body.
+pub(crate) fn closure_evidence(
+    file: &Path,
+    closure: &ExprClosure,
+    handler: &str,
+) -> Vec<AuthEvidence> {
+    let mut evidence = Vec::new();
+    for input in &closure.inputs {
+        if let Pat::Type(typed) = input {
+            extractor_evidence(&typed.ty, file, handler, &mut evidence);
         }
     }
-    let mut visitor = AuthEvidenceVisitor::new(file, &handler);
-    visitor.visit_block(&item.block);
+    let mut visitor = AuthEvidenceVisitor::new(file, handler);
+    match &*closure.body {
+        Expr::Async(body) => visitor.visit_body(&body.block, Use::Statement),
+        Expr::Block(body) => visitor.visit_body(&body.block, Use::Statement),
+        body => visitor.visit_expr(body),
+    }
     evidence.extend(visitor.evidence);
     evidence
+}
+
+fn signature_evidence(
+    file: &Path,
+    handler: &str,
+    attrs: &[syn::Attribute],
+    inputs: &Punctuated<FnArg, Token![,]>,
+) -> Vec<AuthEvidence> {
+    let mut evidence: Vec<AuthEvidence> = attrs
+        .iter()
+        .filter_map(|attribute| attribute_evidence(attribute, file, handler))
+        .collect();
+    for input in inputs {
+        if let FnArg::Typed(argument) = input {
+            extractor_evidence(&argument.ty, file, handler, &mut evidence);
+        }
+    }
+    evidence
+}
+
+fn returns_result(output: &ReturnType) -> bool {
+    matches!(output, ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(path)
+        if path.path.segments.last().is_some_and(|segment| segment.ident.to_string().ends_with("Result"))))
+}
+
+fn returns_bool(output: &ReturnType) -> bool {
+    matches!(output, ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(path) if path.path.is_ident("bool")))
 }
 
 /// An authorization attribute macro on a handler, such as actix-web-grants'
@@ -53,6 +156,16 @@ fn attribute_evidence(
             (kind, _) => (kind, AuthStrength::Strong),
         },
     };
+    let mut requirements = name_keys(&name);
+    if let syn::Meta::List(list) = &attribute.meta {
+        requirements.extend(
+            token_literals(&list.tokens, false)
+                .iter()
+                .filter_map(|value| literal_key(value)),
+        );
+    }
+    requirements.sort();
+    requirements.dedup();
     Some(AuthEvidence {
         kind,
         mechanism: name,
@@ -61,6 +174,7 @@ fn attribute_evidence(
         line: attribute.span().start().line,
         handler: Some(handler.into()),
         strength,
+        requirements,
     })
 }
 
@@ -117,6 +231,20 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 return;
             }
             if let Some((kind, strength)) = classify_extractor_name(&name) {
+                // `AdminUser` requires `admin`; `RequireRole<Admin>` names it
+                // in its type parameter.
+                let mut requirements = name_keys(&name);
+                if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                    for argument in &arguments.args {
+                        if let GenericArgument::Type(Type::Path(inner)) = argument
+                            && let Some(last) = inner.path.segments.last()
+                        {
+                            requirements.extend(name_keys(&last.ident.to_string()));
+                        }
+                    }
+                }
+                requirements.sort();
+                requirements.dedup();
                 evidence.push(AuthEvidence {
                     kind,
                     mechanism: name,
@@ -125,6 +253,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     line: ty.span().start().line,
                     handler: Some(handler.into()),
                     strength,
+                    requirements,
                 });
                 return;
             }
@@ -225,10 +354,29 @@ impl<'ast> Visit<'ast> for FunctionVisitor {
     }
 }
 
+/// Evidence and helper calls recorded while a `let` initializer is visited.
+/// They count only if the binding is later read where it is enforced:
+/// `let allowed = is_admin(&user); if !allowed { return Err(..) }`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Captured {
+    evidence: Vec<AuthEvidence>,
+    calls: Vec<HandlerTarget>,
+}
+
 pub(crate) struct AuthEvidenceVisitor {
     pub(crate) file: PathBuf,
     pub(crate) handler: String,
     pub(crate) evidence: Vec<AuthEvidence>,
+    pub(crate) predicate_evidence: Vec<AuthEvidence>,
+    pub(crate) calls: Vec<HelperCall>,
+    pub(crate) predicate_calls: Vec<HandlerTarget>,
+    use_: Use,
+    /// The function returns `bool`: its returned value is a predicate.
+    returns_bool: bool,
+    /// Visiting a `bool` function's returned value.
+    in_returned_value: bool,
+    capture: Option<Captured>,
+    bound: HashMap<String, Captured>,
 }
 
 impl AuthEvidenceVisitor {
@@ -237,22 +385,249 @@ impl AuthEvidenceVisitor {
             file: file.to_path_buf(),
             handler: handler.into(),
             evidence: Vec::new(),
+            predicate_evidence: Vec::new(),
+            calls: Vec::new(),
+            predicate_calls: Vec::new(),
+            use_: Use::Statement,
+            returns_bool: false,
+            in_returned_value: false,
+            capture: None,
+            bound: HashMap::new(),
+        }
+    }
+
+    fn with_use(&mut self, use_: Use, visit: impl FnOnce(&mut Self)) {
+        let previous = std::mem::replace(&mut self.use_, use_);
+        visit(self);
+        self.use_ = previous;
+    }
+
+    /// Visits a function or closure body; its final expression is the
+    /// returned value, a predicate when the function returns `bool`.
+    pub(crate) fn visit_body(&mut self, block: &Block, tail: Use) {
+        let Some((last, rest)) = block.stmts.split_last() else {
+            return;
+        };
+        self.with_use(Use::Statement, |visitor| {
+            for statement in rest {
+                visitor.visit_stmt(statement);
+            }
+        });
+        match last {
+            Stmt::Expr(expr, None) => self.visit_returned(expr, tail),
+            statement => self.with_use(Use::Statement, |visitor| visitor.visit_stmt(statement)),
+        }
+    }
+
+    fn visit_returned(&mut self, expr: &Expr, use_: Use) {
+        if self.returns_bool {
+            let previous = std::mem::replace(&mut self.in_returned_value, true);
+            self.with_use(Use::Enforcing, |visitor| visitor.visit_expr(expr));
+            self.in_returned_value = previous;
+        } else {
+            self.with_use(use_, |visitor| visitor.visit_expr(expr));
+        }
+    }
+
+    /// Records a check where it restricts the request. Imperative checks
+    /// (`require_admin`, `authorize`) restrict wherever their effect runs;
+    /// predicates only where their value decides a rejection. Identity
+    /// extraction bound to a variable (`let user = current_user(&req);`)
+    /// counts: that is how an extracted identity is used.
+    fn record(&mut self, evidence: AuthEvidence, imperative: bool) {
+        let enforced = match self.use_ {
+            Use::Enforcing => true,
+            Use::Statement => imperative,
+            Use::Scoping => evidence.kind == AuthEvidenceKind::OwnershipCheck,
+            Use::Value => {
+                imperative
+                    && evidence.kind == AuthEvidenceKind::IdentityExtraction
+                    && self.capture.is_some()
+            }
+        };
+        if enforced {
+            if self.in_returned_value {
+                self.predicate_evidence.push(evidence);
+            } else {
+                self.evidence.push(evidence);
+            }
+        } else if let Some(captured) = &mut self.capture {
+            captured.evidence.push(evidence);
+        }
+    }
+
+    fn record_call(&mut self, target: HandlerTarget) {
+        if self.in_returned_value && self.use_ == Use::Enforcing {
+            self.predicate_calls.push(target);
+            return;
+        }
+        if self.use_ == Use::Value
+            && let Some(captured) = &mut self.capture
+        {
+            captured.calls.push(target.clone());
+        }
+        self.calls.push(HelperCall {
+            target,
+            use_: self.use_,
+        });
+    }
+
+    /// A binding read where it is enforced releases what its initializer
+    /// captured.
+    fn release(&mut self, name: &str) {
+        if self.use_ != Use::Enforcing {
+            return;
+        }
+        let Some(captured) = self.bound.remove(name) else {
+            return;
+        };
+        for evidence in captured.evidence {
+            self.record(evidence, true);
+        }
+        for target in captured.calls {
+            self.record_call(target);
+        }
+    }
+
+    fn evidence(
+        &self,
+        kind: AuthEvidenceKind,
+        mechanism: String,
+        line: usize,
+        strength: AuthStrength,
+    ) -> AuthEvidence {
+        AuthEvidence {
+            kind,
+            symbol: Some(mechanism.clone()),
+            mechanism,
+            file: self.file.clone(),
+            line,
+            handler: Some(self.handler.clone()),
+            strength,
+            requirements: Vec::new(),
         }
     }
 }
 
 impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
+    fn visit_block(&mut self, node: &'ast Block) {
+        self.with_use(Use::Statement, |visitor| visit::visit_block(visitor, node));
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        let Some(init) = &node.init else {
+            return;
+        };
+        // `let Some(user) = current_user(&req) else { return ... };`
+        if let Some((_, diverge)) = &init.diverge {
+            self.with_use(Use::Enforcing, |visitor| visitor.visit_expr(&init.expr));
+            self.with_use(Use::Statement, |visitor| visitor.visit_expr(diverge));
+            return;
+        }
+        let mut names = HashSet::new();
+        pattern_bindings(&node.pat, &mut names);
+        let previous = self.capture.replace(Captured::default());
+        self.with_use(Use::Value, |visitor| visitor.visit_expr(&init.expr));
+        let captured = std::mem::replace(&mut self.capture, previous).unwrap_or_default();
+        for name in names {
+            self.bound.insert(name, captured.clone());
+        }
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast ExprTry) {
+        self.with_use(Use::Enforcing, |visitor| visitor.visit_expr(&node.expr));
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        let rejecting = block_rejects(&node.then_branch)
+            || node
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, branch)| expr_rejects(branch));
+        let condition = if rejecting {
+            Use::Enforcing
+        } else {
+            Use::Value
+        };
+        self.with_use(condition, |visitor| visitor.visit_expr(&node.cond));
+        self.visit_block(&node.then_branch);
+        if let Some((_, branch)) = &node.else_branch {
+            self.with_use(Use::Statement, |visitor| visitor.visit_expr(branch));
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
+        let condition = if block_rejects(&node.body) {
+            Use::Enforcing
+        } else {
+            Use::Value
+        };
+        self.with_use(condition, |visitor| visitor.visit_expr(&node.cond));
+        self.visit_block(&node.body);
+    }
+
+    /// `match user.role { Role::Admin | Role::Owner => .., _ => return Err(..) }`
+    /// is a role check requiring the roles of the arms that do not reject.
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        let rejecting: Vec<bool> = node
+            .arms
+            .iter()
+            .map(|arm| expr_rejects(&arm.body))
+            .collect();
+        let enforcing = rejecting.iter().any(|rejects| *rejects);
+        let condition = if enforcing {
+            Use::Enforcing
+        } else {
+            Use::Value
+        };
+        self.with_use(condition, |visitor| visitor.visit_expr(&node.expr));
+        if enforcing && let Some(kind) = authorization_operand(&node.expr) {
+            let mut requirements: Vec<String> = node
+                .arms
+                .iter()
+                .zip(&rejecting)
+                .filter(|(_, rejects)| !**rejects)
+                .flat_map(|(arm, _)| pattern_keys(&arm.pat))
+                .collect();
+            requirements.sort();
+            requirements.dedup();
+            let written = node.expr.to_token_stream().to_string().replace(' ', "");
+            let mut evidence = self.evidence(
+                kind,
+                written,
+                node.expr.span().start().line,
+                AuthStrength::Medium,
+            );
+            evidence.requirements = requirements;
+            self.with_use(Use::Enforcing, |visitor| visitor.record(evidence, false));
+        }
+        for arm in &node.arms {
+            if let Pat::Guard(guarded) = &arm.pat {
+                self.with_use(condition, |visitor| visitor.visit_expr(&guarded.guard));
+            }
+            self.with_use(Use::Statement, |visitor| visitor.visit_expr(&arm.body));
+        }
+    }
+
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         let symbol = node.func.to_token_stream().to_string().replace(' ', "");
         let line = node.func.span().start().line;
-        let evidence = evidence_for_handler_call(&symbol, line, &self.file, &self.handler)
+        let name = symbol.rsplit("::").next().unwrap_or(&symbol).to_string();
+        let found = evidence_for_handler_call(&symbol, line, &self.file, &self.handler)
             .or_else(|| evidence_for_handler_symbol(&symbol, line, &self.file, &self.handler));
-        if let Some(evidence) = evidence {
-            self.evidence.push(evidence);
+        if let Some(mut evidence) = found {
+            evidence.requirements = requirement_keys(&name, &node.args);
+            let imperative = is_imperative(&name, &evidence.kind);
+            self.record(evidence, imperative);
         }
-        for argument in &node.args {
-            self.visit_expr(argument);
+        if let Some(target) = handler_target(&node.func) {
+            self.record_call(target);
         }
+        self.with_use(Use::Value, |visitor| {
+            for argument in &node.args {
+                visitor.visit_expr(argument);
+            }
+        });
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
@@ -268,9 +643,24 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             evidence_for_handler_method(&method, 0, &self.file, &self.handler)
         {
             evidence.line = node.span().start().line;
-            self.evidence.push(evidence);
+            evidence.requirements = requirement_keys(&method, &node.args);
+            let imperative = is_imperative(&method, &evidence.kind);
+            self.record(evidence, imperative);
         }
-        visit::visit_expr_method_call(self, node);
+        self.visit_expr(&node.receiver);
+        // A filter whose result decides a rejection (`let Some(a) =
+        // users.find(|u| is_admin(u)) else { return .. }`) enforces its
+        // predicate; otherwise it scopes the records returned.
+        let arguments = match (SCOPING_METHODS.contains(&method.as_str()), self.use_) {
+            (true, Use::Enforcing) => Use::Enforcing,
+            (true, _) => Use::Scoping,
+            (false, _) => Use::Value,
+        };
+        self.with_use(arguments, |visitor| {
+            for argument in &node.args {
+                visitor.visit_expr(argument);
+            }
+        });
     }
 
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
@@ -281,24 +671,19 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             &self.file,
             &self.handler,
         ) {
-            self.evidence.push(evidence);
+            self.record(evidence, true);
+        }
+        if let Some(name) = node.path.get_ident() {
+            self.release(&name.to_string());
         }
         visit::visit_expr_path(self, node);
     }
 
-    // Expression and statement macros both reach this hook once. Only the
-    // macro's own name is classified, with the helper-name rules; its tokens
-    // are opaque, so calls written inside a macro (`assert!(is_admin(&user))`)
-    // are not evidence.
+    // Expression and statement macros both reach this hook once. The
+    // condition of `ensure!`/`assert!` is enforced; `matches!` is a
+    // comparison; other macros' tokens are opaque, apart from SQL string
+    // literals that scope a query to the caller.
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        // `matches!(user.role, Role::Admin | Role::Owner)`: the pattern is
-        // read as an expression, which a path or `|` of paths parses as.
-        if node.path.is_ident("matches")
-            && let Ok(arguments) =
-                node.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-        {
-            self.record_comparison(arguments.iter());
-        }
         let Some(name) = node
             .path
             .segments
@@ -307,22 +692,72 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         else {
             return;
         };
+        let arguments = node.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated);
+        if let Ok(arguments) = &arguments {
+            if ENFORCING_MACROS.contains(&name.as_str()) {
+                let conditions = if name.ends_with("_eq") || name.ends_with("_ne") {
+                    2
+                } else {
+                    1
+                };
+                for (position, argument) in arguments.iter().enumerate() {
+                    let use_ = if position < conditions {
+                        Use::Enforcing
+                    } else {
+                        Use::Value
+                    };
+                    self.with_use(use_, |visitor| visitor.visit_expr(argument));
+                }
+            } else if name == "matches" {
+                // `matches!(user.role, Role::Admin | Role::Owner)`: the
+                // pattern is read as an expression, which a path or `|` of
+                // paths parses as.
+                self.record_comparison(arguments.iter());
+            }
+        }
+        for literal in token_literals(&node.tokens, true) {
+            if sql_scopes_to_caller(&literal) {
+                let evidence = self.evidence(
+                    AuthEvidenceKind::OwnershipCheck,
+                    format!("{name}! query scoped to the caller"),
+                    node.path.span().start().line,
+                    AuthStrength::Medium,
+                );
+                self.with_use(Use::Enforcing, |visitor| visitor.record(evidence, true));
+            }
+        }
         let Some((kind, strength)) = classify_check_name(&name) else {
             return;
         };
         let symbol = node.path.to_token_stream().to_string().replace(' ', "");
-        self.evidence.push(AuthEvidence {
-            kind,
-            mechanism: name,
-            symbol: Some(format!("{symbol}!")),
-            file: self.file.clone(),
-            line: node.path.span().start().line,
-            handler: Some(self.handler.clone()),
-            strength,
-        });
+        let mut evidence =
+            self.evidence(kind, name.clone(), node.path.span().start().line, strength);
+        evidence.symbol = Some(format!("{symbol}!"));
+        evidence.requirements = name_keys(&name);
+        evidence.requirements.extend(
+            token_literals(&node.tokens, false)
+                .iter()
+                .filter_map(|value| literal_key(value)),
+        );
+        evidence.requirements.sort();
+        evidence.requirements.dedup();
+        let imperative = is_imperative(&name, &evidence.kind);
+        self.record(evidence, imperative);
     }
 
-    /// `user.role != Role::Admin`, `claims.permission == Permission::Write`.
+    fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+        if sql_scopes_to_caller(&node.value()) {
+            let evidence = self.evidence(
+                AuthEvidenceKind::OwnershipCheck,
+                "query scoped to the caller".into(),
+                node.span().start().line,
+                AuthStrength::Medium,
+            );
+            self.with_use(Use::Enforcing, |visitor| visitor.record(evidence, true));
+        }
+    }
+
+    /// `user.role != Role::Admin`, `post.owner_id == user.id`.
     fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
         if matches!(node.op, BinOp::Eq(_) | BinOp::Ne(_)) {
             self.record_comparison([&*node.left, &*node.right]);
@@ -336,22 +771,55 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         if let Member::Named(member) = &node.member
             && let Some((kind, _)) = classify_check_name(&member.to_string())
         {
-            self.evidence.push(AuthEvidence {
+            let mut evidence = self.evidence(
                 kind,
-                mechanism: member.to_string(),
-                symbol: Some(node.to_token_stream().to_string().replace(' ', "")),
-                file: self.file.clone(),
-                line: member.span().start().line,
-                handler: Some(self.handler.clone()),
-                strength: AuthStrength::Medium,
-            });
+                member.to_string(),
+                member.span().start().line,
+                AuthStrength::Medium,
+            );
+            evidence.symbol = Some(node.to_token_stream().to_string().replace(' ', ""));
+            evidence.requirements = name_keys(&member.to_string());
+            self.record(evidence, false);
         }
         visit::visit_expr_field(self, node);
     }
 
     /// Assigning a flag (`user.is_admin = true`) does not check it.
     fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
-        self.visit_expr(&node.right);
+        self.with_use(Use::Value, |visitor| visitor.visit_expr(&node.right));
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        self.with_use(Use::Value, |visitor| {
+            visit::visit_expr_struct(visitor, node)
+        });
+    }
+
+    fn visit_expr_array(&mut self, node: &'ast syn::ExprArray) {
+        self.with_use(Use::Value, |visitor| visit::visit_expr_array(visitor, node));
+    }
+
+    fn visit_expr_tuple(&mut self, node: &'ast syn::ExprTuple) {
+        self.with_use(Use::Value, |visitor| visit::visit_expr_tuple(visitor, node));
+    }
+
+    fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+        if let Some(expr) = &node.expr {
+            self.visit_returned(expr, Use::Statement);
+        }
+    }
+
+    /// A closure body keeps an enforcing or scoping use (`.filter(|p|
+    /// p.owner_id == user.id)`); otherwise it runs like statements.
+    fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
+        let use_ = match self.use_ {
+            Use::Enforcing | Use::Scoping => self.use_,
+            _ => Use::Statement,
+        };
+        match &*node.body {
+            Expr::Block(body) => self.visit_body(&body.block, use_),
+            body => self.with_use(use_, |visitor| visitor.visit_expr(body)),
+        }
     }
 
     // Functions declared inside the handler body, including methods of nested
@@ -364,27 +832,264 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     fn visit_trait_item_fn(&mut self, _: &'ast TraitItemFn) {}
 }
 
-impl AuthEvidenceVisitor {
-    /// Records the first operand of a comparison that is a role or
-    /// permission: comparing one is a check, whatever the other side is.
-    fn record_comparison<'e>(&mut self, operands: impl IntoIterator<Item = &'e Expr>) {
-        let Some((kind, operand)) = operands
-            .into_iter()
-            .find_map(|operand| authorization_operand(operand).map(|kind| (kind, operand)))
-        else {
-            return;
-        };
-        let written = operand.to_token_stream().to_string().replace(' ', "");
-        self.evidence.push(AuthEvidence {
-            kind,
-            mechanism: written.clone(),
-            symbol: Some(written),
-            file: self.file.clone(),
-            line: operand.span().start().line,
-            handler: Some(self.handler.clone()),
-            strength: AuthStrength::Medium,
-        });
+/// Macros whose leading argument is a condition that rejects when false.
+/// `debug_assert!` is left out: it does not run in release builds.
+const ENFORCING_MACROS: [&str; 6] = [
+    "ensure",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "require",
+    "ensure_eq",
+];
+
+/// Methods whose closure argument decides which records are returned.
+const SCOPING_METHODS: [&str; 7] = [
+    "filter",
+    "retain",
+    "retain_mut",
+    "find",
+    "filter_map",
+    "find_map",
+    "position",
+];
+
+/// Whether a check name is imperative (`require_admin`, `authorize`,
+/// `check_permission`), rejecting by itself, rather than a predicate
+/// (`is_admin`, `has_role`, `owns`) whose value must be acted on.
+pub(crate) fn is_imperative(name: &str, kind: &AuthEvidenceKind) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if *kind == AuthEvidenceKind::IdentityExtraction {
+        return true;
     }
+    !(["is_", "has_", "can_", "may_", "owns"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix)))
+}
+
+impl AuthEvidenceVisitor {
+    /// Records a comparison that checks a role or permission (`user.role ==
+    /// Role::Admin`) or resource ownership (`post.owner_id == user.id`).
+    fn record_comparison<'e>(&mut self, operands: impl IntoIterator<Item = &'e Expr>) {
+        let operands: Vec<&Expr> = operands.into_iter().collect();
+        if let Some((kind, operand)) = operands
+            .iter()
+            .find_map(|operand| authorization_operand(operand).map(|kind| (kind, *operand)))
+        {
+            let written = operand.to_token_stream().to_string().replace(' ', "");
+            let mut evidence = self.evidence(
+                kind,
+                written,
+                operand.span().start().line,
+                AuthStrength::Medium,
+            );
+            let mut requirements: Vec<String> = operands
+                .iter()
+                .flat_map(|operand| keys_in_expr(operand))
+                .collect();
+            requirements.sort();
+            requirements.dedup();
+            evidence.requirements = requirements;
+            self.record(evidence, false);
+            return;
+        }
+        if let [left, right] = operands.as_slice()
+            && let Some(owned) = [(left, right), (right, left)]
+                .into_iter()
+                .find(|(owned, caller)| ownership_operand(owned) && caller_operand(caller))
+                .map(|(owned, _)| *owned)
+        {
+            let written = owned.to_token_stream().to_string().replace(' ', "");
+            let evidence = self.evidence(
+                AuthEvidenceKind::OwnershipCheck,
+                written,
+                owned.span().start().line,
+                AuthStrength::Medium,
+            );
+            self.record(evidence, false);
+        }
+    }
+}
+
+/// Fields that name a record's owner.
+const OWNERSHIP_FIELDS: [&str; 9] = [
+    "owner_id",
+    "owner",
+    "user_id",
+    "author_id",
+    "created_by",
+    "creator_id",
+    "tenant_id",
+    "account_id",
+    "owned_by",
+];
+
+/// Words that make an expression the requesting caller (`user.id`,
+/// `claims.sub`, `identity.id()`).
+const CALLER_WORDS: [&str; 13] = [
+    "user",
+    "claims",
+    "identity",
+    "current",
+    "session",
+    "principal",
+    "caller",
+    "auth",
+    "subject",
+    "sub",
+    "me",
+    "actor",
+    "requester",
+];
+
+fn strip_conversions(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => strip_conversions(&paren.expr),
+        Expr::Group(group) => strip_conversions(&group.expr),
+        Expr::Reference(reference) => strip_conversions(&reference.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => strip_conversions(&unary.expr),
+        Expr::MethodCall(call)
+            if call.args.is_empty()
+                && [
+                    "as_str",
+                    "as_ref",
+                    "as_deref",
+                    "to_string",
+                    "to_owned",
+                    "clone",
+                    "unwrap",
+                    "as_uuid",
+                    "into",
+                ]
+                .iter()
+                .any(|conversion| call.method == conversion) =>
+        {
+            strip_conversions(&call.receiver)
+        }
+        _ => expr,
+    }
+}
+
+fn ownership_operand(expr: &Expr) -> bool {
+    match strip_conversions(expr) {
+        Expr::Field(field) => {
+            matches!(&field.member, Member::Named(member) if OWNERSHIP_FIELDS.contains(&member.to_string().as_str()))
+        }
+        Expr::MethodCall(call) => {
+            call.args.is_empty() && OWNERSHIP_FIELDS.contains(&call.method.to_string().as_str())
+        }
+        _ => false,
+    }
+}
+
+fn caller_operand(expr: &Expr) -> bool {
+    // `u.id`, `claims.sub`, `me.uid`: an identifier field of some caller value.
+    if let Expr::Field(field) = strip_conversions(expr)
+        && let Member::Named(member) = &field.member
+        && ["id", "sub", "uid", "user_id", "subject"].contains(&member.to_string().as_str())
+    {
+        return true;
+    }
+    let written = expr.to_token_stream().to_string().to_ascii_lowercase();
+    written
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| CALLER_WORDS.contains(&word))
+}
+
+/// Whether a SQL string restricts rows to the caller: `WHERE ... owner_id =
+/// $1`, `AND user_id = ?`.
+pub(crate) fn sql_scopes_to_caller(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let Some(clause) = lower.find("where") else {
+        return false;
+    };
+    let clause = &lower[clause..];
+    OWNERSHIP_FIELDS.iter().any(|field| {
+        clause.match_indices(field).any(|(index, _)| {
+            let before = clause[..index].chars().next_back();
+            if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return false;
+            }
+            let rest = clause[index + field.len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('=') else {
+                return false;
+            };
+            rest.trim_start()
+                .starts_with(['$', '?', ':', '@'])
+        })
+    })
+}
+
+/// Whether a value's rejecting branch exists: an early `return`, `?`, an
+/// `Err(..)`, a forbidden/unauthorized response or error, or a panic.
+pub(crate) fn block_rejects(block: &Block) -> bool {
+    let mut visitor = RejectionVisitor::default();
+    visitor.visit_block(block);
+    visitor.rejects
+}
+
+pub(crate) fn expr_rejects(expr: &Expr) -> bool {
+    let mut visitor = RejectionVisitor::default();
+    visitor.visit_expr(expr);
+    visitor.rejects
+}
+
+#[derive(Default)]
+struct RejectionVisitor {
+    rejects: bool,
+}
+
+const REJECTION_WORDS: [&str; 6] = [
+    "forbidden",
+    "unauthorized",
+    "unauthorised",
+    "deny",
+    "denied",
+    "reject",
+];
+const REJECTION_MACROS: [&str; 5] = ["panic", "unreachable", "bail", "abort", "throw"];
+
+impl<'ast> Visit<'ast> for RejectionVisitor {
+    fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+        self.rejects = true;
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast ExprTry) {
+        self.rejects = true;
+        visit::visit_expr_try(self, node);
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        let written = node.path.to_token_stream().to_string().to_ascii_lowercase();
+        if node.path.is_ident("Err") || REJECTION_WORDS.iter().any(|word| written.contains(word)) {
+            self.rejects = true;
+        }
+        visit::visit_expr_path(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        let method = node.method.to_string().to_ascii_lowercase();
+        if REJECTION_WORDS.iter().any(|word| method.contains(word)) {
+            self.rejects = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| REJECTION_MACROS.contains(&segment.ident.to_string().as_str()))
+        {
+            self.rejects = true;
+        }
+    }
+
+    fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+
+    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
 }
 
 /// Whether an operand names a role or permission: a variant of a type named
@@ -466,6 +1171,7 @@ pub(crate) fn evidence_for_handler_method(
         line,
         handler: Some(handler.into()),
         strength,
+        requirements: Vec::new(),
     })
 }
 
@@ -485,6 +1191,7 @@ pub(crate) fn evidence_for_handler_call(
         line,
         handler: Some(handler.into()),
         strength,
+        requirements: Vec::new(),
     })
 }
 
@@ -615,6 +1322,7 @@ pub(crate) fn evidence_for_handler_symbol(
             line,
             handler: Some(handler.into()),
             strength: AuthStrength::Strong,
+            requirements: vec!["admin".into()],
         });
     }
     if name.ends_with("Guard") || name.ends_with("Middleware") {
@@ -629,6 +1337,7 @@ pub(crate) fn evidence_for_handler_symbol(
             line,
             handler: Some(handler.into()),
             strength: AuthStrength::Weak,
+            requirements: Vec::new(),
         });
     }
     None
@@ -707,6 +1416,9 @@ pub(crate) const CONFIGURATION_SHAPE_WORDS: [&str; 11] = [
 pub(crate) fn classify_route_configuration_name(
     identifier: &str,
 ) -> Option<RouteConfigurationName> {
+    if INFRASTRUCTURE_COMPONENTS.contains(&identifier) {
+        return None;
+    }
     if !identifier.chars().any(char::is_uppercase) {
         let (kind, _) = classify_check_name(identifier)?;
         return Some(if kind == AuthEvidenceKind::IdentityExtraction {
@@ -805,4 +1517,450 @@ impl<'ast> Visit<'ast> for RouteConfigurationNameVisitor {
         }
         visit::visit_expr_path(self, node);
     }
+}
+
+/// Words that name the kind or shape of a check, not what it requires:
+/// `require_admin` requires `admin`, `RequireRole<Admin>` requires `admin`.
+const KEY_STOP_WORDS: &[&str] = &[
+    "require",
+    "requires",
+    "required",
+    "check",
+    "checks",
+    "verify",
+    "ensure",
+    "assert",
+    "enforce",
+    "enforcer",
+    "is",
+    "has",
+    "have",
+    "can",
+    "may",
+    "any",
+    "all",
+    "role",
+    "roles",
+    "permission",
+    "permissions",
+    "perm",
+    "perms",
+    "access",
+    "user",
+    "users",
+    "guard",
+    "middleware",
+    "only",
+    "must",
+    "be",
+    "a",
+    "an",
+    "the",
+    "of",
+    "for",
+    "to",
+    "in",
+    "auth",
+    "authn",
+    "authz",
+    "authorized",
+    "authorize",
+    "authorise",
+    "authorization",
+    "rbac",
+    "acl",
+    "extractor",
+    "gate",
+    "filter",
+    "mw",
+    "layer",
+    "new",
+    "with",
+    "from",
+    "request",
+    "req",
+    "claims",
+    "policy",
+    "grant",
+    "grants",
+    "level",
+];
+
+/// Normalizes a role or permission subject: `ROLE_ADMIN`, `Admins`, and
+/// `administrator` all become `admin`.
+pub(crate) fn normalize_key(raw: &str) -> Option<String> {
+    let mut key = raw.trim().to_ascii_lowercase();
+    for prefix in [
+        "role_",
+        "role:",
+        "roles:",
+        "perm_",
+        "permission:",
+        "permissions:",
+    ] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            key = rest.to_string();
+        }
+    }
+    if [
+        "admins",
+        "administrator",
+        "administrators",
+        "superadmin_admin",
+    ]
+    .contains(&key.as_str())
+    {
+        key = "admin".into();
+    }
+    (!key.is_empty()).then_some(key)
+}
+
+/// The subject a check's name requires: `admin` for `require_admin`,
+/// `AdminUser`, and `AdminGuard`; `billing_admin` for `check_billing_admin`;
+/// nothing for `check_role` or `authorize`.
+pub(crate) fn name_keys(name: &str) -> Vec<String> {
+    let words: Vec<String> = if name.chars().any(char::is_uppercase) {
+        camel_case_words(name)
+    } else {
+        name.to_ascii_lowercase()
+            .split('_')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let subject: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !KEY_STOP_WORDS.contains(word))
+        .collect();
+    if subject.is_empty() {
+        return Vec::new();
+    }
+    normalize_key(&subject.join("_")).into_iter().collect()
+}
+
+/// A string literal that reads as a role or permission name (`"admin"`,
+/// `"billing:read"`), not a message.
+pub(crate) fn literal_key(value: &str) -> Option<String> {
+    let plausible = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.:-/".contains(character));
+    if plausible {
+        normalize_key(value)
+    } else {
+        None
+    }
+}
+
+/// Requirement subjects of a call: its name's, its string-literal
+/// arguments', and its role or permission variants' (`Role::Admin`).
+pub(crate) fn requirement_keys(name: &str, arguments: &Punctuated<Expr, Token![,]>) -> Vec<String> {
+    let mut keys = name_keys(name);
+    for argument in arguments {
+        keys.extend(keys_in_expr(argument));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// String literals and role or permission variants anywhere in an
+/// expression, outside nested calls' function paths.
+pub(crate) fn keys_in_expr(expr: &Expr) -> Vec<String> {
+    #[derive(Default)]
+    struct KeyVisitor {
+        keys: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for KeyVisitor {
+        fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+            self.keys.extend(literal_key(&node.value()));
+        }
+        fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+            self.keys.extend(variant_key(&node.path));
+        }
+        fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+            for argument in &node.args {
+                self.visit_expr(argument);
+            }
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+    }
+    let mut visitor = KeyVisitor::default();
+    visitor.visit_expr(expr);
+    visitor.keys
+}
+
+/// `Role::Admin`, `UserRole::Admin`, `Permission::WriteUsers`: the variant
+/// of a type named like a role or permission, as snake case.
+fn variant_key(path: &syn::Path) -> Option<String> {
+    let segments = &path.segments;
+    let owner = segments.iter().nth_back(1)?.ident.to_string();
+    let words = camel_case_words(&owner);
+    if !words.iter().any(|word| {
+        [
+            "role",
+            "roles",
+            "permission",
+            "permissions",
+            "perm",
+            "scope",
+            "grant",
+        ]
+        .contains(&word.as_str())
+    }) {
+        return None;
+    }
+    let variant = segments.last()?.ident.to_string();
+    normalize_key(&camel_case_words(&variant).join("_"))
+}
+
+/// Role or permission variants named by a match arm's pattern.
+fn pattern_keys(pat: &Pat) -> Vec<String> {
+    match pat {
+        Pat::Path(path) => variant_key(&path.path).into_iter().collect(),
+        Pat::TupleStruct(tuple) => variant_key(&tuple.path).into_iter().collect(),
+        Pat::Struct(item) => variant_key(&item.path).into_iter().collect(),
+        Pat::Or(or) => or.cases.iter().flat_map(pattern_keys).collect(),
+        Pat::Lit(literal) => match &literal.lit {
+            syn::Lit::Str(value) => literal_key(&value.value()).into_iter().collect(),
+            _ => Vec::new(),
+        },
+        Pat::Ident(ident) => ident
+            .subpat
+            .as_ref()
+            .map(|(_, sub)| pattern_keys(sub))
+            .unwrap_or_default(),
+        Pat::Paren(paren) => pattern_keys(&paren.pat),
+        Pat::Guard(guarded) => pattern_keys(&guarded.pat),
+        Pat::Reference(reference) => pattern_keys(&reference.pat),
+        _ => Vec::new(),
+    }
+}
+
+/// String literals in a token stream, recursively. With `include_assigned`
+/// false, literals right after `=` (`ty = "Role"`, `error = "..."`) are
+/// left out: they configure the macro, not the requirement.
+pub(crate) fn token_literals(
+    tokens: &proc_macro2::TokenStream,
+    include_assigned: bool,
+) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut after_equals = false;
+    for token in tokens.clone() {
+        match token {
+            proc_macro2::TokenTree::Literal(literal) => {
+                if (include_assigned || !after_equals)
+                    && let Ok(value) =
+                        syn::parse2::<syn::LitStr>(proc_macro2::TokenTree::Literal(literal).into())
+                {
+                    values.push(value.value());
+                }
+                after_equals = false;
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                values.extend(token_literals(&group.stream(), include_assigned));
+                after_equals = false;
+            }
+            proc_macro2::TokenTree::Punct(punct) => after_equals = punct.as_char() == '=',
+            proc_macro2::TokenTree::Ident(_) => after_equals = false,
+        }
+    }
+    values
+}
+
+/// Middleware that provides sessions, identities, or extracted grants to
+/// handlers without rejecting any request. `IdentityMiddleware` lets a
+/// handler read an identity; it does not require one, so it is not
+/// authentication evidence.
+pub(crate) const INFRASTRUCTURE_COMPONENTS: [&str; 11] = [
+    "PermissionsPolicy",
+    "ContentSecurityPolicy",
+    "SecurityHeaders",
+    "IdentityMiddleware",
+    "IdentityService",
+    "SessionMiddleware",
+    "CookieSession",
+    "CookieIdentityPolicy",
+    "GrantsMiddleware",
+    "GrantsExtractor",
+    "Condition",
+];
+
+/// Words of middleware and guards that route, log, shape, or limit
+/// requests without deciding who may make them.
+const BENIGN_COMPONENT_WORDS: &[&str] = &[
+    "logger",
+    "logging",
+    "log",
+    "compress",
+    "compression",
+    "decompress",
+    "cors",
+    "header",
+    "headers",
+    "normalize",
+    "error",
+    "errors",
+    "tracing",
+    "trace",
+    "tracer",
+    "metrics",
+    "prometheus",
+    "telemetry",
+    "sentry",
+    "otel",
+    "opentelemetry",
+    "span",
+    "session",
+    "sessions",
+    "cookie",
+    "cookies",
+    "governor",
+    "ratelimit",
+    "ratelimiter",
+    "rate",
+    "limit",
+    "limiter",
+    "limits",
+    "throttle",
+    "timeout",
+    "cache",
+    "caching",
+    "request",
+    "compat",
+    "panic",
+    "csrf",
+    "etag",
+    "static",
+    "files",
+    "host",
+    "scheme",
+    "acceptable",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "options",
+    "connect",
+    "method",
+    "redirect",
+    "https",
+    "hsts",
+    "encoding",
+    "content",
+    "json",
+    "payload",
+    "body",
+    "size",
+    "default",
+    "identity",
+    "grants",
+    "handler",
+    "handlers",
+    "unauthorized",
+    "forbidden",
+];
+
+/// Path segments that only locate a component (`middleware::Logger`,
+/// `guard::fn_guard`) or wrap another one (`from_fn(f)`, `Condition::new(..)`).
+const TRANSPARENT_COMPONENT_NAMES: &[&str] = &[
+    "middleware",
+    "web",
+    "actix_web",
+    "actix_web_lab",
+    "guard",
+    "http",
+    "new",
+    "default",
+    "from_fn",
+    "fn_guard",
+    "wrap_fn",
+    "with",
+    "builder",
+    "build",
+    "finish",
+    "Condition",
+    "Some",
+    "Any",
+    "All",
+    "Not",
+    "Box",
+    "Rc",
+    "Arc",
+    "clone",
+    "into",
+    "self",
+    "crate",
+    "super",
+];
+
+/// The component a `.wrap(...)`/`.guard(...)` argument installs, when its
+/// name says nothing about authorization or a known harmless purpose:
+/// `StaffOnlyGate`, `from_fn(gatekeeper)`, a `wrap_fn` closure. Such a
+/// component may protect the route, so it is recorded as unknown.
+pub(crate) fn unrecognized_component(expr: &Expr) -> Option<String> {
+    component_heads(expr)
+        .into_iter()
+        .find(|name| !is_benign_component(name))
+}
+
+fn is_benign_component(name: &str) -> bool {
+    INFRASTRUCTURE_COMPONENTS.contains(&name)
+        || camel_case_words(name)
+            .iter()
+            .any(|word| BENIGN_COMPONENT_WORDS.contains(&word.as_str()))
+}
+
+fn component_heads(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Call(call) => {
+            let Expr::Path(path) = &*call.func else {
+                return call.args.iter().flat_map(component_heads).collect();
+            };
+            // `Condition::new(enabled, Inner)`: the flag is not a component.
+            if path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "Condition")
+            {
+                return call.args.iter().skip(1).flat_map(component_heads).collect();
+            }
+            match component_name(&path.path) {
+                Some(name) => vec![name],
+                None => call.args.iter().flat_map(component_heads).collect(),
+            }
+        }
+        Expr::MethodCall(call) => component_heads(&call.receiver),
+        Expr::Path(path) => component_name(&path.path).into_iter().collect(),
+        Expr::Closure(_) => vec!["<closure>".into()],
+        Expr::Reference(reference) => component_heads(&reference.expr),
+        Expr::Paren(paren) => component_heads(&paren.expr),
+        Expr::Group(group) => component_heads(&group.expr),
+        Expr::Struct(item) => component_name(&item.path).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The meaningful segment of a component path: the last type-like segment
+/// (`Logger` in `middleware::Logger::default`), else the last function name
+/// that is not a locating or wrapping one.
+fn component_name(path: &syn::Path) -> Option<String> {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let meaningful = |name: &&String| !TRANSPARENT_COMPONENT_NAMES.contains(&name.as_str());
+    segments
+        .iter()
+        .rev()
+        .filter(meaningful)
+        .find(|name| name.chars().next().is_some_and(char::is_uppercase))
+        .or_else(|| segments.iter().rev().find(meaningful))
+        .cloned()
 }

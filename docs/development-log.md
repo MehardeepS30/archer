@@ -187,3 +187,36 @@ E7 and E8 widen what counts as evidence, which removes false positives but can h
 
 ### Next Step
 Same as section 9: rebuild the benchmark dataset and measure precision and recall before and after sections 9 and 10, paying attention to whether E7 and E8 hide any true findings.
+
+
+## 11. Drift Detection Redesign
+
+### Objective
+An assessment of the detection logic (not of extraction) found six ways in which Archer did not detect authorization drift as intended:
+1. The peer key included the HTTP method and the exact path shape, so CRUD drift (an unguarded `DELETE /admin/users/{id}` next to guarded GET/POST/PUT) produced no group.
+2. Missing authentication was never reported, because the identity tier took no part in findings.
+3. Only the evidence tier was compared, so `check_role(.., "viewer")` among `require_admin` peers looked consistent.
+4. Any mention of a check counted: a role comparison for a display badge, a flag copied into a DTO, or `if is_admin() { log }`.
+5. Closure handlers and unrecognized middleware produced false "missing authorization" findings.
+6. Scopes held in variables lost their prefix and middleware.
+
+### Work Completed
+- **Grouping** (`drift.rs`): two levels, resource and namespace, each split into reads and writes. Routes are compared with their resource when it is informative, and with their namespace otherwise, where each resource counts once. A write is held to its resource's reads. A write alone in its namespace is also held to the namespace's reads, but only when those reads require a privilege. A resource whose routes are all public is treated as public by design.
+- **Tiers and categories** (`model.rs`): the expected tier is the highest of privilege, resource, and identity that is dominant. There are new categories (`MissingAuthentication`, `DifferentAuthorization`, `UnverifiedProtection`), and every finding has a `severity` and a `rationale`. Invariants report `expected_tier` and `dominant_requirement`.
+- **Requirements** (`evidence.rs`): normalized subjects are taken from names, literals, variants, type parameters, and attribute arguments, and compared within the privilege tier.
+- **Enforcement-aware evidence** (`evidence.rs`): each expression has a use (statement, enforcing, scoping, value). Predicates count only where enforced. This covers `let`-bound predicates, `let ... else`, `match` arms over roles, `ensure!`/`assert!`, `?`, and returned `Result`s. `bool` helpers carry predicate evidence that a caller gains only when it enforces the call (`handlers.rs`). Ownership comes from owner-field comparisons, `filter` closures, and SQL literals.
+- **Extraction** (`routes.rs`): closure handlers are analysed (`HandlerResolution::Closure`). Unrecognized `.wrap`/`.guard`/`wrap_fn` components become `Unknown` evidence, while known infrastructure is ignored and `IdentityMiddleware` no longer counts as authentication. Unresolved, ambiguous, and opaque handlers mark the route `unverified`. Builders bound to variables, reassigned, or never registered are substituted where they're used, or visited when their block ends.
+- **Exemptions**: authentication and health/docs endpoints are exempt only under generic or account segments.
+
+### Result
+105 unit tests and 3 CLI tests pass. They include 16 drift fixtures (`tests/fixtures/probes/drift/f01`-`f16`) that pin each case above, the intended non-findings (public reads, public-by-design resources, per-route permissions, infrastructure middleware), and the edge cases. `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean. A few earlier tests encoded the old semantics and were updated: the method/shape peer key, predicates in statement position counting as checks, closure handlers being `Unresolved`, and `UnauthorizedHandler` being ignored rather than infrastructure. The 10,000-route grouping test now places its routes under one namespace.
+
+### Limitation / Learning
+- Enforcement is syntactic. A rejection that happens through a callback, an error-mapping trait, or a method call (`self.policy.check()`) is not seen.
+- Requirement comparison can't order roles (`superuser` vs `admin`), so a stricter role is reported as different. That is why it's medium severity.
+- Namespace fallback depends on scopes or path conventions. Unscoped apps with a flat root (`/users`, `/orders`) never compare across resources.
+- Builders held in struct fields, statics, or function arguments are still not followed.
+- The thresholds (`min_support` 2, `threshold` 0.6) are unvalidated defaults.
+
+### Next Step
+Rebuild the benchmark dataset and measure precision and recall of this version against the hardening passes, especially for the new `MissingAuthentication` and `DifferentAuthorization` categories.
