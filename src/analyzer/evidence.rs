@@ -147,7 +147,7 @@ fn identity_bindings<'p>(
     names
 }
 
-fn identity_type(ty: &Type) -> bool {
+pub(crate) fn identity_type(ty: &Type) -> bool {
     match ty {
         Type::Path(path) if path.qself.is_none() => {
             let Some(segment) = path.path.segments.last() else {

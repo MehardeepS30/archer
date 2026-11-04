@@ -329,6 +329,7 @@ pub(crate) fn build_analysis_layers_full(
     }
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
+    super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     // A route its groups could not judge falls back to the routes linked to
     // it by data; if those judged it, it is not left unjudged.
     let reported: HashSet<_> = finding_details
@@ -511,7 +512,7 @@ fn stronger_fields(route: &Requirement, stronger: &Requirement, same_handler: bo
 /// the number of repository functions and model types both take request
 /// data into. A single shared function or type (an error constructor, a
 /// converter) is too weak a link to compare on, so it counts as none.
-fn link_strength(route: &Route, other: &Route) -> usize {
+pub(crate) fn link_strength(route: &Route, other: &Route) -> usize {
     let shared: Vec<&String> = route
         .resource_keys
         .iter()
@@ -691,7 +692,7 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    fn key(&self, level: GroupLevel) -> GroupKey {
+    pub(crate) fn key(&self, level: GroupLevel) -> GroupKey {
         GroupKey {
             level,
             prefix: match level {
@@ -715,7 +716,7 @@ impl Placement {
     /// The namespace and its enclosing prefixes, nearest first, that can
     /// head a scope tree: not the root, and not only generic segments
     /// (`/api/v4`), which would pool a whole API.
-    fn subtrees(&self) -> impl Iterator<Item = String> + use<> {
+    pub(crate) fn subtrees(&self) -> impl Iterator<Item = String> + use<> {
         let segments: Vec<&str> = self
             .namespace
             .split('/')
@@ -1119,6 +1120,10 @@ fn finding(
         FindingCategory::SameResourceWeakerProtection => (
             Severity::Medium,
             "Routes serving the same data require more of the caller than this route.".into(),
+        ),
+        FindingCategory::SkipsPeerCheck => (
+            Severity::Medium,
+            "Its peers make a check with the caller that this route does not.".into(),
         ),
         FindingCategory::UnverifiedProtection => (
             Severity::Low,

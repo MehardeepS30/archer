@@ -136,6 +136,10 @@ pub struct Route {
     /// definition, repository functions it calls, model types it names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_keys: Vec<String>,
+    /// How the handler uses the caller's identity (`takes:T`, `reads:T:field`,
+    /// `passes:T:callee`, `compares:T`), for comparison with peers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_use: Vec<String>,
     /// Extraction bookkeeping that is not part of the report.
     #[serde(skip)]
     pub(crate) origin: RouteOrigin,
@@ -351,6 +355,11 @@ pub enum FindingCategory {
     /// repository function, or model type) but requires less of the caller:
     /// no login, no role, or no ownership check where they have one.
     SameResourceWeakerProtection,
+    /// Nearly all of the route's peers that take the same caller identity
+    /// do something with it that this route does not: pass it to the same
+    /// check (`check_private_instance`), compare it with a record, or take
+    /// it at all.
+    SkipsPeerCheck,
 }
 
 impl std::fmt::Display for FindingCategory {
@@ -363,6 +372,7 @@ impl std::fmt::Display for FindingCategory {
             Self::UnverifiedProtection => "unverified protection",
             Self::InconsistentRegistration => "inconsistent registration of one handler",
             Self::SameResourceWeakerProtection => "same resource, weaker protection",
+            Self::SkipsPeerCheck => "skips a check its peers make",
         })
     }
 }

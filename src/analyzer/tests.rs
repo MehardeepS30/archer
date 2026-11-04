@@ -37,6 +37,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
         unverified: Vec::new(),
         requirement: Requirement::default(),
         resource_keys: Vec::new(),
+        caller_use: Vec::new(),
         origin: RouteOrigin::default(),
     }
 }
@@ -795,6 +796,7 @@ fn access_token_and_access_log_helpers_are_not_authorization() {
         unverified: Vec::new(),
         requirement: Requirement::default(),
         resource_keys: Vec::new(),
+        caller_use: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!token_route.is_authorized());
@@ -1227,6 +1229,7 @@ fn identity_extraction_is_not_authorization() {
         unverified: Vec::new(),
         requirement: Requirement::default(),
         resource_keys: Vec::new(),
+        caller_use: Vec::new(),
         origin: RouteOrigin::default(),
     };
     assert!(!route.is_authorized());
@@ -4219,4 +4222,32 @@ fn routes_under_a_runtime_mount_prefix_are_still_compared() {
     assert!(report.unjudged.iter().any(|route| {
         route.path.ends_with("/healthz") && route.reason == UnjudgedReason::WellKnownPublic
     }));
+}
+
+#[test]
+fn routes_that_skip_the_check_their_peers_make_with_the_caller_are_reported() {
+    let report = drift_fixture(
+        "f33",
+        include_str!("../../tests/fixtures/probes/drift/f33_peer_checks.rs"),
+    );
+    let skipped: Vec<_> = reported(&report)
+        .into_iter()
+        .filter(|(category, _, _)| *category == FindingCategory::SkipsPeerCheck)
+        .map(|(_, method, path)| format!("{method} {path}"))
+        .collect();
+    assert_eq!(skipped, ["DELETE /billing/evidence", "GET /forum/multi"]);
+    let multi = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/forum/multi")
+        .unwrap();
+    assert_eq!(multi.severity, Severity::Medium);
+    assert!(multi.rationale.contains("4 of 5 under /forum check the caller with `check_private_instance`"), "{}", multi.rationale);
+    assert_eq!(multi.authorized_peer_routes.len(), 4);
+    // The check made in the service function counts for the handler.
+    let attach = report.routes.iter().find(|route| route.method == "PUT").unwrap();
+    assert!(attach.caller_use.contains(&"checks:AuthData:validate_profile".to_string()), "{:?}", attach.caller_use);
+    // The forwarding closure resolves to `update_evidence`.
+    let patch = report.routes.iter().find(|route| route.method == "PATCH").unwrap();
+    assert_eq!(patch.handler.as_deref(), Some("update_evidence"));
 }

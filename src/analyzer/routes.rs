@@ -502,6 +502,7 @@ impl<'a> RouteVisitor<'a> {
             unverified,
             requirement: Requirement::default(),
             resource_keys: Vec::new(),
+            caller_use: Vec::new(),
             origin: RouteOrigin {
                 position: span_position(node.method.span()),
                 attribute: None,
@@ -754,6 +755,7 @@ impl RouteVisitor<'_> {
                 unverified: Vec::new(),
                 requirement: Requirement::default(),
                 resource_keys: Vec::new(),
+                caller_use: Vec::new(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
                     attribute: definition.map(|definition| (definition, path_literal.value())),
@@ -1502,6 +1504,62 @@ pub(crate) fn handler_target(expr: &Expr) -> Option<HandlerTarget> {
                 .collect(),
             leading_colon: path.path.leading_colon.is_some(),
         }),
+        Expr::Closure(closure) => forwarding_target(closure),
+        _ => None,
+    }
+}
+
+/// The function a closure only forwards its parameters to:
+/// `.to(|state, req, path, payload| routing::update(state, req, path, payload))`
+/// is the handler `routing::update`. A closure that does anything else is
+/// its own handler.
+fn forwarding_target(closure: &syn::ExprClosure) -> Option<HandlerTarget> {
+    let mut parameters = HashSet::new();
+    for input in &closure.inputs {
+        let pattern = match input {
+            Pat::Type(typed) => &*typed.pat,
+            other => other,
+        };
+        match pattern {
+            Pat::Ident(ident) => {
+                parameters.insert(ident.ident.to_string());
+            }
+            _ => return None,
+        }
+    }
+    let mut body = &*closure.body;
+    loop {
+        body = match body {
+            Expr::Async(inner) => match inner.block.stmts.as_slice() {
+                [syn::Stmt::Expr(expr, None)] => expr,
+                _ => return None,
+            },
+            Expr::Block(inner) => match inner.block.stmts.as_slice() {
+                [syn::Stmt::Expr(expr, None)] => expr,
+                _ => return None,
+            },
+            Expr::Await(inner) => &inner.base,
+            Expr::Paren(inner) => &inner.expr,
+            _ => break,
+        };
+    }
+    let Expr::Call(call) = body else {
+        return None;
+    };
+    let forwards = !call.args.is_empty()
+        && call.args.iter().all(|argument| match argument {
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| parameters.contains(&ident.to_string())),
+            _ => false,
+        })
+        && call.args.len() == parameters.len();
+    if !forwards {
+        return None;
+    }
+    match &*call.func {
+        Expr::Path(_) => handler_target(&call.func),
         _ => None,
     }
 }

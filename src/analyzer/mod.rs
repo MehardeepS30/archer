@@ -1,10 +1,12 @@
 //! Repository analysis: file discovery, parsing, and the extraction and inference pipeline.
 
+mod caller_use;
 mod drift;
 mod evidence;
 mod handlers;
 mod middleware;
 mod model;
+mod peer_checks;
 mod resources;
 mod routes;
 #[cfg(test)]
@@ -197,6 +199,10 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     );
     for (route, keys) in routes.iter_mut().zip(keys) {
         route.resource_keys = keys;
+    }
+    let uses = caller_use::caller_use(&index, &routes);
+    for (route, uses) in routes.iter_mut().zip(uses) {
+        route.caller_use = uses;
     }
 
     let (peer_groups, invariants, finding_details, findings, unjudged) =
