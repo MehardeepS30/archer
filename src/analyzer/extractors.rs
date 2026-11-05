@@ -206,7 +206,7 @@ const CALLER_WORDS: [&str; 18] = [
     "caller",
 ];
 
-fn names_caller(name: &str) -> bool {
+pub(crate) fn names_caller(name: &str) -> bool {
     camel_case_words(name)
         .iter()
         .chain(

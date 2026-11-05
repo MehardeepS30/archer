@@ -989,8 +989,14 @@ fn own_undecided(stats: &HashMap<GroupKey, GroupStats>, own: &GroupKey) -> bool 
 /// The group above a route's resource: its namespace, or the nearest
 /// enclosing scope with more routes of its class.
 fn wider_key(place: &Placement, class_size: &impl Fn(&GroupKey) -> usize) -> Option<GroupKey> {
-    if place.namespace == place.resource || place.namespace == "/" {
+    if place.namespace == "/" {
         return None;
+    }
+    // A collection that is its own namespace (`GET /api/users` beside
+    // `GET /api/users/{id}`): its namespace group holds its records' routes.
+    if place.namespace == place.resource {
+        let namespace = place.key(GroupLevel::Namespace);
+        return (class_size(&namespace) >= 2).then_some(namespace);
     }
     let namespace = place.key(GroupLevel::Namespace);
     let own_size = class_size(&namespace);

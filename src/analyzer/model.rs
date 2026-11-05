@@ -645,6 +645,12 @@ pub struct Coverage {
     pub unresolved_paths: usize,
     /// Attribute routes that nothing registers, left out of `routes`.
     pub unregistered_attribute_routes: usize,
+    /// Route-like call sites seen (route constructors, resources, route
+    /// attributes) and how many of them some route was read from.
+    pub route_sites: usize,
+    pub route_sites_read: usize,
+    /// The unread ones, as `file:line `code``.
+    pub unread_route_sites: Vec<String>,
     /// Macros that name unrouted handlers, with how many each names.
     pub macro_registrations: Vec<(String, usize)>,
     /// Names of the unrouted handler-like functions.

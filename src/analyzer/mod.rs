@@ -6,6 +6,7 @@ mod drift;
 mod evidence;
 mod extractors;
 mod handlers;
+mod macros;
 mod middleware;
 mod model;
 mod peer_checks;
@@ -156,14 +157,37 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     let mut warnings = Vec::new();
     let mut configured = Vec::new();
     let mut table_mounts = Vec::new();
+    routes::set_helper_returns(parsed_files.iter().map(|(_, file_path, syntax)| {
+        let module = index
+            .file_modules
+            .get(file_path)
+            .map(|(_, module)| module.clone())
+            .unwrap_or_default();
+        (module, syntax)
+    }));
+    let field_paths =
+        std::rc::Rc::new(routes::FieldPaths::build(parsed_files.iter().map(|(_, _, syntax)| syntax)));
+    let (mut route_sites, mut route_sites_read, mut unread_route_sites) = (0, 0, Vec::new());
+    let macros = routes::project_macros(parsed_files.iter().map(|(_, _, syntax)| syntax));
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
+        visitor.macros = macros.clone();
+        visitor.field_paths = field_paths.clone();
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
         registrations.extend(visitor.registrations);
         configured.extend(visitor.configured);
         table_mounts.extend(visitor.table_mounts);
         warnings.extend(visitor.warnings);
+        for (position, text) in &visitor.route_sites {
+            let line = position.0;
+            route_sites += 1;
+            if visitor.read_lines.contains(position) {
+                route_sites_read += 1;
+            } else {
+                unread_route_sites.push(format!("{}:{line} `{text}`", file_path.display()));
+            }
+        }
     }
     // A scope's prefix is read once per route registered under it.
     warnings.sort();
@@ -293,6 +317,21 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     }
 
     let mut coverage = coverage(&index, &routes);
+    coverage.route_sites = route_sites;
+    coverage.route_sites_read = route_sites_read;
+    for site in &unread_route_sites {
+        warnings.push(format!(
+            "{site}: route-like code that Archer did not read as a route; any route it registers is missing from the analysis"
+        ));
+    }
+    coverage.unread_route_sites = unread_route_sites;
+    if peer_groups.is_empty() && !routes.is_empty() {
+        warnings.push(format!(
+            "no peer groups formed: {} route(s) read, {} not comparable (see `unjudged`); a group needs at least two comparable routes of the same kind under one scope, so this report cannot show drift",
+            routes.len(),
+            unjudged.len()
+        ));
+    }
     coverage.unregistered_attribute_routes = unregistered.len();
     coverage.macro_registrations = macro_registrations(
         parsed_files.iter().map(|(_, _, syntax)| syntax),

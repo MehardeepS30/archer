@@ -154,6 +154,10 @@ pub(crate) fn identity_type(ty: &Type) -> bool {
                 return false;
             };
             let name = segment.ident.to_string();
+            if name == "ReqData" {
+                return first_type_argument_name(&segment.arguments)
+                    .is_some_and(|inner| super::extractors::names_caller(&inner));
+            }
             if name == "Option" || name == "Box" || name == "Arc" {
                 return match &segment.arguments {
                     PathArguments::AngleBracketed(arguments) => {
@@ -511,6 +515,24 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 return;
             };
             let name = segment.ident.to_string();
+            // `web::ReqData<Claims>`: what authentication middleware stored
+            // for the request. Present only once that middleware ran.
+            if name == "ReqData"
+                && let Some(inner) = first_type_argument_name(&segment.arguments)
+                && super::extractors::names_caller(&inner)
+            {
+                evidence.push(AuthEvidence {
+                    kind: AuthEvidenceKind::IdentityExtraction,
+                    mechanism: format!("ReqData<{inner}>"),
+                    symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                    file: file.to_path_buf(),
+                    line: ty.span().start().line,
+                    handler: Some(handler.into()),
+                    strength: AuthStrength::Weak,
+                    requirements: Vec::new(),
+                });
+                return;
+            }
             if DATA_EXTRACTORS.contains(&name.as_str()) {
                 return;
             }
@@ -595,6 +617,20 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
         }
         _ => {}
     }
+}
+
+/// The last segment of a type's first type argument: `Claims` in
+/// `ReqData<auth::Claims>`.
+fn first_type_argument_name(arguments: &PathArguments) -> Option<String> {
+    let PathArguments::AngleBracketed(arguments) = arguments else {
+        return None;
+    };
+    arguments.args.iter().find_map(|argument| match argument {
+        GenericArgument::Type(Type::Path(inner)) => {
+            inner.path.segments.last().map(|last| last.ident.to_string())
+        }
+        _ => None,
+    })
 }
 
 /// The requirements of an extractor parameterized by a policy type,
@@ -1052,7 +1088,8 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         let line = node.func.span().start().line;
         let name = symbol.rsplit("::").next().unwrap_or(&symbol).to_string();
         let found = evidence_for_handler_call(&symbol, line, &self.file, &self.handler)
-            .or_else(|| evidence_for_handler_symbol(&symbol, line, &self.file, &self.handler));
+            .or_else(|| evidence_for_handler_symbol(&symbol, line, &self.file, &self.handler))
+            .or_else(|| rejects_unauthenticated(&name, &symbol, line, &self.file, &self.handler));
         if let Some(mut evidence) = found {
             evidence.requirements = requirement_keys(&name, &node.args);
             let imperative = is_imperative(&name, &evidence.kind);
@@ -1777,6 +1814,30 @@ pub(crate) fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthS
     Some(classification)
 }
 
+/// `HttpResponse::Unauthorized()`, `ErrorUnauthorized(..)`: a handler that
+/// builds an unauthenticated rejection turns away callers who are not logged
+/// in, so it identifies them itself. Only a call counts; naming the variant
+/// as a value does not.
+fn rejects_unauthenticated(
+    name: &str,
+    symbol: &str,
+    line: usize,
+    file: &Path,
+    handler: &str,
+) -> Option<AuthEvidence> {
+    let lower = name.to_ascii_lowercase();
+    (lower.contains("unauthorized") || lower.contains("unauthenticated")).then(|| AuthEvidence {
+        kind: AuthEvidenceKind::IdentityExtraction,
+        mechanism: format!("rejects unauthenticated callers (`{name}`)"),
+        symbol: Some(symbol.into()),
+        file: file.to_path_buf(),
+        line,
+        handler: Some(handler.into()),
+        strength: AuthStrength::Weak,
+        requirements: Vec::new(),
+    })
+}
+
 pub(crate) fn evidence_for_handler_symbol(
     symbol: &str,
     line: usize,
@@ -1840,7 +1901,9 @@ pub(crate) const CONFIGURATION_EXCLUDED_WORDS: [&str; 15] = [
     "telemetry",
     "audit",
 ];
-pub(crate) const CONFIGURATION_AUTHORIZATION_WORDS: [&str; 12] = [
+pub(crate) const CONFIGURATION_AUTHORIZATION_WORDS: [&str; 14] = [
+    "authority",
+    "authorities",
     "admin",
     "admins",
     "role",

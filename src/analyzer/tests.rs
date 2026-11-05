@@ -4546,3 +4546,84 @@ fn f42_resource_method_shorthand_path_arrays_and_forwarding_configure_closures()
         [finding(MissingAuthorization, "PATCH", "/api/users/{id}/restore")]
     );
 }
+#[test]
+fn f43_loops_macros_services_aliases_any_guards_scope_modules_and_route_tables() {
+    let report = drift_fixture(
+        "f43",
+        include_str!("../../tests/fixtures/probes/drift/f43_route_forms.rs"),
+    );
+    let mut routes: Vec<String> = report
+        .routes
+        .iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect();
+    routes.sort();
+    assert_eq!(
+        routes,
+        [
+            "DELETE /scoped/x",
+            "GET /admin/stats",
+            "GET /alias",
+            "GET /any",
+            "GET /loop/a",
+            "GET /loop/b",
+            "GET /m/a",
+            "GET /m/b",
+            "GET /var/a",
+            "GET /var/b",
+            "POST /any",
+            "POST /signin",
+            "POST /typed",
+            "PUT /foreign",
+            "UNKNOWN /svc",
+        ]
+    );
+    assert_eq!(route_at(&report, "/m/b").handler.as_deref(), Some("h2"));
+    // Every route-like call site was read; the fallback service is not a route.
+    assert_eq!(report.coverage.route_sites, report.coverage.route_sites_read);
+    assert!(report.coverage.unread_route_sites.is_empty());
+}
+
+#[test]
+fn f44_helper_middleware_closures_attribute_options_req_data_and_check_methods() {
+    let report = drift_fixture(
+        "f44",
+        include_str!("../../tests/fixtures/probes/drift/f44_auth_forms.rs"),
+    );
+    let kinds = |path: &str| -> Vec<AuthEvidenceKind> {
+        route_at(&report, path).authorization.iter().map(|evidence| evidence.kind.clone()).collect()
+    };
+    for path in ["/helper", "/attr", "/closure", "/me"] {
+        assert!(kinds(path).contains(&AuthEvidenceKind::IdentityExtraction), "{path}: {:?}", kinds(path));
+    }
+    assert!(
+        route_at(&report, "/helper")
+            .authorization
+            .iter()
+            .any(|evidence| evidence.mechanism.contains("returned by `get_middleware()`"))
+    );
+    assert!(
+        kinds("/alerts").iter().any(|kind| *kind != AuthEvidenceKind::Unknown),
+        "{:?}",
+        kinds("/alerts")
+    );
+}
+
+#[test]
+fn unread_route_sites_are_reported_and_zero_peer_groups_explained() {
+    // `make(web::get())` hands the route constructor to a function Archer
+    // does not follow: the route is missing, and the report says where.
+    let report = drift_fixture(
+        "unread_sites",
+        r#"
+use actix_web::{web, App};
+async fn h() {}
+fn make(route: actix_web::Route) -> actix_web::Resource { web::resource("/x").route(route) }
+fn main() { App::new().route("/a", web::get().to(h)).service(make(web::get().to(h))); }
+"#,
+    );
+    assert_eq!(report.coverage.unread_route_sites.len(), 1, "{:?}", report.coverage.unread_route_sites);
+    assert!(report.coverage.unread_route_sites[0].contains(":5 "));
+    assert!(report.warnings.iter().any(|warning| warning.contains("did not read as a route")));
+    assert!(report.warnings.iter().any(|warning| warning.starts_with("no peer groups formed")));
+}

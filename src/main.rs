@@ -105,6 +105,10 @@ fn run(cli: &Cli) -> Result<bool> {
         "Handler coverage: {} of {} functions that look like handlers are routed",
         coverage.routed_handlers, coverage.likely_handlers
     );
+    println!(
+        "Route sites: {} of {} route-like call sites were read as routes",
+        coverage.route_sites_read, coverage.route_sites
+    );
     if coverage.unresolved_handlers > 0 || coverage.unresolved_paths > 0 {
         println!(
             "  routes with unresolved handlers: {}; with unresolved paths: {}",

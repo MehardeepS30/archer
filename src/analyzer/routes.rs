@@ -74,6 +74,23 @@ pub(crate) struct RouteVisitor<'a> {
     /// `.configure(<T as _>::configure)` calls naming a type, which may be a
     /// declared route table.
     pub(crate) table_mounts: Vec<super::route_tables::TableMount>,
+    /// Loop variables bound to one string literal of the array a `for` loop
+    /// walks, innermost last: `for p in ["/a", "/b"] { .. }` is read once per path.
+    pub(crate) loop_values: Vec<(String, String)>,
+    /// The project's own `macro_rules!` macros seen so far, by name.
+    pub(crate) macros: HashMap<String, Vec<super::macros::Rule>>,
+    /// Macro expansions being visited; bounds recursive macros.
+    pub(crate) macro_depth: usize,
+    /// Prefixes of enclosing `#[actix_web::scope("/p")] mod m { .. }` modules.
+    pub(crate) module_scopes: Vec<String>,
+    /// String fields of the project's constant route tables.
+    pub(crate) field_paths: std::rc::Rc<FieldPaths>,
+    /// Route-like call sites seen, by line: a route constructor such as
+    /// `web::get()`, a `web::resource(..)`, or a route attribute, with the
+    /// code as written. Sites no route was read from are reported.
+    pub(crate) route_sites: std::collections::BTreeMap<(usize, usize), String>,
+    /// Positions of route-like sites some route was read from.
+    pub(crate) read_lines: HashSet<(usize, usize)>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -109,6 +126,13 @@ impl<'a> RouteVisitor<'a> {
             expanding: Vec::new(),
             expanding_builders: Vec::new(),
             table_mounts: Vec::new(),
+            loop_values: Vec::new(),
+            macros: HashMap::new(),
+            macro_depth: 0,
+            module_scopes: Vec::new(),
+            field_paths: std::rc::Rc::default(),
+            route_sites: std::collections::BTreeMap::new(),
+            read_lines: HashSet::new(),
         }
     }
 
@@ -165,10 +189,17 @@ impl<'a> RouteVisitor<'a> {
     /// `web::resource`, a route constructor such as `web::get()`, `App::new()`,
     /// or a variable holding one of these.
     pub(crate) fn builder_value(&self, expr: &Expr) -> Option<Expr> {
-        if let Some(substituted) = self.substituted(expr) {
-            return Some(substituted);
+        let value = match self.substituted(expr) {
+            Some(substituted) => substituted,
+            None => is_builder_constructor(chain_root_expr(expr)).then(|| expr.clone())?,
+        };
+        // A builder extended inside `for p in ["/a", "/b"]` is read later,
+        // outside the loop: it keeps the literal `p` stood for here.
+        if self.loop_values.is_empty() {
+            return Some(value);
         }
-        is_builder_constructor(chain_root_expr(expr)).then(|| expr.clone())
+        let tokens = replace_loop_values(value.to_token_stream(), &self.loop_values);
+        Some(syn::parse2(tokens).unwrap_or(value))
     }
 
     /// Records `let name = <builder>;` or `name = <builder>;` instead of
@@ -361,22 +392,25 @@ impl<'a> RouteVisitor<'a> {
                     .iter()
                     .for_each(|element| self.add_registration(element));
             }
+            Expr::Array(array) => {
+                return array
+                    .elems
+                    .iter()
+                    .for_each(|element| self.add_registration(element));
+            }
             Expr::Paren(paren) => return self.add_registration(&paren.expr),
             Expr::Group(group) => return self.add_registration(&group.expr),
-            Expr::Macro(mac)
-                if mac
-                    .mac
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|segment| segment.ident == "services") =>
-            {
-                if let Ok(elements) = mac.mac.parse_body_with(
-                    syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated,
-                ) {
-                    elements
-                        .iter()
-                        .for_each(|element| self.add_registration(element));
+            Expr::Macro(mac) => {
+                // `services![a, b]`, `vec![a, b]`, or a project macro that
+                // expands to the registered expression.
+                if let Some(statements) = self.macro_expansion(&mac.mac) {
+                    self.macro_depth += 1;
+                    for statement in &statements {
+                        if let Stmt::Expr(expr, _) = statement {
+                            self.add_registration(expr);
+                        }
+                    }
+                    self.macro_depth -= 1;
                 }
                 return;
             }
@@ -399,7 +433,9 @@ impl<'a> RouteVisitor<'a> {
         // shorthand for `.route(web::get().to(handler))`.
         let shorthand =
             ROUTE_METHOD_CONSTRUCTORS.contains(&name.as_str()) && node.args.len() == 1;
-        if name != "route" && name != "resource" && name != "to" && !shorthand {
+        // `web::service("/p").finish(handler)`: a `WebService` answering every method.
+        let finish = name == "finish" && node.args.len() == 1;
+        if name != "route" && name != "resource" && name != "to" && !shorthand && !finish {
             return;
         }
         // Builders held in variables are read as if written in place.
@@ -410,7 +446,7 @@ impl<'a> RouteVisitor<'a> {
         // .route(builder)`, `web::resource("/path").to(handler)` and
         // `web::resource("/path").get(handler)` take it from the resource the
         // chain starts from, one route per path of `web::resource(["/a", "/b"])`.
-        let paths = if name == "to" || shorthand || (name == "route" && node.args.len() != 2) {
+        let paths = if name == "to" || shorthand || finish || (name == "route" && node.args.len() != 2) {
             self.resource_paths(&node.receiver)
         } else if name == "route" {
             self.path_argument(&node.args[0]).map(|path| vec![path])
@@ -424,7 +460,7 @@ impl<'a> RouteVisitor<'a> {
         let Some(paths) = paths.filter(|paths| !paths.is_empty()) else {
             return;
         };
-        let handler_call = name == "to" || shorthand;
+        let handler_call = name == "to" || shorthand || finish;
 
         let local_prefix = self.scope_prefix(&node.receiver);
         let prefix = join_paths(&self.scope_context, &local_prefix);
@@ -495,14 +531,26 @@ impl<'a> RouteVisitor<'a> {
 
         // `web::resource(p).guard(guard::Method(Method::GET)).to(h)`: the
         // resource's method guards decide what its handler answers.
-        let method = if shorthand {
-            name.to_uppercase()
-        } else if name == "to" {
-            resource_guard_method(&node.receiver).unwrap_or_else(|| "UNKNOWN".into())
+        let methods = if shorthand {
+            vec![name.to_uppercase()]
+        } else if name == "to" || name == "finish" {
+            vec![resource_guard_method(&node.receiver).unwrap_or_else(|| "UNKNOWN".into())]
         } else {
-            extract_http_method(node)
+            node.args
+                .last()
+                .and_then(route_builder_methods)
+                .unwrap_or_else(|| vec!["UNKNOWN".into()])
         };
-        for (path, path_line) in paths {
+        // The route-like sites this route was read from.
+        if !handler_call
+            && let Some(builder) = node.args.last()
+        {
+            self.read_lines.insert(span_position(chain_root_expr(builder).span()));
+        }
+        for (method, (path, path_line)) in methods
+            .iter()
+            .flat_map(|method| paths.iter().map(move |path| (method, path.clone())))
+        {
             self.routes.push(Route {
                 method: method.clone(),
                 path: join_paths(&prefix, &path),
@@ -562,6 +610,10 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
     /// call, like `.configure(f)`: its routes take the caller's scope prefix
     /// and middleware.
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if is_route_site(&node.func) {
+            let text: String = node.to_token_stream().to_string().chars().take(60).collect();
+            self.route_sites.entry(span_position(node.span())).or_insert(text);
+        }
         if let Some(definition) = self.named_definition(&node.func)
             && is_route_factory(&self.index.items[definition].sig)
         {
@@ -582,7 +634,43 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         self.visit_expr(&node.expr);
         let mut locals = HashSet::new();
         pattern_bindings(&node.pat, &mut locals);
+        // `for p in ["/a", "/b"] { cfg.route(p, ..) }`: the body is read once
+        // per literal, with `p` standing for it.
+        if let (Some(name), Some(values)) = (simple_binding(&node.pat), literal_strings(&node.expr)) {
+            for value in values {
+                self.loop_values.push((name.clone(), value));
+                self.with_locals(locals.clone(), |visitor| visitor.visit_block(&node.body));
+                self.loop_values.pop();
+            }
+            return;
+        }
         self.with_locals(locals, |visitor| visitor.visit_block(&node.body));
+    }
+
+    fn visit_file(&mut self, node: &'ast syn::File) {
+        set_import_aliases(node);
+        visit::visit_file(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if node.mac.path.is_ident("macro_rules") {
+            if let Some(name) = &node.ident {
+                let rules = super::macros::parse_rules(&node.mac.tokens);
+                if !rules.is_empty() {
+                    self.macros.insert(name.to_string(), rules);
+                }
+            }
+            return;
+        }
+        self.visit_macro_tokens(&node.mac);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        self.visit_macro_tokens(&node.mac);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        self.visit_macro_tokens(&node.mac);
     }
 
     fn visit_arm(&mut self, node: &'ast Arm) {
@@ -612,7 +700,15 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             // Items of an enclosing function block are not visible inside a module.
             let block_scopes = std::mem::take(&mut self.block_scopes);
             self.module.push(node.ident.to_string());
+            let scope = node.attrs.iter().find_map(scope_attribute);
+            let scoped = scope.is_some();
+            if let Some(prefix) = scope {
+                self.module_scopes.push(prefix);
+            }
             visit::visit_item_mod(self, node);
+            if scoped {
+                self.module_scopes.pop();
+            }
             self.module.pop();
             self.block_scopes = block_scopes;
         }
@@ -714,6 +810,13 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             self.chain_scopes.push((root, evidence));
         }
 
+        // `.default_service(web::route().to(not_found))`: the fallback for
+        // unmatched requests, not a route, so its constructor is accounted for.
+        if node.method == "default_service"
+            && let Some(arg) = node.args.first()
+        {
+            self.read_lines.insert(span_position(chain_root_expr(arg).span()));
+        }
         if node.method == "service" || node.method == "configure" {
             let previous_context = self.scope_context.clone();
             self.scope_context = join_paths(&previous_context, &self.scope_prefix(&node.receiver));
@@ -752,10 +855,81 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
 }
 
 impl RouteVisitor<'_> {
+    /// The code a macro invocation stands for, when Archer can read it: a
+    /// project `macro_rules!` macro expanded, or the comma-separated
+    /// expressions of `services![..]`/`vec![..]`.
+    pub(crate) fn macro_expansion(&self, mac: &syn::Macro) -> Option<Vec<Stmt>> {
+        let name = mac.path.segments.last()?.ident.to_string();
+        let tokens = match self.macros.get(&name) {
+            Some(rules) if self.macro_depth < 8 => super::macros::expand(rules, &mac.tokens)?,
+            _ if name == "services" || name == "vec" => {
+                let elements = mac
+                    .parse_body_with(
+                        syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated,
+                    )
+                    .ok()?;
+                return Some(
+                    elements
+                        .into_iter()
+                        .map(|element| Stmt::Expr(element, Some(Default::default())))
+                        .collect(),
+                );
+            }
+            _ => return None,
+        };
+        let braced = quote::quote!({ #tokens });
+        syn::parse2::<Block>(braced).ok().map(|block| block.stmts)
+    }
+
+    /// Visits the code a macro invocation stands for, in place.
+    pub(crate) fn visit_macro_tokens(&mut self, mac: &syn::Macro) {
+        let Some(statements) = self.macro_expansion(mac) else {
+            return;
+        };
+        self.macro_depth += 1;
+        for statement in &statements {
+            match statement {
+                Stmt::Item(item) => self.visit_item(item),
+                Stmt::Expr(expr, _) => self.visit_expr(expr),
+                Stmt::Local(local) => self.visit_local(local),
+                Stmt::Macro(mac) => self.visit_stmt_macro(mac),
+            }
+        }
+        self.macro_depth -= 1;
+    }
+
     pub(crate) fn add_attribute_routes(&mut self, node: &ItemFn) {
+        let module_prefix = self
+            .module_scopes
+            .iter()
+            .fold(String::new(), |prefix, scope| join_paths(&prefix, scope));
         for (method, path_literal) in node.attrs.iter().flat_map(attribute_routes) {
             let prefix = self.scope_context.clone();
-            let path = join_paths(&prefix, &path_literal.value());
+            // `path = "crate::ROUTES.auth.login"`: a field of a constant
+            // route table, which a codegen fork resolves at compile time.
+            let written = path_literal.value();
+            let literal_path = if written.is_empty() || written.starts_with('/') {
+                written
+            } else {
+                match self.field_paths.resolve(&written) {
+                    Some(value) => value,
+                    None => {
+                        self.warnings.push(format!(
+                            "{}:{}: path `{}` is not a string literal or resolvable const",
+                            self.file.display(),
+                            path_literal.span().start().line,
+                            written
+                        ));
+                        format!("<unresolved:{written}>")
+                    }
+                }
+            };
+            let position = span_position(path_literal.span());
+            self.route_sites.entry(position).or_insert_with(|| format!("#[{}(..)]", method.to_lowercase()));
+            self.read_lines.insert(position);
+            // `#[scope("/api")] mod api { #[get("/a")] .. }` serves `/api/a`.
+            let attribute_path = join_paths(&module_prefix, &literal_path);
+            let path = join_paths(&prefix, &attribute_path);
             let handler = node.sig.ident.to_string();
             // Only module-level functions can be named by `.service(handler)`.
             let definition = if self.block_scopes.is_empty() {
@@ -765,10 +939,11 @@ impl RouteVisitor<'_> {
                 None
             };
             // The index's evidence includes the handler's helpers.
-            let authorization = definition.map_or_else(
+            let mut authorization = definition.map_or_else(
                 || handler_evidence(&self.file, node),
                 |definition| self.index.definitions[definition].evidence.clone(),
             );
+            authorization.extend(attribute_option_evidence(&node.attrs, &self.file, &handler));
 
             self.routes.push(Route {
                 method,
@@ -786,13 +961,61 @@ impl RouteVisitor<'_> {
                 caller_use: Vec::new(),
                 origin: RouteOrigin {
                     position: span_position(path_literal.span()),
-                    attribute: definition.map(|definition| (definition, path_literal.value())),
+                    attribute: definition.map(|definition| (definition, attribute_path.clone())),
                     enclosing: None,
                     definition,
                 },
             });
         }
     }
+}
+
+/// Middleware and guards a route attribute names in its options:
+/// `#[get("/p", wrap = "AuthMiddleware", guard = "is_admin")]`. Each string
+/// is read as the expression it names and classified like a `.wrap(..)` or
+/// `.guard(..)` argument.
+fn attribute_option_evidence(
+    attrs: &[syn::Attribute],
+    file: &Path,
+    handler: &str,
+) -> Vec<AuthEvidence> {
+    let mut evidence = Vec::new();
+    for attribute in attrs {
+        if attribute_routes(attribute).is_empty() {
+            continue;
+        }
+        let Ok(args) = attribute
+            .parse_args_with(syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+        for arg in &args {
+            let Expr::Assign(assign) = arg else {
+                continue;
+            };
+            let (Expr::Path(key), Expr::Lit(ExprLit { lit: Lit::Str(value), .. })) =
+                (&*assign.left, &*assign.right)
+            else {
+                continue;
+            };
+            let Some(key) = key.path.get_ident().map(ToString::to_string) else {
+                continue;
+            };
+            if key != "wrap" && key != "guard" {
+                continue;
+            }
+            let Ok(call) = syn::parse_str::<ExprMethodCall>(&format!("route.{key}({})", value.value()))
+            else {
+                continue;
+            };
+            let start = evidence.len();
+            configuration_call_evidence(&call, file, Some(handler), &mut evidence);
+            for found in &mut evidence[start..] {
+                found.line = value.span().start().line;
+            }
+        }
+    }
+    evidence
 }
 
 /// The routes an Actix route attribute declares, as `(method, path)`:
@@ -805,10 +1028,10 @@ pub(crate) fn attribute_routes(attribute: &syn::Attribute) -> Vec<(String, syn::
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect();
-    let name = match segments.as_slice() {
-        [name] => name,
-        [krate, name] if krate == "actix_web" => name,
-        _ => return Vec::new(),
+    // `#[get(..)]`, `#[actix_web::get(..)]`, or a re-export or fork of the
+    // codegen crate such as `#[my_codegen::get(..)]`.
+    let Some(name) = segments.last() else {
+        return Vec::new();
     };
     let fixed_method = match name.as_str() {
         "get" => Some("GET"),
@@ -825,12 +1048,28 @@ pub(crate) fn attribute_routes(attribute: &syn::Attribute) -> Vec<(String, syn::
     else {
         return Vec::new();
     };
-    let Some(Expr::Lit(ExprLit {
-        lit: Lit::Str(path),
-        ..
-    })) = args.first()
-    else {
-        return Vec::new();
+    // The path is the first argument, or a `path = ".."` option.
+    let path = match args.first() {
+        Some(Expr::Lit(ExprLit {
+            lit: Lit::Str(path),
+            ..
+        })) => path.clone(),
+        _ => match args.iter().find_map(|arg| match arg {
+            Expr::Assign(assign) => match (&*assign.left, &*assign.right) {
+                (
+                    Expr::Path(key),
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(path),
+                        ..
+                    }),
+                ) if key.path.is_ident("path") => Some(path.clone()),
+                _ => None,
+            },
+            _ => None,
+        }) {
+            Some(path) => path,
+            None => return Vec::new(),
+        },
     };
     let methods: Vec<String> = match fixed_method {
         Some(method) => vec![method.to_owned()],
@@ -894,6 +1133,7 @@ pub(crate) const HTTP_METHOD_CONSTANTS: [&str; 9] = [
 /// Reads the HTTP method from a route's builder (its last argument). Only the
 /// builder's own call chain is followed, so calls nested in guard, handler, or
 /// configuration arguments cannot supply the method.
+#[cfg(test)]
 pub(crate) fn extract_http_method(expr: &ExprMethodCall) -> String {
     expr.args
         .last()
@@ -901,8 +1141,18 @@ pub(crate) fn extract_http_method(expr: &ExprMethodCall) -> String {
         .unwrap_or_else(|| "UNKNOWN".into())
 }
 
+#[cfg(test)]
 pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
-    let mut methods = Vec::new();
+    match route_builder_methods(builder)?.as_slice() {
+        [method] => Some(method.clone()),
+        _ => None,
+    }
+}
+
+/// The methods a route builder answers: one for `web::get()`, several for
+/// `web::route().guard(guard::Any(guard::Get()).or(guard::Post()))`.
+pub(crate) fn route_builder_methods(builder: &Expr) -> Option<Vec<String>> {
+    let mut methods: Vec<Vec<String>> = Vec::new();
     let mut expr = builder;
     let root = loop {
         match expr {
@@ -910,9 +1160,9 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
                 // `Route::method` and a method guard (`.guard(guard::Get())`)
                 // constrain the method; other builder calls do not.
                 if call.method == "method" {
-                    methods.push(method_constant(call.args.first()?)?);
+                    methods.push(vec![method_constant(call.args.first()?)?]);
                 } else if call.method == "guard"
-                    && let Some(method) = call.args.first().and_then(method_guard)
+                    && let Some(method) = call.args.first().and_then(method_guards)
                 {
                     methods.push(method);
                 }
@@ -938,15 +1188,18 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
         .map(|segment| segment.ident.to_string())
         .collect();
     let (name, module) = segments.split_last()?;
+    let name = unalias(name);
     let module: Vec<&str> = module.iter().map(String::as_str).collect();
-    let web_function = matches!(module.as_slice(), [] | ["web"] | ["actix_web", "web"]);
+    // `web::get`, `actix_web::web::get`, or a re-export such as
+    // `paperclip::actix::web::get`.
+    let web_function = matches!(module.as_slice(), [] | [.., "web"]);
     let any_method_route = (web_function && name == "route")
         || (matches!(module.as_slice(), ["Route"] | ["actix_web", "Route"]) && name == "new");
 
     if web_function && ROUTE_METHOD_CONSTRUCTORS.contains(&name.as_str()) {
-        methods.push(name.to_uppercase());
+        methods.push(vec![name.to_uppercase()]);
     } else if web_function && name == "method" {
-        methods.push(method_constant(root.args.first()?)?);
+        methods.push(vec![method_constant(root.args.first()?)?]);
     } else if !any_method_route {
         // Not a recognized `Route` constructor.
         return None;
@@ -958,6 +1211,25 @@ pub(crate) fn route_builder_method(builder: &Expr) -> Option<String> {
         // An any-method route without a method guard, or conflicting guards.
         _ => None,
     }
+}
+
+/// A method guard, or `guard::Any(a).or(b)..` over method guards.
+fn method_guards(expr: &Expr) -> Option<Vec<String>> {
+    if let Expr::MethodCall(call) = expr
+        && call.method == "or"
+    {
+        let mut methods = method_guards(&call.receiver)?;
+        methods.extend(method_guards(call.args.first()?)?);
+        methods.dedup();
+        return Some(methods);
+    }
+    if let Expr::Call(call) = expr
+        && let Expr::Path(function) = &*call.func
+        && function.path.segments.last().is_some_and(|segment| segment.ident == "Any")
+    {
+        return method_guards(call.args.first()?);
+    }
+    method_guard(expr).map(|method| vec![method])
 }
 
 /// Reads a method guard: `guard::Get()`, `actix_web::guard::Post()`, or
@@ -996,7 +1268,7 @@ pub(crate) fn method_guard(expr: &Expr) -> Option<String> {
         .collect();
     let (name, module) = segments.split_last()?;
     let module: Vec<&str> = module.iter().map(String::as_str).collect();
-    if !matches!(module.as_slice(), [] | ["guard"] | ["actix_web", "guard"]) {
+    if !matches!(module.as_slice(), [] | [.., "guard"]) {
         return None;
     }
     if name == "Method" {
@@ -1112,6 +1384,36 @@ pub(crate) fn configuration_call_evidence(
             AuthStrength::Medium,
         )
     } else {
+        // An application's own builder extension on a route or scope:
+        // `web::post().to(h).authorize(Action::PutAlert)`. Named as a check,
+        // it wraps the route in that check.
+        let name = method.method.to_string();
+        if let Some((kind, strength)) = classify_check_name(&name) {
+            let mut requirements = name_keys(&name);
+            for arg in &method.args {
+                requirements.extend(keys_in_expr(arg));
+            }
+            requirements.sort();
+            requirements.dedup();
+            evidence.push(AuthEvidence {
+                kind,
+                mechanism: name.clone(),
+                symbol: Some(format!(
+                    ".{name}({})",
+                    method
+                        .args
+                        .iter()
+                        .map(|arg| arg.to_token_stream().to_string().replace(' ', ""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )),
+                file: file.to_path_buf(),
+                line: method.method.span().start().line,
+                handler: handler.map(str::to_owned),
+                strength,
+                requirements,
+            });
+        }
         return;
     };
     for arg in &method.args {
@@ -1133,9 +1435,51 @@ pub(crate) fn configuration_call_evidence(
                 continue;
             }
         }
+        // `.wrap(get_middleware())` with `fn get_middleware() -> .. {
+        // Authentication::with_identity(ROUTES) }`: read as what it returns.
+        if let Some(returned) = helper_return(arg) {
+            let call = ExprMethodCall {
+                attrs: Vec::new(),
+                receiver: Box::new(syn::parse_quote!(route)),
+                dot_token: Default::default(),
+                method: method.method.clone(),
+                turbofish: None,
+                paren_token: Default::default(),
+                args: std::iter::once(returned).collect(),
+            };
+            let start = evidence.len();
+            HELPER_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            configuration_call_evidence(&call, file, handler, evidence);
+            HELPER_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            let found = &mut evidence[start..];
+            if found.iter().any(|found| found.kind != AuthEvidenceKind::Unknown) {
+                let written = arg.to_token_stream().to_string().replace(' ', "");
+                for found in found.iter_mut() {
+                    found.line = arg.span().start().line;
+                    found.mechanism = format!("{} (returned by `{written}`)", found.mechanism);
+                }
+                continue;
+            }
+            evidence.truncate(start);
+        }
         let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
             // Neither authorization, authentication, nor a known harmless
             // component: it may protect the route, so it is kept as unknown.
+            // `wrap_fn(|req, srv| ..)`, `guard::fn_guard(|ctx| ..)`: a
+            // closure that reads the caller's credentials or role.
+            if let Some((kind, requirements)) = closure_check(arg) {
+                evidence.push(AuthEvidence {
+                    kind,
+                    mechanism: format!("`.{}` closure that checks the caller", method.method),
+                    symbol: Some(format!(".{}(<closure>)", method.method)),
+                    file: file.to_path_buf(),
+                    line: arg.span().start().line,
+                    handler: handler.map(str::to_owned),
+                    strength: AuthStrength::Weak,
+                    requirements,
+                });
+                continue;
+            }
             if let Some(name) = unrecognized_component(arg) {
                 // Wrapped around the routes, a component named for
                 // authentication (`reject_anonymous_users`, `Authentication`)
@@ -1349,6 +1693,12 @@ impl RouteVisitor<'_> {
                 lit: Lit::Str(value),
                 ..
             }) => return Some((value.value(), line)),
+            Expr::Reference(reference) => return self.path_argument(&reference.expr),
+            Expr::Group(group) => return self.path_argument(&group.expr),
+            Expr::Paren(paren) => return self.path_argument(&paren.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                return self.path_argument(&unary.expr);
+            }
             Expr::Path(path) if path.qself.is_none() => {
                 let segments: Vec<String> = path
                     .path
@@ -1356,6 +1706,12 @@ impl RouteVisitor<'_> {
                     .iter()
                     .map(|segment| segment.ident.to_string())
                     .collect();
+                if let [name] = segments.as_slice()
+                    && let Some((_, value)) =
+                        self.loop_values.iter().rev().find(|(bound, _)| bound == name)
+                {
+                    return Some((value.clone(), line));
+                }
                 if let Some(value) =
                     self.index
                         .resolve_const(&self.crate_key, &self.module, &segments)
@@ -1449,13 +1805,8 @@ impl RouteVisitor<'_> {
                     .map(|(_, builder)| builder.clone())?;
                 self.resource_paths(&builder)
             }
-            Expr::Call(call)
-                if matches!(
-                    &*call.func,
-                    Expr::Path(path)
-                        if path.path.segments.last().is_some_and(|segment| segment.ident == "resource")
-                ) =>
-            {
+            Expr::Call(call) if is_resource_call(&call.func) || constructs(&call.func, "service", "WebService") => {
+                self.read_lines.insert(span_position(call.span()));
                 let mut argument = call.args.first()?;
                 // `["/a", "/b"]`, `&["/a", "/b"]`, `vec!["/a", "/b"]`.
                 while let Expr::Reference(reference) = argument {
@@ -1503,12 +1854,82 @@ pub(crate) fn has_unresolved_inner_segment(path: &str) -> bool {
         .any(|segment| segment.starts_with("<unresolved:"))
 }
 
+/// What a closure passed as middleware or a guard checks, from the words it
+/// uses: a role or permission, else the caller's credentials. `None` when
+/// the argument holds no closure or the closure names neither.
+fn closure_check(expr: &Expr) -> Option<(AuthEvidenceKind, Vec<String>)> {
+    const PRIVILEGE: [&str; 6] = ["admin", "admins", "role", "roles", "permission", "permissions"];
+    const CREDENTIAL: [&str; 11] = [
+        "authorization",
+        "unauthorized",
+        "authenticated",
+        "token",
+        "bearer",
+        "session",
+        "claims",
+        "jwt",
+        "apikey",
+        "identity",
+        "credentials",
+    ];
+    let closure = match expr {
+        Expr::Closure(closure) => closure,
+        Expr::Call(call) => call.args.iter().find_map(|arg| match arg {
+            Expr::Closure(closure) => Some(closure),
+            _ => None,
+        })?,
+        _ => return None,
+    };
+    let text = closure.body.to_token_stream().to_string();
+    let mut words: Vec<String> = Vec::new();
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        words.extend(token.split('_').map(str::to_ascii_lowercase));
+        words.extend(camel_case_words(token));
+    }
+    let mut roles: Vec<String> = words
+        .iter()
+        .filter(|word| PRIVILEGE.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    roles.sort();
+    roles.dedup();
+    if !roles.is_empty() {
+        return Some((AuthEvidenceKind::RoleCheck, roles));
+    }
+    words
+        .iter()
+        .any(|word| CREDENTIAL.contains(&word.as_str()))
+        .then(|| (AuthEvidenceKind::IdentityExtraction, Vec::new()))
+}
+
 pub(crate) fn is_scope_call(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Path(path)
-            if path.path.segments.last().is_some_and(|segment| segment.ident == "scope")
-    )
+    constructs(expr, "scope", "Scope")
+}
+
+/// `web::resource(..)` or `Resource::new(..)`.
+pub(crate) fn is_resource_call(expr: &Expr) -> bool {
+    constructs(expr, "resource", "Resource")
+}
+
+/// Whether a called path is `web::<function>` or `<Type>::new`.
+fn constructs(expr: &Expr, function: &str, ty: &str) -> bool {
+    let Expr::Path(path) = expr else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    match segments.as_slice() {
+        // `actix_web::Resource::new`, or `Resource::new` with `Resource`
+        // imported from actix-web: a project's own `crate::Resource` is not one.
+        [owner, new] if new == "new" => unalias(owner) == ty && imported_from_actix(owner),
+        [first, .., owner, new] if new == "new" => unalias(owner) == ty && first == "actix_web",
+        [.., last] => unalias(last) == function,
+        [] => false,
+    }
 }
 
 /// The argument of a route's `.to(...)` call.
@@ -1806,4 +2227,492 @@ pub(crate) fn find_handler_closure(
         }
     }
     exprs.iter().find_map(in_expr)
+}
+
+/// The prefix of `#[actix_web::scope("/p")]` on a module.
+fn scope_attribute(attribute: &syn::Attribute) -> Option<String> {
+    let last = attribute.path().segments.last()?;
+    if last.ident != "scope" {
+        return None;
+    }
+    attribute.parse_args::<syn::LitStr>().ok().map(|value| value.value())
+}
+
+/// The string literals a loop walks: `["/a", "/b"]`, `&[..]`, `vec![..]`,
+/// optionally through `.iter()`/`.into_iter()`/`.iter().copied()`.
+fn literal_strings(expr: &Expr) -> Option<Vec<String>> {
+    let mut expr = expr;
+    loop {
+        match expr {
+            Expr::Reference(reference) => expr = &reference.expr,
+            Expr::Paren(paren) => expr = &paren.expr,
+            Expr::MethodCall(call)
+                if call.args.is_empty()
+                    && matches!(
+                        call.method.to_string().as_str(),
+                        "iter" | "into_iter" | "copied" | "cloned"
+                    ) =>
+            {
+                expr = &call.receiver;
+            }
+            _ => break,
+        }
+    }
+    let elements: Vec<Expr> = match expr {
+        Expr::Array(array) => array.elems.iter().cloned().collect(),
+        Expr::Macro(mac) if mac.mac.path.is_ident("vec") => mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+            .ok()?
+            .into_iter()
+            .collect(),
+        _ => return None,
+    };
+    let values: Vec<String> = elements
+        .iter()
+        .map(|element| match element {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    (!values.is_empty()).then_some(values)
+}
+
+thread_local! {
+    /// `use` renames of the file being visited, alias to original name:
+    /// `use actix_web::web::{get as get_route}` maps `get_route` to `get`.
+    static IMPORT_ALIASES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Names the file being visited imports from `actix_web`.
+    static ACTIX_IMPORTS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn imported_from_actix(name: &str) -> bool {
+    ACTIX_IMPORTS.with(|imports| imports.borrow().contains(name))
+}
+
+fn set_import_aliases(file: &syn::File) {
+    struct Uses(HashMap<String, String>, HashSet<String>);
+    fn imported(tree: &syn::UseTree, actix: bool, uses: &mut Uses) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                let actix = actix || path.ident == "actix_web";
+                imported(&path.tree, actix, uses);
+            }
+            syn::UseTree::Name(name) if actix => {
+                uses.1.insert(name.ident.to_string());
+            }
+            syn::UseTree::Rename(rename) => {
+                uses.0.insert(rename.rename.to_string(), rename.ident.to_string());
+                if actix {
+                    uses.1.insert(rename.rename.to_string());
+                }
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    imported(tree, actix, uses);
+                }
+            }
+            _ => {}
+        }
+    }
+    impl<'ast> Visit<'ast> for Uses {
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            imported(&node.tree, false, self);
+        }
+    }
+    let mut uses = Uses(HashMap::new(), HashSet::new());
+    uses.visit_file(file);
+    IMPORT_ALIASES.with(|aliases| *aliases.borrow_mut() = uses.0);
+    ACTIX_IMPORTS.with(|imports| *imports.borrow_mut() = uses.1);
+}
+
+/// The original name of an imported alias, or the name itself.
+fn unalias(name: &str) -> String {
+    IMPORT_ALIASES
+        .with(|aliases| aliases.borrow().get(name).cloned())
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Every `macro_rules!` macro the project defines, by name, so that a macro
+/// exported from one file (`#[macro_use]`, `#[macro_export]`) is read where
+/// another file invokes it. A name defined twice differently is dropped.
+pub(crate) fn project_macros<'a>(
+    files: impl IntoIterator<Item = &'a syn::File>,
+) -> HashMap<String, Vec<super::macros::Rule>> {
+    struct Definitions(HashMap<String, Option<(String, Vec<super::macros::Rule>)>>);
+    impl<'ast> Visit<'ast> for Definitions {
+        fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+            if node.mac.path.is_ident("macro_rules")
+                && let Some(name) = &node.ident
+            {
+                let text = node.mac.tokens.to_string();
+                let rules = super::macros::parse_rules(&node.mac.tokens);
+                self.0
+                    .entry(name.to_string())
+                    .and_modify(|entry| {
+                        if entry.as_ref().is_some_and(|(seen, _)| *seen != text) {
+                            *entry = None;
+                        }
+                    })
+                    .or_insert(Some((text, rules)));
+            }
+        }
+    }
+    let mut definitions = Definitions(HashMap::new());
+    for file in files {
+        definitions.visit_file(file);
+    }
+    definitions
+        .0
+        .into_iter()
+        .filter_map(|(name, entry)| entry.map(|(_, rules)| (name, rules)))
+        .filter(|(_, rules)| !rules.is_empty())
+        .collect()
+}
+
+/// `tokens` with each loop variable that stands alone (not a field or path
+/// segment) replaced by the literal it is bound to.
+fn replace_loop_values(
+    tokens: proc_macro2::TokenStream,
+    values: &[(String, String)],
+) -> proc_macro2::TokenStream {
+    use proc_macro2::TokenTree;
+    let mut output = Vec::new();
+    let mut previous: Option<TokenTree> = None;
+    for token in tokens {
+        let replaced = match &token {
+            TokenTree::Ident(ident)
+                if !matches!(&previous, Some(TokenTree::Punct(p)) if p.as_char() == '.' || p.as_char() == ':') =>
+            {
+                values
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| ident == name)
+                    .map(|(_, value)| {
+                        let mut literal = proc_macro2::Literal::string(value);
+                        literal.set_span(ident.span());
+                        TokenTree::Literal(literal)
+                    })
+            }
+            TokenTree::Group(group) => {
+                let mut copy = proc_macro2::Group::new(
+                    group.delimiter(),
+                    replace_loop_values(group.stream(), values),
+                );
+                copy.set_span(group.span());
+                Some(TokenTree::Group(copy))
+            }
+            _ => None,
+        };
+        let token = replaced.unwrap_or(token);
+        previous = Some(token.clone());
+        output.push(token);
+    }
+    output.into_iter().collect()
+}
+
+/// The string fields of constant route tables, as in
+/// `pub const ROUTES: Routes = Routes::new();` with `Routes::new()` building
+/// `Self { auth: Auth::new(), .. }` and `Auth::new()` building
+/// `Self { login: "/api/v1/signin", .. }`. Types are known by name only; a
+/// field path resolves when every type it could pass through gives one value.
+#[derive(Default)]
+pub(crate) struct FieldPaths {
+    /// Constant or static name to the type names it is declared with.
+    consts: HashMap<String, HashSet<String>>,
+    /// `use a::B as C` renames across the project: `C` to `B`.
+    renames: HashMap<String, HashSet<String>>,
+    /// `(struct, field)` to the type names of the field.
+    fields: HashMap<(String, String), HashSet<String>>,
+    /// `(struct, field)` to the string literals written for it.
+    values: HashMap<(String, String), HashSet<String>>,
+}
+
+impl FieldPaths {
+    pub(crate) fn build<'a>(files: impl IntoIterator<Item = &'a syn::File>) -> Self {
+        struct Collect {
+            paths: FieldPaths,
+            impl_type: Vec<Option<String>>,
+            /// `let login = "/api/v1/signin";` in the function being visited.
+            strings: Vec<HashMap<String, String>>,
+        }
+        fn type_name(ty: &Type) -> Option<String> {
+            match ty {
+                Type::Path(path) => path.path.segments.last().map(|segment| segment.ident.to_string()),
+                Type::Reference(reference) => type_name(&reference.elem),
+                Type::Paren(paren) => type_name(&paren.elem),
+                Type::Group(group) => type_name(&group.elem),
+                _ => None,
+            }
+        }
+        impl<'ast> Visit<'ast> for Collect {
+            fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+                if let Some(name) = type_name(&node.ty) {
+                    self.paths.consts.entry(node.ident.to_string()).or_default().insert(name);
+                }
+                visit::visit_item_const(self, node);
+            }
+            fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+                if let Some(name) = type_name(&node.ty) {
+                    self.paths.consts.entry(node.ident.to_string()).or_default().insert(name);
+                }
+                visit::visit_impl_item_const(self, node);
+            }
+            fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+                if let Some(name) = type_name(&node.ty) {
+                    self.paths.consts.entry(node.ident.to_string()).or_default().insert(name);
+                }
+                visit::visit_item_static(self, node);
+            }
+            fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+                self.paths
+                    .renames
+                    .entry(node.rename.to_string())
+                    .or_default()
+                    .insert(node.ident.to_string());
+            }
+            fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+                for field in &node.fields {
+                    if let (Some(ident), Some(name)) = (&field.ident, type_name(&field.ty)) {
+                        self.paths
+                            .fields
+                            .entry((node.ident.to_string(), ident.to_string()))
+                            .or_default()
+                            .insert(name);
+                    }
+                }
+                visit::visit_item_struct(self, node);
+            }
+            fn visit_block(&mut self, node: &'ast Block) {
+                let mut strings = self.strings.last().cloned().unwrap_or_default();
+                for statement in &node.stmts {
+                    if let Stmt::Local(local) = statement
+                        && let Some(init) = &local.init
+                        && let Expr::Lit(ExprLit { lit: Lit::Str(value), .. }) = &*init.expr
+                        && let Some(name) = simple_binding(&local.pat)
+                    {
+                        strings.insert(name, value.value());
+                    }
+                }
+                self.strings.push(strings);
+                visit::visit_block(self, node);
+                self.strings.pop();
+            }
+            fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+                self.impl_type.push(type_name(&node.self_ty));
+                visit::visit_item_impl(self, node);
+                self.impl_type.pop();
+            }
+            fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+                let written = node.path.segments.last().map(|segment| segment.ident.to_string());
+                let name = match written.as_deref() {
+                    Some("Self") => self.impl_type.last().cloned().flatten(),
+                    other => other.map(str::to_owned),
+                };
+                if let Some(name) = name {
+                    for field in &node.fields {
+                        let syn::Member::Named(ident) = &field.member else {
+                            continue;
+                        };
+                        let value = match &field.expr {
+                            Expr::Lit(ExprLit { lit: Lit::Str(value), .. }) => Some(value.value()),
+                            // `Auth { login, .. }` after `let login = "/signin";`.
+                            Expr::Path(path) => path.path.get_ident().and_then(|local| {
+                                self.strings.last().and_then(|strings| strings.get(&local.to_string())).cloned()
+                            }),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            self.paths
+                                .values
+                                .entry((name.clone(), ident.to_string()))
+                                .or_default()
+                                .insert(value);
+                        }
+                    }
+                }
+                visit::visit_expr_struct(self, node);
+            }
+        }
+        let mut collect = Collect {
+            paths: FieldPaths::default(),
+            impl_type: Vec::new(),
+            strings: Vec::new(),
+        };
+        for file in files {
+            collect.visit_file(file);
+        }
+        collect.paths
+    }
+
+    /// The string a field path such as `crate::V1_API_ROUTES.auth.login` names.
+    pub(crate) fn resolve(&self, written: &str) -> Option<String> {
+        let mut expr = syn::parse_str::<Expr>(written).ok()?;
+        let mut fields = Vec::new();
+        let root = loop {
+            match expr {
+                Expr::Field(field) => {
+                    let syn::Member::Named(name) = &field.member else {
+                        return None;
+                    };
+                    fields.push(name.to_string());
+                    expr = *field.base;
+                }
+                Expr::Path(path) => break path.path.segments.last()?.ident.to_string(),
+                _ => return None,
+            }
+        };
+        fields.reverse();
+        let (last, through) = fields.split_last()?;
+        let mut names: HashSet<String> = HashSet::from([root.clone()]);
+        names.extend(self.renames.get(&root).into_iter().flatten().cloned());
+        let mut types: HashSet<String> = names
+            .iter()
+            .filter_map(|name| self.consts.get(name))
+            .flatten()
+            .cloned()
+            .collect();
+        for field in through {
+            types = types
+                .iter()
+                .filter_map(|ty| self.fields.get(&(ty.clone(), field.clone())))
+                .flatten()
+                .cloned()
+                .collect();
+        }
+        let values: HashSet<&String> = types
+            .iter()
+            .filter_map(|ty| self.values.get(&(ty.clone(), last.clone())))
+            .flatten()
+            .collect();
+        match values.into_iter().collect::<Vec<_>>().as_slice() {
+            [value] => Some((*value).clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Function name to `(module, returned expression)` per definition.
+type HelperReturns = HashMap<String, Vec<(Vec<String>, Option<Expr>)>>;
+
+thread_local! {
+    /// The value each project function returns, by function name, with the
+    /// module it is defined in, when its body is one expression.
+    static HELPER_RETURNS: std::cell::RefCell<HelperReturns> =
+        std::cell::RefCell::new(HashMap::new());
+    static HELPER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Records what the project's functions return, for [`helper_return`].
+pub(crate) fn set_helper_returns<'a>(files: impl IntoIterator<Item = (Vec<String>, &'a syn::File)>) {
+    struct Returns {
+        found: HelperReturns,
+        module: Vec<String>,
+    }
+    impl Returns {
+        fn add(&mut self, name: String, block: &Block) {
+            let tail = match block.stmts.as_slice() {
+                [Stmt::Expr(expr, None)] => Some(expr.clone()),
+                _ => None,
+            };
+            self.found.entry(name).or_default().push((self.module.clone(), tail));
+        }
+    }
+    impl<'ast> Visit<'ast> for Returns {
+        fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+            self.module.push(node.ident.to_string());
+            visit::visit_item_mod(self, node);
+            self.module.pop();
+        }
+        fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+            self.add(node.sig.ident.to_string(), &node.block);
+        }
+        fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+            self.add(node.sig.ident.to_string(), &node.block);
+        }
+    }
+    let mut returns = Returns { found: HashMap::new(), module: Vec::new() };
+    for (module, file) in files {
+        returns.module = module;
+        returns.visit_file(file);
+    }
+    HELPER_RETURNS.with(|helpers| *helpers.borrow_mut() = returns.found);
+}
+
+/// What a call to a project function without arguments returns, as in
+/// `get_middleware()` or `crate::pages::get_middleware()`. A qualified call
+/// picks the definition whose module ends with the qualifier; otherwise all
+/// definitions of the name must return the same expression.
+fn helper_return(arg: &Expr) -> Option<Expr> {
+    if HELPER_DEPTH.with(std::cell::Cell::get) >= 4 {
+        return None;
+    }
+    let Expr::Call(call) = arg else {
+        return None;
+    };
+    if !call.args.is_empty() {
+        return None;
+    }
+    let Expr::Path(function) = &*call.func else {
+        return None;
+    };
+    let segments: Vec<String> = function
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .filter(|segment| !matches!(segment.as_str(), "crate" | "self" | "super"))
+        .collect();
+    let (name, qualifier) = segments.split_last()?;
+    HELPER_RETURNS.with(|helpers| {
+        let helpers = helpers.borrow();
+        let candidates: Vec<&(Vec<String>, Option<Expr>)> = helpers
+            .get(name)?
+            .iter()
+            .filter(|(module, _)| module.ends_with(qualifier))
+            .collect();
+        let first = candidates.first()?.1.clone()?;
+        let text = first.to_token_stream().to_string();
+        candidates
+            .iter()
+            .all(|(_, tail)| tail.as_ref().is_some_and(|tail| tail.to_token_stream().to_string() == text))
+            .then_some(first)
+    })
+}
+
+/// Whether a called path builds a route or resource: `web::get`,
+/// `web::route`, `web::method`, `web::resource`, `web::service`,
+/// `Resource::new`, `Route::new`, or one of those imported from actix-web
+/// by name. These are where routes are written, so each should yield a route.
+fn is_route_site(func: &Expr) -> bool {
+    let Expr::Path(path) = func else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let Some((name, module)) = segments.split_last() else {
+        return false;
+    };
+    let original = unalias(name);
+    let builds = ROUTE_METHOD_CONSTRUCTORS.contains(&original.as_str())
+        || matches!(original.as_str(), "route" | "method" | "resource" | "service");
+    match module {
+        [] => builds && imported_from_actix(name),
+        [.., web] if web == "web" => builds,
+        [.., owner] => {
+            original == "new"
+                && matches!(owner.as_str(), "Resource" | "Route" | "WebService")
+                && (segments.first().is_some_and(|first| first == "actix_web")
+                    || imported_from_actix(owner))
+        }
+    }
 }
