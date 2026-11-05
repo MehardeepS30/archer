@@ -103,7 +103,7 @@ cargo run --locked -- tests/fixtures/demo.rs
 
 (`tests/fixtures/probes/` holds one small regression fixture per problem in `docs/improvement-plan.md`; analyzing all of `tests/fixtures` includes them.)
 
-The bundled fixture yields five `/admin/*` routes and one potential drift finding for `GET /admin/payments`, supported by guard, middleware, and `require_admin` evidence on three GET peers; `POST /admin/audit` is not a peer.
+The bundled fixture yields five `/admin/*` routes and two potential drift findings, `GET /admin/payments` and `POST /admin/audit`, both supported by guard, middleware, and `require_admin` evidence on the three protected GET routes. `/admin/audit` has no read routes of its own, so the write is compared with the reads of its namespace.
 
 ### Generate JSON Output
 
@@ -123,8 +123,29 @@ The JSON report can be consumed by a backend or other programmatic workflow.
 | `--min-support <N>` | 2 | Authorized peers a group needs before its unauthorized routes are reported. |
 | `--threshold <F>` | 0.6 | Share of a group's routes, in (0, 1], that must be authorized before its unauthorized routes are reported. |
 | `--fail-on-findings` | off | Exit with status 1 when findings are reported. Status 2 always means the analysis failed. |
+| `--config <FILE>` | `archer.toml` at the repository root, if present | Reviewer decisions to apply: routes that are public by design and findings that were reviewed and dismissed. |
 
 The two inference defaults reproduce the earlier behaviour on small groups (two authorized peers out of three) and reject minority patterns (two out of seven). They are starting points for evaluation, not validated values.
+
+### Recording review decisions (`archer.toml`)
+
+Routes that are public on purpose, and findings that were reviewed and accepted, can be recorded so later runs do not report them again:
+
+```toml
+# Public by design: not judged, and not counted as peers of other routes.
+[[public]]
+path = "/api/status/**"
+reason = "status pages are public"
+
+# Reviewed and accepted: moved to `dismissed` in the report.
+[[dismiss]]
+method = "DELETE"                     # optional
+path = "/api/keys/{key}"
+category = "MissingAuthorization"     # optional
+reason = "checked inside delete_key by the key store"
+```
+
+Paths match segment by segment: `*` matches one segment, `**` any number of segments (only at the end), and a `{name}` segment matches any path parameter. Methods and categories match case-insensitively. Every rule needs a `reason`, and unknown keys are rejected.
 
 ## Understanding the Results
 
@@ -248,7 +269,7 @@ For reproducible evaluation, run ARCHER against controlled fixtures with known a
 
 ### Validation status
 
-- `cargo test --offline --locked`: 105 unit tests and 3 CLI tests pass, including 16 drift fixtures in `tests/fixtures/probes/drift/`.
+- `cargo test --offline --locked`: 133 unit tests and 3 CLI tests pass, including 37 drift fixtures in `tests/fixtures/probes/drift/`.
 - A synthetic single-file integration fixture produces its expected 16 routes, 3 peer groups, and the one intended `GET /api/admin/payments` finding.
 - These are controlled synthetic checks. They do not establish accuracy or generalization on real-world Actix-Web codebases. Historical benchmark figures in `docs/evaluation/` were produced by an earlier engine version and have not been rerun.
 
