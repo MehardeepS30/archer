@@ -4,6 +4,7 @@ mod caller_use;
 mod config;
 mod drift;
 mod evidence;
+mod extractors;
 mod handlers;
 mod middleware;
 mod model;
@@ -141,6 +142,8 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
 
     // Index every handler definition before extracting routes so that route
     // registrations can resolve handlers defined in other files.
+    // Before the index, whose evidence uses what extractors check.
+    extractors::index_extractors(parsed_files.iter().map(|(_, _, syntax)| syntax));
     let crates = workspace_crates(parsed_files.iter().map(|((crate_key, _), _, _)| crate_key));
     let index = HandlerIndex::build(
         parsed_files

@@ -164,8 +164,17 @@ pub(crate) fn identity_type(ty: &Type) -> bool {
                     _ => false,
                 };
             }
+            // `GuardedData<Policy, Data<State>>` checks the caller but hands
+            // the handler the state: what it is used for is not the caller.
+            let wraps_data = matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
+                if arguments.args.iter().any(|argument| matches!(argument,
+                    GenericArgument::Type(Type::Path(inner))
+                        if inner.path.segments.last().is_some_and(|last| last.ident == "Data"))));
             !DATA_EXTRACTORS.contains(&name.as_str())
-                && (classify_extractor_name(&name).is_some() || names_authentication(&name))
+                && !wraps_data
+                && (super::extractors::learned(&name).is_some()
+                    || classify_extractor_name(&name).is_some()
+                    || names_authentication(&name))
         }
         Type::Reference(reference) => identity_type(&reference.elem),
         Type::Paren(paren) => identity_type(&paren.elem),
@@ -492,8 +501,9 @@ const EXTRACTOR_EXCLUDED_WORDS: [&str; 26] = [
 /// Records handler arguments whose type is an authorization extractor
 /// (`AdminUser`, `RequireRole<Admin>`) or an authentication-only extractor
 /// (`BearerAuth`). An extractor that implements `FromRequest` rejects the
-/// request before the handler runs, so its type is the evidence. This is a
-/// naming heuristic: the extractor's implementation is not inspected.
+/// request before the handler runs, so its type is the evidence. An
+/// extractor whose `FromRequest` body is in the scanned code is judged by
+/// that body (see `extractors`); others by their name.
 fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<AuthEvidence>) {
     match ty {
         Type::Path(path) if path.qself.is_none() => {
@@ -502,6 +512,42 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
             };
             let name = segment.ident.to_string();
             if DATA_EXTRACTORS.contains(&name.as_str()) {
+                return;
+            }
+            // A policy type argument names the requirement more precisely
+            // than the extractor's own body, which only runs the policy.
+            if let PathArguments::AngleBracketed(arguments) = &segment.arguments
+                && let Some(requirements) = policy_requirements(arguments)
+            {
+                evidence.push(AuthEvidence {
+                    kind: AuthEvidenceKind::PermissionCheck,
+                    mechanism: name,
+                    symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                    file: file.to_path_buf(),
+                    line: ty.span().start().line,
+                    handler: Some(handler.into()),
+                    strength: AuthStrength::Medium,
+                    requirements,
+                });
+                return;
+            }
+            // What the application's own `impl FromRequest` checks.
+            if let Some(learned) = super::extractors::learned(&name) {
+                let strength = if learned.kind == AuthEvidenceKind::IdentityExtraction {
+                    AuthStrength::Weak
+                } else {
+                    AuthStrength::Medium
+                };
+                evidence.push(AuthEvidence {
+                    kind: learned.kind,
+                    mechanism: name,
+                    symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                    file: file.to_path_buf(),
+                    line: ty.span().start().line,
+                    handler: Some(handler.into()),
+                    strength,
+                    requirements: learned.requirements,
+                });
                 return;
             }
             if let Some((kind, strength)) = classify_extractor_name(&name) {
@@ -532,19 +578,6 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 return;
             }
             if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
-                if let Some(requirements) = policy_requirements(arguments) {
-                    evidence.push(AuthEvidence {
-                        kind: AuthEvidenceKind::PermissionCheck,
-                        mechanism: name,
-                        symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
-                        file: file.to_path_buf(),
-                        line: ty.span().start().line,
-                        handler: Some(handler.into()),
-                        strength: AuthStrength::Medium,
-                        requirements,
-                    });
-                    return;
-                }
                 for argument in &arguments.args {
                     if let GenericArgument::Type(inner) = argument {
                         extractor_evidence(inner, file, handler, evidence);
@@ -1381,14 +1414,30 @@ fn strip_conversions(expr: &Expr) -> &Expr {
     }
 }
 
+/// Fields that place a record in a tenant (an organization, team or
+/// workspace): a record whose tenant is compared with the caller's is held
+/// to the caller's tenant, an object-level check like ownership.
+const TENANT_FIELDS: [&str; 8] = [
+    "org_id",
+    "organization_id",
+    "team_id",
+    "workspace_id",
+    "project_id",
+    "merchant_id",
+    "company_id",
+    "namespace_id",
+];
+
 fn ownership_operand(expr: &Expr) -> bool {
+    let named = |name: &str| {
+        let name = name.strip_prefix("get_").unwrap_or(name);
+        OWNERSHIP_FIELDS.contains(&name) || TENANT_FIELDS.contains(&name)
+    };
     match strip_conversions(expr) {
         Expr::Field(field) => {
-            matches!(&field.member, Member::Named(member) if OWNERSHIP_FIELDS.contains(&member.to_string().as_str()))
+            matches!(&field.member, Member::Named(member) if named(&member.to_string()))
         }
-        Expr::MethodCall(call) => {
-            call.args.is_empty() && OWNERSHIP_FIELDS.contains(&call.method.to_string().as_str())
-        }
+        Expr::MethodCall(call) => call.args.is_empty() && named(&call.method.to_string()),
         _ => false,
     }
 }
@@ -1717,8 +1766,9 @@ pub(crate) fn classify_check_name(name: &str) -> Option<(AuthEvidenceKind, AuthS
         && (has_token(&["permission", "permissions"]) || ends_with_access))
     {
         (AuthEvidenceKind::PermissionCheck, AuthStrength::Strong)
-    } else if is_one_of(&["owns", "is_owner", "is_owned_by"])
-        || (uses_check_prefix && has_token(&["owner", "ownership"]))
+    } else if is_one_of(&["owns", "is_owner", "is_owned_by", "is_member", "belongs_to"])
+        || (uses_check_prefix
+            && has_token(&["owner", "ownership", "member", "membership", "belongs"]))
     {
         (AuthEvidenceKind::OwnershipCheck, AuthStrength::Medium)
     } else {

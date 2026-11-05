@@ -4424,3 +4424,89 @@ fn a_route_calling_the_identity_source_without_the_peers_requirement_is_reported
     );
     assert!(report.finding_details[0].rationale.contains("`Some(Role::Administrator)`"));
 }
+
+#[test]
+fn f38_extractors_are_judged_by_their_from_request_body() {
+    let report = drift_fixture(
+        "f38",
+        include_str!("../../tests/fixtures/probes/drift/f38_learned_extractors.rs"),
+    );
+    let members = route_at(&report, "/api/team/members");
+    assert!(has_evidence(members, AuthEvidenceKind::RoleCheck, "OwnerOnly"));
+    assert!(
+        members
+            .authorization
+            .iter()
+            .any(|evidence| evidence.requirements == ["owner"]),
+        "{:?}",
+        members.authorization
+    );
+    assert!(has_evidence(
+        route_at(&report, "/api/team/archive"),
+        AuthEvidenceKind::RoleCheck,
+        "StaffGate"
+    ));
+    let rename = route_at(&report, "/api/team/rename");
+    assert!(has_evidence(rename, AuthEvidenceKind::IdentityExtraction, "LoggedUser"));
+    // A data extractor that rejects malformed requests checks no caller.
+    assert!(
+        !rename
+            .authorization
+            .iter()
+            .any(|evidence| evidence.mechanism == "TeamData"),
+        "{:?}",
+        rename.authorization
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "POST", "/api/team/rename")]
+    );
+}
+
+#[test]
+fn f39_a_write_below_every_other_route_of_its_resource_is_reported() {
+    let report = drift_fixture(
+        "f39",
+        include_str!("../../tests/fixtures/probes/drift/f39_write_below_reads.rs"),
+    );
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "POST", "/api/org/api_key")]
+    );
+    let create = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/api/org/api_key")
+        .unwrap();
+    assert_eq!(create.severity, Severity::High);
+    assert!(create.rationale.contains("its reads included"), "{}", create.rationale);
+    assert!(
+        report
+            .unjudged
+            .iter()
+            .any(|route| route.path == "/api/billing/webhook"
+                && route.reason == UnjudgedReason::WellKnownPublic),
+    );
+}
+
+#[test]
+fn f40_tenant_comparisons_and_membership_helpers_are_object_level_checks() {
+    let report = drift_fixture(
+        "f40",
+        include_str!("../../tests/fixtures/probes/drift/f40_tenant_checks.rs"),
+    );
+    for method in ["GET", "PUT", "PATCH"] {
+        let route = report
+            .routes
+            .iter()
+            .find(|route| route.path == "/api/projects/{project_id}" && route.method == method)
+            .unwrap();
+        assert_eq!(route.best_tier(), EvidenceTier::Resource, "{method} {:?}", route.authorization);
+    }
+    let team = route_at(&report, "/api/teams/{team_id}");
+    assert!(has_evidence(team, AuthEvidenceKind::OwnershipCheck, "verify_member"));
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "DELETE", "/api/projects/{project_id}")]
+    );
+}

@@ -104,6 +104,21 @@ pub(crate) fn build_analysis_layers_full(
         GroupStats::of(peers, weights, options)
     };
     for (index, place) in placed.iter().enumerate() {
+        // A POST named as a read is held to the reads, when there are
+        // reads to hold it to; it still counts among the writes as a peer,
+        // which its method makes it.
+        let as_read = Placement {
+            class: MethodClass::Read,
+            ..place.clone()
+        };
+        let place = if place.class == MethodClass::Write
+            && route_class(candidates[index]) == MethodClass::Read
+            && comparison_key(&as_read, &class_size).is_some_and(|key| class_size(&key) >= 2)
+        {
+            &as_read
+        } else {
+            place
+        };
         let Some(mut own) = comparison_key(place, &class_size) else {
             pending.push((
                 candidates[index],
@@ -208,7 +223,7 @@ pub(crate) fn build_analysis_layers_full(
             .chain(reads.as_ref())
             .filter_map(|key| ids.get(key).map(|id| (&stats[key], key, id)))
             .filter(|(group, key, _)| {
-                key.class == place_class(route)
+                key.class == own.class
                     || (key.level == GroupLevel::Resource && targets_record(route))
                     || (group.expected == Some(EvidenceTier::Privilege)
                         && own_undecided(&stats, &own))
@@ -328,6 +343,7 @@ pub(crate) fn build_analysis_layers_full(
         ));
     }
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    writes_below_resource(&candidates, &mut peer_groups, &mut invariants, &mut finding_details);
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     per_route_permissions(routes, &mut finding_details);
@@ -353,6 +369,141 @@ pub(crate) fn build_analysis_layers_full(
     }
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings, unjudged)
+}
+
+/// A write on a resource's collection or record that requires less than
+/// every other route of that resource, its reads included:
+/// `POST /org/api_key` open to any logged-in user beside an admin-only
+/// `GET /org/api_key` and `DELETE /org/api_key/{id}`. The class-split
+/// groups miss it when the resource has too few routes of each class to
+/// reach support. Every other route must agree (at least two, one of them
+/// a read), so a resource with mixed protection says nothing.
+fn writes_below_resource(
+    candidates: &[&Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+    finding_details: &mut Vec<Finding>,
+) {
+    let reported: HashSet<(String, String, Option<String>)> = finding_details
+        .iter()
+        .map(|finding| {
+            let route = &finding.suspicious_route;
+            (route.method.clone(), route.path.clone(), route.handler.clone())
+        })
+        .collect();
+    let on_record: Vec<(&Route, String)> = candidates
+        .iter()
+        .copied()
+        .filter(|route| targets_record(route))
+        .map(|route| (route, placement(route).resource))
+        .collect();
+    for (route, resource) in &on_record {
+        if route_class(route) != MethodClass::Write
+            || reported.contains(&(route.method.clone(), route.path.clone(), route.handler.clone()))
+        {
+            continue;
+        }
+        let peers: Vec<&Route> = on_record
+            .iter()
+            .filter(|(other, theirs)| {
+                theirs == resource && route_identity(other) != route_identity(route)
+            })
+            .map(|(other, _)| *other)
+            .collect();
+        if peers.len() < 2
+            || !peers
+                .iter()
+                .any(|peer| MethodClass::of(&peer.method) == MethodClass::Read)
+        {
+            continue;
+        }
+        let tier = route.best_tier();
+        let Some(mut expected) = peers.iter().map(|peer| peer.best_tier()).min() else {
+            continue;
+        };
+        // A create makes the record its caller will own: nothing to own yet.
+        if expected == EvidenceTier::Resource && route.method == "POST" {
+            expected = EvidenceTier::Identity;
+        }
+        if expected <= tier {
+            continue;
+        }
+        // Protection Archer cannot evaluate, which the peers do not share,
+        // may close the gap: review, not a finding.
+        let unverified = !route.unverified.is_empty()
+            || route.authorization.iter().any(|evidence| {
+                matches!(evidence.kind, AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated)
+                    && !peers.iter().all(|peer| {
+                        peer.authorization.iter().any(|theirs| {
+                            theirs.kind == evidence.kind && theirs.mechanism == evidence.mechanism
+                        })
+                    })
+            });
+        let (category, severity) = if unverified {
+            (FindingCategory::UnverifiedProtection, Severity::Low)
+        } else {
+            match (expected, tier) {
+                (EvidenceTier::Identity, _) => (FindingCategory::MissingAuthentication, Severity::High),
+                (EvidenceTier::Privilege, EvidenceTier::None | EvidenceTier::Identity) => {
+                    (FindingCategory::MissingAuthorization, Severity::High)
+                }
+                (_, EvidenceTier::None | EvidenceTier::Identity) => {
+                    (FindingCategory::MissingAuthorization, Severity::Medium)
+                }
+                _ => (FindingCategory::WeakerAuthorization, Severity::Medium),
+            }
+        };
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut members: Vec<RouteReference> = vec![(*route).into()];
+        members.extend(peers.iter().map(|peer| (*peer).into()));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!("routes of resource {resource}, reads and writes"),
+            prefix: resource.clone(),
+            level: GroupLevel::Resource,
+            method_class: MethodClass::Write,
+            routes: members,
+        });
+        let listed = peers
+            .iter()
+            .map(|peer| format!("{} {} ({})", peer.method, peer.path, peer.best_tier()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!(
+                "Every other route of resource {resource} requires at least {expected}."
+            ),
+            total_routes: peers.len() + 1,
+            routes_with_authorization: peers.iter().filter(|peer| peer.is_authorized()).count()
+                + usize::from(route.is_authorized()),
+            routes_without_authorization: peers.iter().filter(|peer| !peer.is_authorized()).count()
+                + usize::from(!route.is_authorized()),
+            evidence_patterns: Vec::new(),
+            strength: AuthStrength::Medium,
+            expected_tier: Some(expected),
+            dominant_requirement: None,
+        };
+        invariants.push(invariant.clone());
+        let mut rationale = format!(
+            "Best evidence is {tier}, while every other route of {resource}, its reads included, reaches at least {expected}: {listed}. A write is rarely less protected than the reads of the same data."
+        );
+        if unverified {
+            rationale.push_str(" It has protection Archer cannot verify. Review manually.");
+        }
+        finding_details.push(Finding {
+            peer_group_id: id,
+            category,
+            severity,
+            rationale,
+            invariant,
+            suspicious_route: (*route).into(),
+            suspicious_route_tier: tier,
+            expected_tier: expected,
+            suspicious_route_evidence: route.authorization.clone(),
+            authorized_peer_routes: peers.iter().map(|peer| (*peer).into()).collect(),
+        });
+    }
 }
 
 /// Fewest distinct permissions a mechanism must name across the application,
@@ -1007,10 +1158,6 @@ impl<'a> GroupStats<'a> {
     }
 }
 
-fn place_class(route: &Route) -> MethodClass {
-    MethodClass::of(&route.method)
-}
-
 fn capitalized(text: &str) -> String {
     let mut characters = text.chars();
     characters
@@ -1521,6 +1668,15 @@ pub(crate) fn is_well_known_public_route(route: &Route) -> bool {
     // A leading runtime mount prefix (`/<unresolved:cfg.base_uri>/healthz`)
     // does not make the endpoint dynamic.
     let path = without_mount_prefix(&route.path);
+    // A provider's webhook (`POST /api/stripe/webhook`) has no logged-in
+    // caller; it authenticates the sender by a signature in the body.
+    if route.method == "POST"
+        && static_segments(path)
+            .last()
+            .is_some_and(|last| last == "webhook" || last == "webhooks")
+    {
+        return true;
+    }
     if path.split('/').any(is_dynamic_segment) {
         return false;
     }
@@ -1540,6 +1696,54 @@ where
         .into_iter()
         .filter(|route| seen.insert(route_identity(route)))
         .collect()
+}
+
+/// A route's method class, where a POST named as a read
+/// (`POST /dataset/get_all_tags` handled by `get_all_tags`, `POST /search`)
+/// is a read: APIs send a query body with POST, and such a route is
+/// protected like the reads of its resource, not like its writes.
+pub(crate) fn route_class(route: &Route) -> MethodClass {
+    let class = MethodClass::of(&route.method);
+    if route.method != "POST" {
+        return class;
+    }
+    // Read verbs; a name that also holds a write verb
+    // (`delete_points_by_query`) stays a write.
+    const READ_WORDS: [&str; 14] = [
+        "get", "list", "search", "fetch", "count", "query", "find", "autocomplete", "suggest",
+        "recommend", "retrieve", "lookup", "filter", "filters",
+    ];
+    const WRITE_WORDS: [&str; 22] = [
+        "create", "update", "delete", "remove", "add", "set", "put", "post", "upsert", "insert",
+        "patch", "edit", "clear", "move", "upload", "send", "trigger", "cancel", "reset", "revoke",
+        "invite", "import",
+    ];
+    let words = |name: &str| -> Vec<String> {
+        name.split(['_', '-'])
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let named_read = |name: &str| {
+        let words = words(name);
+        words.iter().any(|word| READ_WORDS.contains(&word.as_str()))
+            && !words.iter().any(|word| WRITE_WORDS.contains(&word.as_str()))
+    };
+    let last_literal = route
+        .path
+        .split('/')
+        .rfind(|segment| !segment.is_empty() && !is_dynamic_segment(segment));
+    let read = match route.handler.as_deref() {
+        // The handler's name is the better witness when it names a verb.
+        Some(handler) if words(handler).iter().any(|word| {
+            READ_WORDS.contains(&word.as_str()) || WRITE_WORDS.contains(&word.as_str())
+        }) =>
+        {
+            named_read(handler)
+        }
+        _ => last_literal.is_some_and(named_read),
+    };
+    if read { MethodClass::Read } else { class }
 }
 
 pub(crate) fn route_identity(route: &Route) -> (&str, &str, &str, Option<&str>) {
