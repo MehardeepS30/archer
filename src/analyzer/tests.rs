@@ -4510,3 +4510,39 @@ fn f40_tenant_comparisons_and_membership_helpers_are_object_level_checks() {
         [finding(MissingAuthorization, "DELETE", "/api/projects/{project_id}")]
     );
 }
+
+#[test]
+fn f42_resource_method_shorthand_path_arrays_and_forwarding_configure_closures() {
+    let report = drift_fixture(
+        "f42",
+        include_str!("../../tests/fixtures/probes/drift/f42_resource_shorthand.rs"),
+    );
+    let mut routes: Vec<String> = report
+        .routes
+        .iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect();
+    routes.sort();
+    // Each route once: `.configure(|c| f(c))` expands `f` a single time, and
+    // `map.get(..)` is not a route.
+    assert_eq!(
+        routes,
+        [
+            "DELETE /api/users/{id}",
+            "GET /api/ping",
+            "GET /api/status",
+            "GET /api/users",
+            "GET /api/users/{id}",
+            "PATCH /api/users/{id}/restore",
+            "POST /api/auth/login",
+            "POST /api/users",
+            "PUT /api/users/{id}",
+        ]
+    );
+    assert_eq!(route_at(&report, "/api/users/{id}/restore").handler.as_deref(), Some("restore_user"));
+    assert!(has_evidence(route_at(&report, "/api/users"), AuthEvidenceKind::RoleCheck, "AdminUser"));
+    assert_eq!(
+        reported(&report),
+        [finding(MissingAuthorization, "PATCH", "/api/users/{id}/restore")]
+    );
+}

@@ -395,7 +395,11 @@ impl<'a> RouteVisitor<'a> {
 
     pub(crate) fn add_route(&mut self, node: &ExprMethodCall) {
         let name = node.method.to_string();
-        if name != "route" && name != "resource" && name != "to" {
+        // `web::resource("/path").get(handler)`: Resource's per-method
+        // shorthand for `.route(web::get().to(handler))`.
+        let shorthand =
+            ROUTE_METHOD_CONSTRUCTORS.contains(&name.as_str()) && node.args.len() == 1;
+        if name != "route" && name != "resource" && name != "to" && !shorthand {
             return;
         }
         // Builders held in variables are read as if written in place.
@@ -403,33 +407,36 @@ impl<'a> RouteVisitor<'a> {
         let node = resolved.as_ref().unwrap_or(node);
 
         // `cfg.route("/path", builder)` names its path; `web::resource("/path")
-        // .route(builder)` and `web::resource("/path").to(handler)` take it
-        // from the resource the chain starts from.
-        let path = if name == "to" {
-            self.resource_path(&node.receiver)
-        } else if name == "route" && node.args.len() == 2 {
-            self.path_argument(&node.args[0])
+        // .route(builder)`, `web::resource("/path").to(handler)` and
+        // `web::resource("/path").get(handler)` take it from the resource the
+        // chain starts from, one route per path of `web::resource(["/a", "/b"])`.
+        let paths = if name == "to" || shorthand || (name == "route" && node.args.len() != 2) {
+            self.resource_paths(&node.receiver)
         } else if name == "route" {
-            self.resource_path(&node.receiver)
+            self.path_argument(&node.args[0]).map(|path| vec![path])
         } else {
-            first_string_arg(&node.args).zip(first_string_arg_line(&node.args))
+            first_string_arg(&node.args)
+                .zip(first_string_arg_line(&node.args))
+                .map(|path| vec![path])
         };
-        let Some((path, path_line)) = path else {
+        // A shorthand's receiver must be a resource, so `map.get(key)` has
+        // no path and is not a route.
+        let Some(paths) = paths.filter(|paths| !paths.is_empty()) else {
             return;
         };
+        let handler_call = name == "to" || shorthand;
 
         let local_prefix = self.scope_prefix(&node.receiver);
         let prefix = join_paths(&self.scope_context, &local_prefix);
-        let path = join_paths(&prefix, &path);
         // A resource's own `.to(handler)` answers every method.
-        let target = if name == "to" {
+        let target = if handler_call {
             node.args
                 .first()
                 .map(|arg| handler_target(arg).unwrap_or(HandlerTarget::Other))
         } else {
             find_handler(&node.args)
         };
-        let closure = if name == "to" {
+        let closure = if handler_call {
             node.args.first().and_then(as_closure)
         } else {
             find_handler_closure(&node.args)
@@ -488,32 +495,36 @@ impl<'a> RouteVisitor<'a> {
 
         // `web::resource(p).guard(guard::Method(Method::GET)).to(h)`: the
         // resource's method guards decide what its handler answers.
-        let method = if name == "to" {
+        let method = if shorthand {
+            name.to_uppercase()
+        } else if name == "to" {
             resource_guard_method(&node.receiver).unwrap_or_else(|| "UNKNOWN".into())
         } else {
             extract_http_method(node)
         };
-        self.routes.push(Route {
-            method,
-            path,
-            scope_prefix: prefix,
-            handler,
-            handler_path: written,
-            handler_resolution,
-            authorization,
-            line: path_line,
-            file: self.file.clone(),
-            unverified,
-            requirement: Requirement::default(),
-            resource_keys: Vec::new(),
-            caller_use: Vec::new(),
-            origin: RouteOrigin {
-                position: span_position(node.method.span()),
-                attribute: None,
-                enclosing: self.enclosing,
-                definition: resolved_definition,
-            },
-        });
+        for (path, path_line) in paths {
+            self.routes.push(Route {
+                method: method.clone(),
+                path: join_paths(&prefix, &path),
+                scope_prefix: prefix.clone(),
+                handler: handler.clone(),
+                handler_path: written.clone(),
+                handler_resolution: handler_resolution.clone(),
+                authorization: authorization.clone(),
+                line: path_line,
+                file: self.file.clone(),
+                unverified: unverified.clone(),
+                requirement: Requirement::default(),
+                resource_keys: Vec::new(),
+                caller_use: Vec::new(),
+                origin: RouteOrigin {
+                    position: span_position(node.method.span()),
+                    attribute: None,
+                    enclosing: self.enclosing,
+                    definition: resolved_definition,
+                },
+            });
+        }
     }
 }
 
@@ -710,7 +721,11 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
                 if node.method == "service" {
                     self.add_registration(arg);
                 } else if let Some(definition) = self.named_definition(arg) {
+                    // `.configure(f)` or a closure that only forwards to it,
+                    // `.configure(|c| f(c))`: expanded once, here. Visiting
+                    // the closure's body would expand `f` a second time.
                     self.expand_configure(definition);
+                    continue;
                 } else if let Some(segments) = super::route_tables::configured_type(arg) {
                     self.table_mounts.push(super::route_tables::TableMount {
                         segments,
@@ -1418,20 +1433,21 @@ impl RouteVisitor<'_> {
             })
     }
 
-    /// The path and line of the `web::resource("/path")` call a builder chain
-    /// starts from, as in `web::resource("/path").wrap(X).route(...)`.
-    pub(crate) fn resource_path(&mut self, expr: &Expr) -> Option<(String, usize)> {
+    /// The paths and lines of the `web::resource(..)` call a builder chain
+    /// starts from, as in `web::resource("/path").wrap(X).route(...)`. A
+    /// resource may answer several paths: `web::resource(["/a", "/b"])`.
+    pub(crate) fn resource_paths(&mut self, expr: &Expr) -> Option<Vec<(String, usize)>> {
         match expr {
-            Expr::MethodCall(method) => self.resource_path(&method.receiver),
-            Expr::Paren(paren) => self.resource_path(&paren.expr),
-            Expr::Group(group) => self.resource_path(&group.expr),
+            Expr::MethodCall(method) => self.resource_paths(&method.receiver),
+            Expr::Paren(paren) => self.resource_paths(&paren.expr),
+            Expr::Group(group) => self.resource_paths(&group.expr),
             Expr::Path(path) => {
                 let builder = path
                     .path
                     .get_ident()
                     .and_then(|name| self.builder_binding(&name.to_string()))
                     .map(|(_, builder)| builder.clone())?;
-                self.resource_path(&builder)
+                self.resource_paths(&builder)
             }
             Expr::Call(call)
                 if matches!(
@@ -1440,7 +1456,31 @@ impl RouteVisitor<'_> {
                         if path.path.segments.last().is_some_and(|segment| segment.ident == "resource")
                 ) =>
             {
-                self.path_argument(call.args.first()?)
+                let mut argument = call.args.first()?;
+                // `["/a", "/b"]`, `&["/a", "/b"]`, `vec!["/a", "/b"]`.
+                while let Expr::Reference(reference) = argument {
+                    argument = &reference.expr;
+                }
+                let elements: Option<Vec<Expr>> = match argument {
+                    Expr::Array(array) => Some(array.elems.iter().cloned().collect()),
+                    Expr::Macro(mac) if mac.mac.path.is_ident("vec") => mac
+                        .mac
+                        .parse_body_with(
+                            syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated,
+                        )
+                        .ok()
+                        .map(|elements| elements.into_iter().collect()),
+                    _ => None,
+                };
+                match elements {
+                    Some(elements) => Some(
+                        elements
+                            .iter()
+                            .filter_map(|element| self.path_argument(element))
+                            .collect(),
+                    ),
+                    None => self.path_argument(argument).map(|path| vec![path]),
+                }
             }
             _ => None,
         }
