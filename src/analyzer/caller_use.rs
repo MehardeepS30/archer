@@ -24,6 +24,8 @@
 //!   their scheme to a wrapper do;
 //! - `acts:T`: it makes a deciding call with the caller that is not a check
 //!   (`update_profile(&auth.profile)?;`);
+//! - `auths:f()`: it calls `f`, a function that yields the caller, whether
+//!   or not it keeps the result;
 //! - `compares:T`: it compares a value derived from the parameter with a
 //!   value that is not (a record's owner field, an id from the path).
 
@@ -96,6 +98,7 @@ pub(crate) fn caller_use<'f>(
     routes: &[Route],
 ) -> Vec<Vec<String>> {
     let shapes = return_shapes(files);
+    let sources = std::rc::Rc::new(identity_sources(index, routes));
     // A deciding call counts as a check only when the function it calls
     // returns a verdict: `bool`, or a `Result`/`Option` of `()`. A call
     // whose value is thrown away after `?` but that returns data
@@ -120,7 +123,7 @@ pub(crate) fn caller_use<'f>(
         analyzed
             .entry((definition, bound.to_vec()))
             .or_insert_with(|| {
-                let mut analysis = analyze_function(index.items[definition], bound);
+                let mut analysis = analyze_function(index.items[definition], bound, &sources);
                 for candidate in std::mem::take(&mut analysis.checks) {
                     if is_check(definition, &candidate) {
                         analysis.features.insert(candidate.feature);
@@ -183,7 +186,9 @@ pub(crate) fn caller_use<'f>(
                         .features
                         .iter()
                         .filter(|feature| {
-                            !feature.starts_with("takes:") && !feature.starts_with("scheme:")
+                            !feature.starts_with("takes:")
+                                && !feature.starts_with("scheme:")
+                                && !feature.starts_with("auths:")
                         })
                         .cloned(),
                 );
@@ -225,8 +230,15 @@ struct Analysis {
 
 /// One function's features, with `bound` naming parameters (by position)
 /// that hold the caller's identity whatever their type.
-fn analyze_function(item: &ItemFn, bound: &[(usize, String)]) -> Analysis {
-    let mut visitor = CallerUseVisitor::default();
+fn analyze_function(
+    item: &ItemFn,
+    bound: &[(usize, String)],
+    sources: &std::rc::Rc<HashSet<String>>,
+) -> Analysis {
+    let mut visitor = CallerUseVisitor {
+        sources: sources.clone(),
+        ..CallerUseVisitor::default()
+    };
     for (position, input) in item.sig.inputs.iter().enumerate() {
         let FnArg::Typed(typed) = input else {
             continue;
@@ -253,6 +265,8 @@ struct CallerUseVisitor {
     features: BTreeSet<String>,
     checks: Vec<CheckCandidate>,
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
+    /// Functions whose returned value is the caller (see `identity_sources`).
+    sources: std::rc::Rc<HashSet<String>>,
 }
 
 impl CallerUseVisitor {
@@ -262,6 +276,23 @@ impl CallerUseVisitor {
         }
         let label = type_label(ty);
         if self.bind_names(pattern, &label) {
+            self.features.insert(format!("takes:{label}"));
+        }
+    }
+
+    /// `Ok(session)` or `Some(user)` matched against an identity value binds
+    /// the caller; `Err(e)` does not.
+    fn bind_success(&mut self, pattern: &Pat, label: &str) {
+        let success = match pattern {
+            Pat::TupleStruct(tuple) => tuple
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Ok" || segment.ident == "Some"),
+            Pat::Ident(_) => true,
+            _ => false,
+        };
+        if success && self.bind_names(pattern, label) && label.ends_with("()") {
             self.features.insert(format!("takes:{label}"));
         }
     }
@@ -291,7 +322,15 @@ impl CallerUseVisitor {
                 self.bindings.get(&ident.to_string()).cloned()
             }
             Expr::Field(field) => self.derived(&field.base),
-            Expr::MethodCall(call) => self.derived(&call.receiver),
+            Expr::MethodCall(call) => {
+                let method = call.method.to_string();
+                if self.sources.contains(&method) {
+                    return Some(format!("{method}()"));
+                }
+                self.derived(&call.receiver)
+            }
+            // `match authorize_session(&req) { Ok(session) => session.id(), .. }`
+            Expr::Match(matched) => self.derived(&matched.expr),
             Expr::Reference(reference) => self.derived(&reference.expr),
             Expr::Paren(paren) => self.derived(&paren.expr),
             Expr::Group(group) => self.derived(&group.expr),
@@ -306,6 +345,10 @@ impl CallerUseVisitor {
                     }) =>
                 {
                     call.args.iter().find_map(|argument| self.derived(argument))
+                }
+                Expr::Path(path) => {
+                    let name = path.path.segments.last()?.ident.to_string();
+                    self.sources.contains(&name).then(|| format!("{name}()"))
                 }
                 _ => None,
             },
@@ -472,13 +515,36 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         {
             let mut names = HashSet::new();
             super::routes::pattern_bindings(&node.pat, &mut names);
+            let mut bound = false;
             for name in names {
                 if !name.starts_with('_') {
                     self.bindings.entry(name).or_insert_with(|| label.clone());
+                    bound = true;
                 }
+            }
+            // `let user = get_current_user(&req)?`: the handler takes the
+            // caller from a call rather than an extractor.
+            if bound && label.ends_with("()") {
+                self.features.insert(format!("takes:{label}"));
             }
         }
         visit::visit_local(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if let Some(label) = self.derived(&node.expr) {
+            for arm in &node.arms {
+                self.bind_success(&arm.pat, &label);
+            }
+        }
+        visit::visit_expr_match(self, node);
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        if let Some(label) = self.derived(&node.expr) {
+            self.bind_success(&node.pat, &label);
+        }
+        visit::visit_expr_let(self, node);
     }
 
     fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
@@ -489,6 +555,21 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        // A call that yields the caller, made with no requirement beyond
+        // the request (`authorize_session(&req, None, None)`). One that
+        // names a requirement (`Some(&origin), Some(Maintainer)`) is a check
+        // in itself and counts as the route's own means.
+        if let Expr::Path(path) = &*node.func
+            && let Some(last) = path.path.segments.last()
+            && self.sources.contains(&last.ident.to_string())
+            && node
+                .args
+                .iter()
+                .skip(1)
+                .all(|argument| matches!(argument, Expr::Path(path) if path.path.is_ident("None")))
+        {
+            self.features.insert(format!("auths:{}()", last.ident));
+        }
         let bound: Vec<(usize, String)> = node
             .args
             .iter()
@@ -669,4 +750,75 @@ fn return_shapes<'f>(files: impl IntoIterator<Item = &'f syn::File>) -> HashMap<
         shapes.visit_file(file);
     }
     shapes.0
+}
+
+/// Functions that hand the caller back: they take the request and return a
+/// value rather than a verdict, and either establish who the caller is
+/// (their evidence reaches identity) or are named for it
+/// (`authorize_session(&req, ..) -> Result<Session>`,
+/// `get_user_from_request(&req) -> Result<String>`). The value they return
+/// is treated like an identity extractor's. Route handlers are excluded:
+/// their evidence comes from what they call.
+fn identity_sources(index: &HandlerIndex, routes: &[Route]) -> HashSet<String> {
+    let handlers: HashSet<usize> = routes
+        .iter()
+        .filter_map(|route| route.origin.definition)
+        .collect();
+    index
+        .definitions
+        .iter()
+        .zip(&index.items)
+        .enumerate()
+        .filter(|(position, (definition, item))| {
+            !handlers.contains(position)
+                && matches!(item.sig.output, syn::ReturnType::Type(..))
+                && !returns_verdict(&item.sig.output)
+                && item
+                    .sig
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input, FnArg::Typed(typed) if takes_request(&typed.ty)))
+                && (names_caller(&definition.name)
+                    || definition.evidence.iter().any(|evidence| {
+                        !matches!(
+                            evidence.kind,
+                            super::model::AuthEvidenceKind::Delegated
+                                | super::model::AuthEvidenceKind::Unknown
+                        ) && super::model::EvidenceTier::of(&evidence.kind)
+                            >= super::model::EvidenceTier::Identity
+                    }))
+        })
+        .map(|(_, (definition, _))| definition.name.clone())
+        .collect()
+}
+
+/// `HttpRequest`, `&HttpRequest`, `ServiceRequest`.
+fn takes_request(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => takes_request(&reference.elem),
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "HttpRequest" || segment.ident == "ServiceRequest"
+        }),
+        _ => false,
+    }
+}
+
+/// A function name that says it yields the caller: `authorize_session`,
+/// `get_current_user`, `extract_claims`, `principal_from_req`.
+fn names_caller(name: &str) -> bool {
+    names_authentication(name)
+        || name.split('_').any(|word| {
+            [
+                "session",
+                "user",
+                "principal",
+                "claims",
+                "identity",
+                "authorize",
+                "authorization",
+                "caller",
+                "account",
+            ]
+            .contains(&word)
+        })
 }

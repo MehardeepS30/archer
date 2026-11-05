@@ -53,17 +53,22 @@ struct Features {
     takes: BTreeSet<String>,
     uses: BTreeSet<String>,
     schemes: BTreeSet<String>,
+    /// Calls that yield the caller (`authorize_session()`), bound or not.
+    auths: BTreeSet<String>,
 }
 
 fn features(route: &Route) -> Features {
     let mut takes = BTreeSet::new();
     let mut uses = BTreeSet::new();
     let mut schemes = BTreeSet::new();
+    let mut auths = BTreeSet::new();
     for feature in &route.caller_use {
         if let Some(label) = feature.strip_prefix("takes:") {
             takes.insert(label.to_string());
         } else if let Some(name) = feature.strip_prefix("scheme:") {
             schemes.insert(name.to_string());
+        } else if let Some(call) = feature.strip_prefix("auths:") {
+            auths.insert(call.to_string());
         } else {
             uses.insert(compared(feature));
         }
@@ -72,6 +77,7 @@ fn features(route: &Route) -> Features {
         takes,
         uses,
         schemes,
+        auths,
     }
 }
 
@@ -434,6 +440,12 @@ pub(crate) fn skipped_peer_checks(
         // not taking the peers' identity type. An extractor of that very
         // type bound to `_` has.
         let own_identity = |label: &str| {
+            // It makes the peers' own identity call and throws the caller
+            // away (`Ok(_session) => ..`): the evidence that call carries
+            // is not a different means.
+            if own.auths.contains(label) {
+                return false;
+            }
             let base = label
                 .strip_prefix("Option<")
                 .and_then(|rest| rest.strip_suffix('>'))

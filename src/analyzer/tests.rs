@@ -4290,3 +4290,25 @@ fn peer_checks_use_verdict_calls_version_groups_and_open_schemes() {
     assert!(!bio.caller_use.iter().any(|feature| feature.starts_with("checks:")), "{:?}", bio.caller_use);
     assert!(bio.caller_use.contains(&"acts:LocalUserView".to_string()));
 }
+
+#[test]
+fn a_route_that_discards_the_caller_its_peers_get_from_a_call_is_reported() {
+    let report = drift_fixture(
+        "f35",
+        include_str!("../../tests/fixtures/probes/drift/f35_caller_from_call.rs"),
+    );
+    let update = report.routes.iter().find(|route| route.method == "PATCH").unwrap();
+    assert!(update.caller_use.contains(&"takes:authorize_session()".to_string()), "{:?}", update.caller_use);
+    let skipped: Vec<_> = report
+        .finding_details
+        .iter()
+        .filter(|finding| finding.category == FindingCategory::SkipsPeerCheck)
+        .map(|finding| (finding.suspicious_route.path.clone(), finding.severity))
+        .collect();
+    assert_eq!(
+        skipped,
+        [("/profile/license".to_string(), Severity::Medium)],
+        "{:#?}",
+        report.finding_details.iter().map(|finding| &finding.rationale).collect::<Vec<_>>()
+    );
+}
