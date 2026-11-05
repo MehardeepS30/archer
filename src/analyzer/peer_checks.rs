@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use super::{
     caller_use::UNKNOWN_TYPE,
     drift::{
-        is_authentication_route, is_well_known_public_route, link_strength, placement,
-        route_identity, unique_routes,
+        is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
+        placement, route_identity, unique_routes,
     },
+    evidence::camel_case_words,
     model::*,
     routes::has_unresolved_inner_segment as has_unresolved_segment,
 };
@@ -72,6 +73,144 @@ fn features(route: &Route) -> Features {
         uses,
         schemes,
     }
+}
+
+/// A scheme value whose name says it requires no credential: `NoAuth`,
+/// `PublicAuth`, `AnonymousAuth`.
+fn admits_anyone(scheme: &str) -> bool {
+    camel_case_words(scheme).iter().any(|word| {
+        [
+            "no",
+            "none",
+            "public",
+            "anonymous",
+            "anon",
+            "unauthenticated",
+        ]
+        .contains(&word.as_str())
+    })
+}
+
+/// The open-scheme check: every scheme the route names admits anyone, and at
+/// its narrowest group with enough scheme-naming peers, a dominant share of
+/// them names one credential scheme the route lacks.
+#[allow(clippy::too_many_arguments)]
+fn open_scheme(
+    route: &Route,
+    own: &Features,
+    levels: &[(String, Vec<usize>, usize)],
+    featured: &[Features],
+    eligible: &[&Route],
+    class: MethodClass,
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    if own.schemes.is_empty() || !own.schemes.iter().all(|scheme| admits_anyone(scheme)) {
+        return None;
+    }
+    for (scope, members, minimum) in levels {
+        let population: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&other| !featured[other].schemes.is_empty())
+            .collect();
+        if population.len() < *minimum {
+            continue;
+        }
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for &other in &population {
+            for scheme in &featured[other].schemes {
+                if !admits_anyone(scheme) {
+                    *counts.entry(scheme.as_str()).or_default() += 1;
+                }
+            }
+        }
+        let (scheme, count) = counts
+            .into_iter()
+            .max_by_key(|(name, count)| (*count, std::cmp::Reverse(*name)))?;
+        if (count as f64) / (population.len() as f64) + 1e-9 < CONSENSUS {
+            // The narrowest group with enough peers decides.
+            return None;
+        }
+        let having: Vec<usize> = population
+            .iter()
+            .copied()
+            .filter(|&other| featured[other].schemes.contains(scheme))
+            .collect();
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut group_routes: Vec<RouteReference> = vec![route.into()];
+        group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!(
+                "{class} routes under {scope} compared on the auth scheme they name"
+            ),
+            prefix: scope.clone(),
+            level: GroupLevel::Linked,
+            method_class: class,
+            routes: group_routes,
+        });
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!("{class} routes under {scope} authenticate with `{scheme}`."),
+            total_routes: population.len() + 1,
+            routes_with_authorization: having.len(),
+            routes_without_authorization: population.len() - having.len() + 1,
+            evidence_patterns: vec![format!("scheme:{scheme}")],
+            strength: AuthStrength::Medium,
+            expected_tier: None,
+            dominant_requirement: Some(format!("scheme:{scheme}")),
+        };
+        invariants.push(invariant.clone());
+        let named: Vec<String> = own
+            .schemes
+            .iter()
+            .map(|scheme| format!("`{scheme}`"))
+            .collect();
+        return Some(Finding {
+            peer_group_id: id,
+            category: FindingCategory::SkipsPeerCheck,
+            // An open scheme on a route whose code still expects a caller
+            // is a contradiction; on one that takes none it is often a
+            // public endpoint by design.
+            severity: if own.takes.is_empty() {
+                Severity::Low
+            } else {
+                Severity::Medium
+            },
+            rationale: format!(
+                "Uses {} where {} of {} {class} peers under {scope} use `{scheme}`; this route admits callers they would refuse. Dismiss if the difference is intended.",
+                named.join(", "),
+                having.len(),
+                population.len()
+            ),
+            invariant,
+            suspicious_route: route.into(),
+            suspicious_route_tier: route.best_tier(),
+            expected_tier: route.best_tier(),
+            suspicious_route_evidence: route.authorization.clone(),
+            authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+        });
+    }
+    None
+}
+
+/// The leading generic segments of a namespace, when they include a version:
+/// `/api/v4` for `/api/v4/multi_community`.
+fn version_prefix(namespace: &str) -> Option<String> {
+    let generic: Vec<&str> = namespace
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .take_while(|segment| is_generic_segment(segment))
+        .collect();
+    let versioned = generic.iter().any(|segment| {
+        segment.len() > 1
+            && segment.starts_with(['v', 'V'])
+            && segment[1..]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+    });
+    versioned.then(|| format!("/{}", generic.join("/")))
 }
 
 /// `/` and `/{_:.*}`: a root page or a fallback, not a peer of the API.
@@ -188,7 +327,38 @@ pub(crate) fn skipped_peer_checks(
                 .collect();
             levels.push((prefix, within, MIN_POPULATION));
         }
+        // The API version the route belongs to (`/api/v4`): scope trees
+        // skip generic prefixes, but a version is narrower than the whole
+        // application, which also pools other versions and mounts.
+        let version = version_prefix(&place.namespace);
+        if let Some(version) = version.filter(|version| version != &place.namespace) {
+            let within: Vec<usize> = peers
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    let namespace = &placed[other].namespace;
+                    namespace == &version || namespace.starts_with(&format!("{version}/"))
+                })
+                .collect();
+            levels.push((version, within, MIN_APP_POPULATION));
+        }
         levels.push((APPLICATION.to_string(), peers.clone(), MIN_APP_POPULATION));
+
+        // A route whose only auth schemes admit anyone (`NoAuth`) where its
+        // peers pass a credential scheme to the same wrapper.
+        if let Some(finding) = open_scheme(
+            route,
+            own,
+            &levels,
+            &featured,
+            &eligible,
+            place.class,
+            peer_groups,
+            invariants,
+        ) {
+            finding_details.push(finding);
+            continue;
+        }
 
         // Every feature some peer has, decided at its narrowest level.
         let mut decided: BTreeMap<String, (String, usize, Vec<usize>)> = BTreeMap::new();
@@ -213,7 +383,13 @@ pub(crate) fn skipped_peer_checks(
                 }
             } else {
                 for &other in &sharing {
-                    candidates.extend(featured[other].uses.iter().cloned());
+                    candidates.extend(
+                        featured[other]
+                            .uses
+                            .iter()
+                            .filter(|feature| !feature.starts_with("acts:"))
+                            .cloned(),
+                    );
                 }
             }
             for feature in candidates {
@@ -271,10 +447,11 @@ pub(crate) fn skipped_peer_checks(
                         && evidence.mechanism.contains(base))
             })
         };
-        let makes_checks = own
-            .uses
-            .iter()
-            .any(|feature| feature.starts_with("checks:") || feature.starts_with("compares:"));
+        let makes_checks = own.uses.iter().any(|feature| {
+            feature.starts_with("checks:")
+                || feature.starts_with("compares:")
+                || feature.starts_with("acts:")
+        });
         let mut skipped: Vec<(String, (String, usize, Vec<usize>))> = decided
             .into_iter()
             .filter(

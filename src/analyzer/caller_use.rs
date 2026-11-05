@@ -22,6 +22,8 @@
 //! - `scheme:Name`: it names an authentication scheme value
 //!   (`&auth::AdminApiAuth`, `auth::JWTAuth { .. }`), as handlers that pass
 //!   their scheme to a wrapper do;
+//! - `acts:T`: it makes a deciding call with the caller that is not a check
+//!   (`update_profile(&auth.profile)?;`);
 //! - `compares:T`: it compares a value derived from the parameter with a
 //!   value that is not (a record's owner field, an id from the path).
 
@@ -88,12 +90,53 @@ const PROBES: [&str; 7] = [
 /// passes it a value derived from one (`delete_evidence(state,
 /// auth.profile_id, ..)`), so a check made in a service function is the
 /// handler's check.
-pub(crate) fn caller_use(index: &HandlerIndex, routes: &[Route]) -> Vec<Vec<String>> {
+pub(crate) fn caller_use<'f>(
+    index: &HandlerIndex,
+    files: impl IntoIterator<Item = &'f syn::File>,
+    routes: &[Route],
+) -> Vec<Vec<String>> {
+    let shapes = return_shapes(files);
+    // A deciding call counts as a check only when the function it calls
+    // returns a verdict: `bool`, or a `Result`/`Option` of `()`. A call
+    // whose value is thrown away after `?` but that returns data
+    // (`update_profile(..)?;`) is a side effect, not a check. A call Archer
+    // cannot find stays a check.
+    let is_check = |caller: usize, candidate: &CheckCandidate| -> bool {
+        let definition = &index.definitions[caller];
+        if let Some(target) = &candidate.target
+            && let (Some(callee), resolution) =
+                index.resolve_handler_index(&definition.crate_key, &definition.module, target)
+            && !matches!(resolution, HandlerResolution::UniqueName)
+        {
+            return returns_verdict(&index.items[callee].sig.output);
+        }
+        match shapes.get(&candidate.name) {
+            Some(verdicts) if !verdicts.is_empty() => verdicts.iter().any(|verdict| *verdict),
+            _ => true,
+        }
+    };
     let mut analyzed: HashMap<(usize, Vec<(usize, String)>), Analysis> = HashMap::new();
     let mut analyze = |definition: usize, bound: &[(usize, String)]| -> Analysis {
         analyzed
             .entry((definition, bound.to_vec()))
-            .or_insert_with(|| analyze_function(index.items[definition], bound))
+            .or_insert_with(|| {
+                let mut analysis = analyze_function(index.items[definition], bound);
+                for candidate in std::mem::take(&mut analysis.checks) {
+                    if is_check(definition, &candidate) {
+                        analysis.features.insert(candidate.feature);
+                    } else if let Some(label) = candidate
+                        .feature
+                        .strip_prefix("checks:")
+                        .and_then(|rest| rest.rsplit_once(':'))
+                        .map(|(label, _)| label)
+                    {
+                        // Not a check, but the handler acts on the caller
+                        // deliberately; see `peer_checks`.
+                        analysis.features.insert(format!("acts:{label}"));
+                    }
+                }
+                analysis
+            })
             .clone()
     };
     let mut combined: HashMap<usize, Vec<String>> = HashMap::new();
@@ -161,9 +204,20 @@ pub(crate) fn caller_use(index: &HandlerIndex, routes: &[Route]) -> Vec<Vec<Stri
         .collect()
 }
 
+/// A call that decides something with the caller's identity, before Archer
+/// knows whether the called function returns a verdict.
+#[derive(Clone)]
+struct CheckCandidate {
+    target: Option<HandlerTarget>,
+    /// The function or method name, for lookup when the path does not resolve.
+    name: String,
+    feature: String,
+}
+
 #[derive(Clone, Default)]
 struct Analysis {
     features: BTreeSet<String>,
+    checks: Vec<CheckCandidate>,
     /// Calls by path that receive identity-derived arguments: the target,
     /// and each such argument's position and identity label.
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
@@ -187,23 +241,9 @@ fn analyze_function(item: &ItemFn, bound: &[(usize, String)]) -> Analysis {
     visitor.visit_block(&item.block);
     Analysis {
         features: visitor.features,
+        checks: visitor.checks,
         flows: visitor.flows,
     }
-}
-
-/// The features of one function: its own parameters and body, and closures
-/// written inside it (`server_wrap(.., |state, auth: AuthenticationData, ..| ..)`).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn function_features(item: &ItemFn) -> BTreeSet<String> {
-    analyze_function(item, &[]).features
-}
-
-/// The features of a closure written as a route handler.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn closure_features(closure: &ExprClosure) -> BTreeSet<String> {
-    let mut visitor = CallerUseVisitor::default();
-    visitor.visit_expr_closure(closure);
-    visitor.features
 }
 
 #[derive(Default)]
@@ -211,6 +251,7 @@ struct CallerUseVisitor {
     /// Names bound to an identity value, with the identity type's label.
     bindings: HashMap<String, String>,
     features: BTreeSet<String>,
+    checks: Vec<CheckCandidate>,
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
 }
 
@@ -312,7 +353,13 @@ impl CallerUseVisitor {
                 let Some(callee) = callee_name(&path.path) else {
                     return;
                 };
-                self.checks(&callee, call.args.iter());
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                self.checks(&callee, handler_target(&call.func), name, call.args.iter());
             }
             Expr::MethodCall(call) => {
                 let method = call.method.to_string();
@@ -323,20 +370,38 @@ impl CallerUseVisitor {
                 }
                 self.checks(
                     &method,
+                    None,
+                    method.clone(),
                     std::iter::once(&*call.receiver).chain(call.args.iter()),
                 );
             }
-            _ => {}
+            // `if !user.map(|u| u.local_user.admin).unwrap_or_default()`:
+            // a branch on the caller's own fields is a decision about it.
+            other => {
+                if let Some(label) = self.derived(other) {
+                    self.features.insert(format!("acts:{label}"));
+                }
+            }
         }
     }
 
-    fn checks<'e>(&mut self, callee: &str, arguments: impl Iterator<Item = &'e Expr>) {
+    fn checks<'e>(
+        &mut self,
+        callee: &str,
+        target: Option<HandlerTarget>,
+        name: String,
+        arguments: impl Iterator<Item = &'e Expr>,
+    ) {
         if TRANSPARENT_CALLS.contains(&callee) || PROBES.contains(&callee) {
             return;
         }
         for argument in arguments {
             if let Some(label) = self.derived(argument) {
-                self.features.insert(format!("checks:{label}:{callee}"));
+                self.checks.push(CheckCandidate {
+                    target: target.clone(),
+                    name: name.clone(),
+                    feature: format!("checks:{label}:{callee}"),
+                });
             }
         }
     }
@@ -534,4 +599,74 @@ fn type_label(ty: &Type) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Whether a function's return type is a verdict: `bool`, or a wrapper
+/// whose value is `()` (`Result<()>`, `LemmyResult<()>`, `Option<()>`).
+fn returns_verdict(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    verdict_type(ty)
+}
+
+fn verdict_type(ty: &Type) -> bool {
+    match ty {
+        Type::Paren(paren) => verdict_type(&paren.elem),
+        Type::Group(group) => verdict_type(&group.elem),
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident == "bool" {
+                return true;
+            }
+            match &segment.arguments {
+                PathArguments::AngleBracketed(arguments) => matches!(
+                    arguments.args.first(),
+                    Some(GenericArgument::Type(Type::Tuple(tuple))) if tuple.elems.is_empty()
+                ),
+                _ => false,
+            }
+        }
+        // `impl Future<Output = Result<()>>`.
+        Type::ImplTrait(bounds) => bounds.bounds.iter().any(|bound| match bound {
+            syn::TypeParamBound::Trait(trait_bound) => trait_bound
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| match &segment.arguments {
+                    PathArguments::AngleBracketed(arguments) => {
+                        arguments.args.iter().any(|argument| match argument {
+                            GenericArgument::AssocType(assoc) => verdict_type(&assoc.ty),
+                            _ => false,
+                        })
+                    }
+                    _ => false,
+                }),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// For every function and method name in the scanned files, whether each
+/// definition by that name returns a verdict.
+fn return_shapes<'f>(files: impl IntoIterator<Item = &'f syn::File>) -> HashMap<String, Vec<bool>> {
+    #[derive(Default)]
+    struct Shapes(HashMap<String, Vec<bool>>);
+    impl<'ast> Visit<'ast> for Shapes {
+        fn visit_signature(&mut self, node: &'ast syn::Signature) {
+            self.0
+                .entry(node.ident.to_string())
+                .or_default()
+                .push(returns_verdict(&node.output));
+            visit::visit_signature(self, node);
+        }
+    }
+    let mut shapes = Shapes::default();
+    for file in files {
+        shapes.visit_file(file);
+    }
+    shapes.0
 }

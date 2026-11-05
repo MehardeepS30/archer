@@ -4251,3 +4251,42 @@ fn routes_that_skip_the_check_their_peers_make_with_the_caller_are_reported() {
     let patch = report.routes.iter().find(|route| route.method == "PATCH").unwrap();
     assert_eq!(patch.handler.as_deref(), Some("update_evidence"));
 }
+
+#[test]
+fn peer_checks_use_verdict_calls_version_groups_and_open_schemes() {
+    let report = drift_fixture(
+        "f34",
+        include_str!("../../tests/fixtures/probes/drift/f34_verdicts_versions_schemes.rs"),
+    );
+    let skipped: Vec<_> = report
+        .finding_details
+        .iter()
+        .filter(|finding| finding.category == FindingCategory::SkipsPeerCheck)
+        .map(|finding| {
+            (
+                format!("{} {}", finding.suspicious_route.method, finding.suspicious_route.path),
+                finding.severity,
+            )
+        })
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            ("GET /api/v2/multi".to_string(), Severity::Medium),
+            ("POST /reports/export".to_string(), Severity::Medium),
+            ("POST /reports/schema".to_string(), Severity::Low),
+        ],
+        "{:#?}",
+        report.finding_details.iter().map(|finding| &finding.rationale).collect::<Vec<_>>()
+    );
+    let multi = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/api/v2/multi")
+        .unwrap();
+    assert!(multi.rationale.contains("6 of 6 under /api/v2"), "{}", multi.rationale);
+    // A call that returns data is not a check, even with `?`.
+    let bio = report.routes.iter().find(|route| route.path == "/profile/bio").unwrap();
+    assert!(!bio.caller_use.iter().any(|feature| feature.starts_with("checks:")), "{:?}", bio.caller_use);
+    assert!(bio.caller_use.contains(&"acts:LocalUserView".to_string()));
+}

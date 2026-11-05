@@ -200,7 +200,11 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     for (route, keys) in routes.iter_mut().zip(keys) {
         route.resource_keys = keys;
     }
-    let uses = caller_use::caller_use(&index, &routes);
+    let uses = caller_use::caller_use(
+        &index,
+        parsed_files.iter().map(|(_, _, syntax)| syntax),
+        &routes,
+    );
     for (route, uses) in routes.iter_mut().zip(uses) {
         route.caller_use = uses;
     }
