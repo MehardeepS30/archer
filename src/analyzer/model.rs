@@ -362,6 +362,26 @@ pub enum FindingCategory {
     SkipsPeerCheck,
 }
 
+impl FindingCategory {
+    pub const ALL: [Self; 8] = [
+        Self::MissingAuthentication,
+        Self::MissingAuthorization,
+        Self::WeakerAuthorization,
+        Self::DifferentAuthorization,
+        Self::UnverifiedProtection,
+        Self::InconsistentRegistration,
+        Self::SameResourceWeakerProtection,
+        Self::SkipsPeerCheck,
+    ];
+
+    /// The category the JSON report names `name`, ignoring case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| format!("{category:?}").eq_ignore_ascii_case(name))
+    }
+}
+
 impl std::fmt::Display for FindingCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -499,6 +519,8 @@ pub struct AnalysisOptions {
     /// Minimum share of a group's routes that must be authorized, in (0, 1],
     /// before its unauthorized routes are reported.
     pub dominance_threshold: f64,
+    /// `archer.toml` to read instead of the one at the repository root.
+    pub config_file: Option<std::path::PathBuf>,
 }
 
 impl AnalysisOptions {
@@ -516,6 +538,7 @@ impl Default for AnalysisOptions {
             include_tests: false,
             min_support: Self::DEFAULT_MIN_SUPPORT,
             dominance_threshold: Self::DEFAULT_DOMINANCE_THRESHOLD,
+            config_file: None,
         }
     }
 }
@@ -535,6 +558,8 @@ pub enum UnjudgedReason {
     PeersUnprotected,
     /// Its peers disagree: no protection reaches the support threshold.
     BelowSupport,
+    /// An `archer.toml` public rule declares it public by design.
+    DeclaredPublic,
 }
 
 impl std::fmt::Display for UnjudgedReason {
@@ -546,6 +571,7 @@ impl std::fmt::Display for UnjudgedReason {
             Self::NoPeers => "no peers",
             Self::PeersUnprotected => "peers carry no protection",
             Self::BelowSupport => "peers below the support threshold",
+            Self::DeclaredPublic => "declared public in archer.toml",
         })
     }
 }
@@ -593,6 +619,12 @@ pub struct Report {
     pub finding_details: Vec<Finding>,
     /// Routes no comparison judged, with the reason for each.
     pub unjudged: Vec<UnjudgedRoute>,
+    /// The `archer.toml` applied, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<std::path::PathBuf>,
+    /// Findings an `archer.toml` dismiss rule accepted, with its reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dismissed: Vec<super::config::DismissedFinding>,
 }
 
 /// How much of the repository's request handling Archer's routes cover. A

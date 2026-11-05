@@ -330,6 +330,7 @@ pub(crate) fn build_analysis_layers_full(
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    per_route_permissions(routes, &mut finding_details);
     // A route its groups could not judge falls back to the routes linked to
     // it by data; if those judged it, it is not left unjudged.
     let reported: HashSet<_> = finding_details
@@ -352,6 +353,49 @@ pub(crate) fn build_analysis_layers_full(
     }
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings, unjudged)
+}
+
+/// Fewest distinct permissions a mechanism must name across the application,
+/// and the largest number of routes per permission, before it is read as
+/// assigning one permission per operation.
+const PER_ROUTE_PERMISSIONS: usize = 5;
+const ROUTES_PER_PERMISSION: f64 = 3.0;
+
+/// Lowers a different-requirement finding to Low when the application gives
+/// each operation its own permission through the same mechanism
+/// (`ActionPolicy<{ actions::DOCUMENTS_DELETE }>` next to `DOCUMENTS_ADD`):
+/// there, a route naming another permission than its peers is the design,
+/// and the permissions cannot be ranked against each other.
+fn per_route_permissions(routes: &[Route], findings: &mut [Finding]) {
+    let mut named: HashMap<&str, (HashSet<&str>, HashSet<(&str, &str)>)> = HashMap::new();
+    for route in routes {
+        for evidence in &route.authorization {
+            if evidence.kind != AuthEvidenceKind::PermissionCheck || evidence.requirements.is_empty() {
+                continue;
+            }
+            let (permissions, users) = named.entry(evidence.mechanism.as_str()).or_default();
+            permissions.extend(evidence.requirements.iter().map(String::as_str));
+            users.insert((route.method.as_str(), route.path.as_str()));
+        }
+    }
+    for finding in findings {
+        if finding.category != FindingCategory::DifferentAuthorization {
+            continue;
+        }
+        let scheme = finding.suspicious_route_evidence.iter().find_map(|evidence| {
+            let (permissions, users) = named.get(evidence.mechanism.as_str())?;
+            (evidence.kind == AuthEvidenceKind::PermissionCheck
+                && permissions.len() >= PER_ROUTE_PERMISSIONS
+                && users.len() as f64 <= permissions.len() as f64 * ROUTES_PER_PERMISSION)
+                .then(|| (evidence.mechanism.clone(), permissions.len(), users.len()))
+        });
+        if let Some((mechanism, permissions, users)) = scheme {
+            finding.severity = Severity::Low;
+            finding.rationale.push_str(&format!(
+                " `{mechanism}` names {permissions} different permissions across {users} routes, so permissions look assigned per operation; check that this one is the intended permission."
+            ));
+        }
+    }
 }
 
 /// One handler definition registered for the same method at several paths,

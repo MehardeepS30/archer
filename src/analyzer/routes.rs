@@ -71,6 +71,9 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) expanding: Vec<usize>,
     /// Builder variables being read in place, innermost last.
     pub(crate) expanding_builders: Vec<String>,
+    /// `.configure(<T as _>::configure)` calls naming a type, which may be a
+    /// declared route table.
+    pub(crate) table_mounts: Vec<super::route_tables::TableMount>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -105,6 +108,7 @@ impl<'a> RouteVisitor<'a> {
             enclosing: None,
             expanding: Vec::new(),
             expanding_builders: Vec::new(),
+            table_mounts: Vec::new(),
         }
     }
 
@@ -707,6 +711,15 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
                     self.add_registration(arg);
                 } else if let Some(definition) = self.named_definition(arg) {
                     self.expand_configure(definition);
+                } else if let Some(segments) = super::route_tables::configured_type(arg) {
+                    self.table_mounts.push(super::route_tables::TableMount {
+                        segments,
+                        crate_key: self.crate_key.clone(),
+                        module: self.module.clone(),
+                        prefix: self.scope_context.clone(),
+                        inherited: self.inherited_evidence(),
+                        enclosing: self.enclosing,
+                    });
                 }
                 self.visit_expr(arg);
             }

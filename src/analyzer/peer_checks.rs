@@ -55,6 +55,19 @@ struct Features {
     schemes: BTreeSet<String>,
     /// Calls that yield the caller (`authorize_session()`), bound or not.
     auths: BTreeSet<String>,
+    /// Identity sources the route calls.
+    calls: BTreeSet<String>,
+    /// Requirement arguments it passes them, as `f#i`, with what it passes.
+    requires: BTreeMap<String, String>,
+}
+
+impl Features {
+    /// It checks the caller by its own call or comparison.
+    fn checks_itself(&self) -> bool {
+        self.uses
+            .iter()
+            .any(|feature| feature.starts_with("checks:") || feature.starts_with("compares:"))
+    }
 }
 
 fn features(route: &Route) -> Features {
@@ -62,6 +75,8 @@ fn features(route: &Route) -> Features {
     let mut uses = BTreeSet::new();
     let mut schemes = BTreeSet::new();
     let mut auths = BTreeSet::new();
+    let mut calls = BTreeSet::new();
+    let mut requires = BTreeMap::new();
     for feature in &route.caller_use {
         if let Some(label) = feature.strip_prefix("takes:") {
             takes.insert(label.to_string());
@@ -69,6 +84,14 @@ fn features(route: &Route) -> Features {
             schemes.insert(name.to_string());
         } else if let Some(call) = feature.strip_prefix("auths:") {
             auths.insert(call.to_string());
+        } else if let Some(source) = feature.strip_prefix("calls:") {
+            calls.insert(source.to_string());
+        } else if let Some(rest) = feature.strip_prefix("requires:") {
+            if let Some((key, written)) = rest.split_once(':') {
+                requires
+                    .entry(key.to_string())
+                    .or_insert_with(|| written.to_string());
+            }
         } else {
             uses.insert(compared(feature));
         }
@@ -78,7 +101,55 @@ fn features(route: &Route) -> Features {
         uses,
         schemes,
         auths,
+        calls,
+        requires,
     }
+}
+
+/// A requirement argument that names a fixed requirement, a variant,
+/// constant, or literal (`Some(OriginMemberRole::Maintainer)`, `"admin"`),
+/// not a value from the request (`Some(&origin)`), which scopes the call to
+/// the route's own data and is not comparable across routes.
+fn is_constant_requirement(written: &str) -> bool {
+    let mut value = written;
+    while let Some(inner) = value
+        .strip_prefix("Some(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        value = inner;
+    }
+    let value = value.trim_start_matches('&');
+    if value.starts_with('"') || value.parse::<f64>().is_ok() || value == "true" || value == "false" {
+        return true;
+    }
+    let segments: Vec<&str> = value.split("::").collect();
+    let simple = segments.iter().all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+    });
+    let last = segments.last().copied().unwrap_or_default();
+    simple
+        && (last.chars().all(|character| character.is_ascii_uppercase() || character == '_' || character.is_ascii_digit())
+            || (segments.len() >= 2 && last.starts_with(|character: char| character.is_ascii_uppercase())))
+}
+
+/// Names of a path's parameters: `origin` and `id` for `/o/{origin}/x/{id:\\d+}`.
+fn path_parameters(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+        .map(|inner| inner.split(':').next().unwrap_or(inner).to_string())
+        .collect()
+}
+
+/// Lowercase identifiers in written code: `origin` in `Some(&origin)`.
+fn identifiers(written: &str) -> Vec<String> {
+    written
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|word| word.starts_with(|character: char| character.is_ascii_lowercase()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// A scheme value whose name says it requires no credential: `NoAuth`,
@@ -197,6 +268,165 @@ fn open_scheme(
             suspicious_route_evidence: route.authorization.clone(),
             authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
         });
+    }
+    None
+}
+
+/// The requirement check: the route calls an identity source
+/// (`authorize_session`) without an argument that, at its narrowest group
+/// with enough peers calling the same source, a dominant share of them
+/// pass (`Some(OriginMemberRole::Maintainer)`). Such an argument is the
+/// requirement the source enforces; leaving it `None` admits any caller.
+#[allow(clippy::too_many_arguments)]
+fn missing_requirement(
+    route: &Route,
+    own: &Features,
+    levels: &[(String, Vec<usize>, usize)],
+    featured: &[Features],
+    eligible: &[&Route],
+    class: MethodClass,
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    for source in &own.calls {
+        for (scope, members, minimum) in levels {
+            let prefix = format!("{source}#");
+            // Peers whose call is scoped to request data (`Some(&origin)`)
+            // compare only when this route has that data in its path: a
+            // role in an origin means nothing to a route with no origin.
+            let parameters = path_parameters(&route.path);
+            let population: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&other| featured[other].calls.contains(source))
+                .filter(|&other| {
+                    featured[other]
+                        .requires
+                        .iter()
+                        .filter(|(key, written)| key.starts_with(&prefix) && !is_constant_requirement(written))
+                        .all(|(_, written)| {
+                            identifiers(written).iter().any(|name| parameters.contains(name))
+                        })
+                })
+                .collect();
+            if population.len() < *minimum {
+                continue;
+            }
+            let positions: BTreeSet<&String> = population
+                .iter()
+                .flat_map(|&other| featured[other].requires.iter())
+                .filter(|(key, written)| key.starts_with(&prefix) && is_constant_requirement(written))
+                .map(|(key, _)| key)
+                .collect();
+            let mut missing: Vec<(&String, Vec<usize>, usize)> = positions
+                .into_iter()
+                .filter(|key| !own.requires.contains_key(*key))
+                .map(|key| {
+                    let passes = |other: usize| {
+                        featured[other]
+                            .requires
+                            .get(key)
+                            .is_some_and(|written| is_constant_requirement(written))
+                    };
+                    // A peer that omits the requirement but checks the
+                    // caller itself (`if session.id() != owner`) is not a
+                    // counterexample: it authorizes by other means.
+                    let population: Vec<usize> = population
+                        .iter()
+                        .copied()
+                        .filter(|&other| passes(other) || !featured[other].checks_itself())
+                        .collect();
+                    let having: Vec<usize> = population
+                        .iter()
+                        .copied()
+                        .filter(|&other| passes(other))
+                        .collect();
+                    (key, having, population.len())
+                })
+                .filter(|(_, _, total)| *total >= *minimum)
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            // The narrowest group with enough callers decides.
+            missing.retain(|(_, having, total)| {
+                having.len() as f64 / *total as f64 + 1e-9 >= CONSENSUS
+            });
+            if missing.is_empty() {
+                break;
+            }
+            missing.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+            let (key, having, total) = &missing[0];
+            let position: usize = key[prefix.len()..].parse().unwrap_or(0);
+            let mut examples: Vec<&str> = having
+                .iter()
+                .filter_map(|&other| featured[other].requires.get(*key).map(String::as_str))
+                .collect();
+            examples.sort_unstable();
+            examples.dedup();
+            let shown: Vec<String> = examples
+                .iter()
+                .take(NAMED)
+                .map(|example| format!("`{example}`"))
+                .collect();
+            let scoped = own
+                .requires
+                .iter()
+                .any(|(key, written)| key.starts_with(&prefix) && !is_constant_requirement(written));
+            let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+            let mut group_routes: Vec<RouteReference> = vec![route.into()];
+            group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+            peer_groups.push(PeerGroup {
+                id: id.clone(),
+                description: format!(
+                    "{class} routes under {scope} compared on what they pass `{source}`"
+                ),
+                prefix: scope.clone(),
+                level: GroupLevel::Linked,
+                method_class: class,
+                routes: group_routes,
+            });
+            let invariant = AuthorizationInvariant {
+                peer_group_id: id.clone(),
+                description: format!(
+                    "{class} routes under {scope} that call `{source}` pass it a requirement as argument {}.",
+                    position + 1
+                ),
+                total_routes: total + 1,
+                routes_with_authorization: having.len(),
+                routes_without_authorization: total - having.len() + 1,
+                evidence_patterns: vec![format!("requires:{key}")],
+                strength: AuthStrength::Medium,
+                expected_tier: None,
+                dominant_requirement: Some(format!("requires:{key}")),
+            };
+            invariants.push(invariant.clone());
+            return Some(Finding {
+                peer_group_id: id,
+                category: FindingCategory::SkipsPeerCheck,
+                // A call already scoped to the route's data (`Some(&origin),
+                // None`: any member) is a lighter requirement more often
+                // than a missing one.
+                severity: if scope == APPLICATION || scoped {
+                    Severity::Low
+                } else {
+                    Severity::Medium
+                },
+                rationale: format!(
+                    "Calls `{source}` with no requirement as argument {}, where {} of {} {class} peers under {scope} that call it pass one ({}). Dismiss if the difference is intended.",
+                    position + 1,
+                    having.len(),
+                    total,
+                    shown.join(", ")
+                ),
+                invariant,
+                suspicious_route: route.into(),
+                suspicious_route_tier: route.best_tier(),
+                expected_tier: route.best_tier(),
+                suspicious_route_evidence: route.authorization.clone(),
+                authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+            });
+        }
     }
     None
 }
@@ -362,6 +592,23 @@ pub(crate) fn skipped_peer_checks(
             peer_groups,
             invariants,
         ) {
+            finding_details.push(finding);
+            continue;
+        }
+        // A route that calls the peers' identity source without the
+        // requirement they pass it, and makes no check of its own.
+        if !own.checks_itself()
+            && let Some(finding) = missing_requirement(
+                route,
+                own,
+                &levels,
+                &featured,
+                &eligible,
+                place.class,
+                peer_groups,
+                invariants,
+            )
+        {
             finding_details.push(finding);
             continue;
         }

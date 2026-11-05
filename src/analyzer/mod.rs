@@ -1,6 +1,7 @@
 //! Repository analysis: file discovery, parsing, and the extraction and inference pipeline.
 
 mod caller_use;
+mod config;
 mod drift;
 mod evidence;
 mod handlers;
@@ -8,11 +9,13 @@ mod middleware;
 mod model;
 mod peer_checks;
 mod resources;
+mod route_tables;
 mod routes;
 #[cfg(test)]
 mod tests;
 
 pub use drift::format_finding;
+pub use config::{Config, DismissedFinding};
 pub use model::*;
 
 use anyhow::Result;
@@ -74,6 +77,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     if !root.exists() {
         anyhow::bail!("{} does not exist", root.display());
     }
+    let config = Config::load(root, options.config_file.as_deref())?;
     let mut files_scanned = 0;
     let mut parse_errors = Vec::new();
     let mut routes = Vec::new();
@@ -148,12 +152,14 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     let mut registrations = Vec::new();
     let mut warnings = Vec::new();
     let mut configured = Vec::new();
+    let mut table_mounts = Vec::new();
     for (_, file_path, syntax) in &parsed_files {
         let mut visitor = RouteVisitor::new(file_path.clone(), &index);
         visitor.visit_file(syntax);
         routes.extend(visitor.routes);
         registrations.extend(visitor.registrations);
         configured.extend(visitor.configured);
+        table_mounts.extend(visitor.table_mounts);
         warnings.extend(visitor.warnings);
     }
     // A scope's prefix is read once per route registered under it.
@@ -169,6 +175,21 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     };
     routes.retain(|route| outside_configured(route.origin.enclosing));
     registrations.retain(|registration| outside_configured(registration.enclosing));
+    table_mounts.retain(|mount| outside_configured(mount.enclosing));
+    let tables = route_tables::route_tables(
+        parsed_files
+            .iter()
+            .map(|(location, file_path, syntax)| (location, file_path.as_path(), syntax)),
+    );
+    let (table_routes, unmounted) = route_tables::table_routes(&index, &tables, &table_mounts);
+    routes.extend(table_routes);
+    if !unmounted.is_empty() {
+        warnings.push(format!(
+            "{} route table(s) are declared but never mounted with `.configure(..)` in code Archer could follow, so they are left out: {}",
+            unmounted.len(),
+            unmounted.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+        ));
+    }
     let (mut routes, unregistered) = apply_registrations(routes, &registrations);
     if !unregistered.is_empty() {
         warnings.push(format!(
@@ -209,8 +230,44 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         route.caller_use = uses;
     }
 
-    let (peer_groups, invariants, finding_details, findings, unjudged) =
-        build_analysis_layers_full(&routes, options);
+    // Routes declared public by design are left out of every comparison:
+    // they are not judged and do not count as anyone's peers.
+    let mut declared_public = Vec::new();
+    let judged_routes: Vec<Route> = routes
+        .iter()
+        .filter(|route| match config.public_rule(route) {
+            Some(rule) => {
+                declared_public.push(UnjudgedRoute::new(
+                    route,
+                    UnjudgedReason::DeclaredPublic,
+                    rule.reason.clone(),
+                ));
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    let (peer_groups, invariants, finding_details, _, mut unjudged) =
+        build_analysis_layers_full(&judged_routes, options);
+    unjudged.extend(declared_public);
+    let mut dismissed = Vec::new();
+    let finding_details: Vec<Finding> = finding_details
+        .into_iter()
+        .filter_map(|finding| match config.dismiss_rule(&finding) {
+            Some((rule, dismiss)) => {
+                dismissed.push(DismissedFinding {
+                    reason: dismiss.reason.clone(),
+                    rule,
+                    finding,
+                });
+                None
+            }
+            None => Some(finding),
+        })
+        .collect();
+    let findings: Vec<String> = finding_details.iter().map(format_finding).collect();
+    warnings.extend(config.unused_rules(&routes, &dismissed));
     if !unjudged.is_empty() {
         let mut counts: Vec<(UnjudgedReason, usize)> = Vec::new();
         for route in &unjudged {
@@ -271,6 +328,8 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         findings,
         finding_details,
         unjudged,
+        config: config.source.clone(),
+        dismissed,
     })
 }
 

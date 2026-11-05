@@ -532,6 +532,19 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 return;
             }
             if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                if let Some(requirements) = policy_requirements(arguments) {
+                    evidence.push(AuthEvidence {
+                        kind: AuthEvidenceKind::PermissionCheck,
+                        mechanism: name,
+                        symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                        file: file.to_path_buf(),
+                        line: ty.span().start().line,
+                        handler: Some(handler.into()),
+                        strength: AuthStrength::Medium,
+                        requirements,
+                    });
+                    return;
+                }
                 for argument in &arguments.args {
                     if let GenericArgument::Type(inner) = argument {
                         extractor_evidence(inner, file, handler, evidence);
@@ -548,6 +561,57 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
             }
         }
         _ => {}
+    }
+}
+
+/// The requirements of an extractor parameterized by a policy type,
+/// `GuardedData<ActionPolicy<{ actions::KEYS_GET }>, Data<..>>`: the
+/// extractor runs the policy before the handler, and the policy's own
+/// arguments name what it requires (`keys_get`). `None` when no type
+/// argument is a policy.
+fn policy_requirements(
+    arguments: &syn::AngleBracketedGenericArguments,
+) -> Option<Vec<String>> {
+    arguments.args.iter().find_map(|argument| {
+        let GenericArgument::Type(Type::Path(policy)) = argument else {
+            return None;
+        };
+        let last = policy.path.segments.last()?;
+        let words = camel_case_words(&last.ident.to_string());
+        if !words.iter().any(|word| word == "policy" || word == "policies") {
+            return None;
+        }
+        let mut requirements = Vec::new();
+        if let PathArguments::AngleBracketed(inner) = &last.arguments {
+            for argument in &inner.args {
+                let named = match argument {
+                    GenericArgument::Const(expr) => expr_name(expr),
+                    GenericArgument::Type(Type::Path(ty)) => {
+                        ty.path.segments.last().map(|segment| segment.ident.to_string())
+                    }
+                    _ => None,
+                };
+                requirements.extend(named.map(|name| name.to_ascii_lowercase()));
+            }
+        }
+        if requirements.is_empty() {
+            requirements = name_keys(&last.ident.to_string());
+        }
+        requirements.sort();
+        requirements.dedup();
+        Some(requirements)
+    })
+}
+
+/// The last path segment an expression names, through `{ .. }` blocks.
+fn expr_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) => path.path.segments.last().map(|segment| segment.ident.to_string()),
+        Expr::Block(block) => match block.block.stmts.as_slice() {
+            [syn::Stmt::Expr(inner, None)] => expr_name(inner),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

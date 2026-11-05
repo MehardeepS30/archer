@@ -37,6 +37,11 @@ struct Cli {
     #[arg(long, default_value_t = analyzer::AnalysisOptions::DEFAULT_DOMINANCE_THRESHOLD,
           value_parser = parse_threshold)]
     threshold: f64,
+
+    /// Reviewer decisions to apply (public routes, dismissed findings);
+    /// defaults to archer.toml at the repository root when it exists
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 fn parse_min_support(value: &str) -> Result<usize, String> {
@@ -76,6 +81,7 @@ fn run(cli: &Cli) -> Result<bool> {
         include_tests: cli.include_tests,
         min_support: cli.min_support,
         dominance_threshold: cli.threshold,
+        config_file: cli.config.clone(),
     };
     let report = analyzer::analyze_repository_with(&cli.path, &options)?;
 
@@ -145,6 +151,28 @@ fn run(cli: &Cli) -> Result<bool> {
         }
     } else {
         println!("\nNo prototype drift findings.");
+    }
+    if let Some(config) = &report.config {
+        let public = report
+            .unjudged
+            .iter()
+            .filter(|route| route.reason == analyzer::UnjudgedReason::DeclaredPublic)
+            .count();
+        println!(
+            "\n{}: {} route(s) declared public, {} finding(s) dismissed",
+            config.display(),
+            public,
+            report.dismissed.len()
+        );
+        for dismissed in &report.dismissed {
+            println!(
+                "  dismissed: {} {} ({}): {}",
+                dismissed.finding.suspicious_route.method,
+                dismissed.finding.suspicious_route.path,
+                dismissed.finding.category,
+                dismissed.reason
+            );
+        }
     }
 
     Ok(!report.finding_details.is_empty())

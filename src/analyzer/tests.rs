@@ -4312,3 +4312,115 @@ fn a_route_that_discards_the_caller_its_peers_get_from_a_call_is_reported() {
         report.finding_details.iter().map(|finding| &finding.rationale).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn routes_declared_in_mounted_route_tables_are_analyzed() {
+    let report = drift_fixture(
+        "f36",
+        include_str!("../../tests/fixtures/probes/drift/f36_route_tables.rs"),
+    );
+    let mut paths: Vec<String> = report
+        .routes
+        .iter()
+        .map(|route| format!("{} {}", route.method, route.path))
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "DELETE /api/indexes/{uid}",
+            "DELETE /api/keys/{key}",
+            "GET /api/health",
+            "GET /api/indexes",
+            "GET /api/indexes/{uid}",
+            "GET /api/indexes/{uid}/stats",
+            "GET /api/keys",
+            "GET /api/keys/{key}",
+            "PATCH /api/keys/{key}",
+            "POST /api/indexes",
+            "POST /api/keys",
+        ]
+    );
+    let list = report.routes.iter().find(|route| route.path == "/api/keys" && route.method == "GET").unwrap();
+    assert_eq!(list.requirement.roles, ["keys_get"]);
+    assert!(report.warnings.iter().any(|warning| warning.contains("CompactApi")), "{:?}", report.warnings);
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.method.clone(), finding.suspicious_route.path.clone(), finding.severity))
+        .collect();
+    assert!(found.contains(&("DELETE".into(), "/api/keys/{key}".into(), Severity::High)), "{found:#?}");
+    assert!(
+        found.contains(&("GET".into(), "/api/indexes/{uid}/stats".into(), Severity::Low))
+            && !found.iter().any(|(_, path, severity)| path == "/api/indexes/{uid}/stats" && *severity != Severity::Low),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn archer_toml_declares_public_routes_and_dismisses_reviewed_findings() {
+    let config = r#"
+[[public]]
+method = "GET"
+path = "/api/indexes/{id}/stats"
+reason = "stats are public"
+
+[[dismiss]]
+method = "delete"
+path = "/api/keys/*"
+category = "MissingAuthorization"
+reason = "delete_key checks the key store itself"
+
+[[dismiss]]
+path = "/api/gone"
+reason = "stale rule"
+"#;
+    let repo = TempRepo::new(
+        "f36-config",
+        &[
+            ("main.rs", include_str!("../../tests/fixtures/probes/drift/f36_route_tables.rs")),
+            ("archer.toml", config),
+        ],
+    );
+    let report = repo.analyze();
+    assert!(report.config.is_some());
+    assert!(report.finding_details.iter().all(|finding| finding.suspicious_route.path != "/api/indexes/{uid}/stats"
+        && finding.suspicious_route.path != "/api/keys/{key}"
+        || finding.suspicious_route.method == "PATCH"));
+    assert_eq!(report.dismissed.len(), 1);
+    assert_eq!(report.dismissed[0].reason, "delete_key checks the key store itself");
+    assert!(report.unjudged.iter().any(|route| route.reason == UnjudgedReason::DeclaredPublic
+        && route.path == "/api/indexes/{uid}/stats"
+        && route.detail == "stats are public"));
+    assert!(report.warnings.iter().any(|warning| warning.contains("`/api/gone` matches no finding")), "{:?}", report.warnings);
+
+    let invalid = TempRepo::new(
+        "f36-bad-config",
+        &[("main.rs", "fn main() {}"), ("archer.toml", "[[dismiss]]\npath = \"/x\"\ncategory = \"Nope\"\nreason = \"r\"\n")],
+    );
+    let error = analyze_repository(&invalid.0).unwrap_err().to_string();
+    assert!(error.contains("unknown finding category `Nope`"), "{error}");
+}
+
+#[test]
+fn a_route_calling_the_identity_source_without_the_peers_requirement_is_reported() {
+    let report = drift_fixture(
+        "f37",
+        include_str!("../../tests/fixtures/probes/drift/f37_requirement_arguments.rs"),
+    );
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.method.clone(), finding.suspicious_route.path.clone(), finding.severity))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("DELETE".to_string(), "/origins/{origin}/invitations/{id}".to_string(), Severity::Medium),
+            ("GET".to_string(), "/origins/{origin}/members".to_string(), Severity::Low),
+        ],
+        "{:#?}",
+        report.finding_details.iter().map(|finding| &finding.rationale).collect::<Vec<_>>()
+    );
+    assert!(report.finding_details[0].rationale.contains("`Some(Role::Administrator)`"));
+}

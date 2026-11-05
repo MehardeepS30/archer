@@ -26,6 +26,9 @@
 //!   (`update_profile(&auth.profile)?;`);
 //! - `auths:f()`: it calls `f`, a function that yields the caller, whether
 //!   or not it keeps the result;
+//! - `calls:f` and `requires:f#i:arg`: it calls the identity source `f`,
+//!   passing `arg` (not `None`) as argument `i`
+//!   (`authorize_session(&req, Some(&origin), Some(Maintainer))`);
 //! - `compares:T`: it compares a value derived from the parameter with a
 //!   value that is not (a record's owner field, an id from the path).
 
@@ -173,6 +176,10 @@ pub(crate) fn caller_use<'f>(
             for (callee, _) in index.resolved_calls(current).calls {
                 callees.push((callee, Vec::new()));
             }
+            // An identity source's own checks are compared through what
+            // its callers pass it (`calls:`, `requires:`), not credited to
+            // every caller.
+            callees.retain(|(callee, _)| !sources.contains(&index.definitions[*callee].name));
             for (callee, bound) in callees {
                 if !seen.insert((callee, bound.clone())) {
                     continue;
@@ -569,6 +576,29 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                 .all(|argument| matches!(argument, Expr::Path(path) if path.path.is_ident("None")))
         {
             self.features.insert(format!("auths:{}()", last.ident));
+        }
+        // Which requirement arguments a call to an identity source passes,
+        // for comparison with the peers' calls of the same source.
+        if let Expr::Path(path) = &*node.func
+            && let Some(last) = path.path.segments.last()
+            && self.sources.contains(&last.ident.to_string())
+        {
+            let name = last.ident.to_string();
+            self.features.insert(format!("calls:{name}"));
+            for (position, argument) in node.args.iter().enumerate().skip(1) {
+                if matches!(argument, Expr::Path(path) if path.path.is_ident("None")) {
+                    continue;
+                }
+                let mut written = quote::ToTokens::to_token_stream(argument)
+                    .to_string()
+                    .replace(' ', "");
+                if written.len() > 60 {
+                    written.truncate(written.floor_char_boundary(57));
+                    written.push_str("...");
+                }
+                self.features
+                    .insert(format!("requires:{name}#{position}:{written}"));
+            }
         }
         let bound: Vec<(usize, String)> = node
             .args
