@@ -271,6 +271,14 @@ impl DelegationVisitor {
             .map(|segment| segment.ident.to_string())
             .collect();
         let last = names.last()?;
+        // `constants::MESSAGE_LOGIN_SUCCESS` is a value, not an
+        // authentication object.
+        if last.len() > 1
+            && last.chars().any(|c| c.is_ascii_alphabetic())
+            && last.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            return None;
+        }
         let public = camel_case_words(last)
             .iter()
             .any(|word| word == "no" || word == "none" || word == "public");
@@ -2630,6 +2638,9 @@ fn component_heads(expr: &Expr) -> Vec<String> {
         },
         Expr::MethodCall(call) => component_heads(&call.receiver),
         Expr::Path(path) => component_name(&path.path).into_iter().collect(),
+        // `wrap_fn(|req, srv| srv.call(req).map(|res| res))` hands every
+        // request on: it cannot protect anything.
+        Expr::Closure(closure) if only_passes_on(closure) => Vec::new(),
         Expr::Closure(_) => vec!["<closure>".into()],
         Expr::Reference(reference) => component_heads(&reference.expr),
         Expr::Paren(paren) => component_heads(&paren.expr),
@@ -2637,6 +2648,26 @@ fn component_heads(expr: &Expr) -> Vec<String> {
         Expr::Struct(item) => component_name(&item.path).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether a middleware closure only calls the next service: it never
+/// branches, returns early, builds a response or an error of its own, or
+/// reads the request's headers, extensions, or caller.
+fn only_passes_on(closure: &ExprClosure) -> bool {
+    const WORDS: [&str; 8] = ["if", "match", "return", "status", "auth", "token", "cookie", "headers"];
+    const PARTS: [&str; 11] = [
+        "?", "err(", "error", "response", "unauthorized", "forbidden", "header(", "extensions",
+        "identity", "app_data", "guard",
+    ];
+    let text = closure.body.to_token_stream().to_string().to_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect();
+    let compact = text.replace(' ', "");
+    compact.contains(".call(")
+        && !WORDS.iter().any(|sign| words.contains(sign))
+        && !PARTS.iter().any(|sign| compact.contains(sign))
 }
 
 /// The meaningful segment of a component path: the last type-like segment

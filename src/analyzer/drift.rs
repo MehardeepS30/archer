@@ -1904,7 +1904,19 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
         && before.iter().all(|segment| {
             is_generic_segment(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str())
         });
-    named && authenticates_structurally(route)
+    named && authenticates_structurally(route) && !kept_behind_exempt_list(route)
+}
+
+/// A route the app's own middleware checks while exempting other paths by
+/// name (`IGNORE_ROUTES = ["/auth/login", "/auth/signup"]`): the app has
+/// said which authentication endpoints are reached anonymously, and this
+/// one (`/auth/logout`, `/auth/me`) is not among them, so it is compared
+/// with its peers.
+fn kept_behind_exempt_list(route: &Route) -> bool {
+    route
+        .authorization
+        .iter()
+        .any(|evidence| evidence.mechanism.contains(super::middleware::SKIP_RULE_MARK))
 }
 
 /// The structural half of an authentication endpoint: what its handler

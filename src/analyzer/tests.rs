@@ -4797,3 +4797,53 @@ fn well_known_names_ignore_separators() {
     assert!(is_well_known_public_route(&route("GET", "/api/health-check", "/api", "NONE")));
     assert!(!is_well_known_public_route(&route("GET", "/admin/health_check", "/admin", "NONE")));
 }
+
+#[test]
+fn exempt_lists_walked_in_a_loop_are_read() {
+    let report = drift_fixture(
+        "f47",
+        include_str!("../../tests/fixtures/probes/drift/f47_exempt_list_loop.rs"),
+    );
+    let evidence = |path: &str| -> Vec<(AuthEvidenceKind, String)> {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap_or_else(|| panic!("no route {path}"))
+            .authorization
+            .iter()
+            .map(|evidence| (evidence.kind.clone(), evidence.mechanism.clone()))
+            .collect()
+    };
+    // The constant list in `constants` is read through the `for` loop and
+    // the `authenticate_pass` flag: its entries are exempt, the rest checked.
+    for exempt in ["/api/ping", "/api/auth/signup", "/api/auth/login", "/api/notes/export"] {
+        assert!(evidence(exempt).is_empty(), "{exempt}: {:?}", evidence(exempt));
+    }
+    for checked in ["/api/notes", "/api/notes/{id}", "/api/auth/logout"] {
+        let found = evidence(checked);
+        assert_eq!(found.len(), 1, "{checked}: {found:?}");
+        assert_eq!(found[0].0, AuthEvidenceKind::IdentityExtraction, "{checked}");
+        assert!(found[0].1.contains("skips /api/ping*"), "{}", found[0].1);
+    }
+    // Logout is not on the app's exempt list, so it is compared with its
+    // peers; login and signup are.
+    let reason = |path: &str| {
+        report
+            .unjudged
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.reason)
+    };
+    assert_eq!(reason("/api/auth/login"), Some(UnjudgedReason::AuthenticationEndpoint));
+    assert_ne!(reason("/api/auth/logout"), Some(UnjudgedReason::AuthenticationEndpoint));
+    // The note export exempted by mistake is the one its peers flag.
+    assert_eq!(
+        reported(&report),
+        [(
+            FindingCategory::MissingAuthentication,
+            "GET".to_string(),
+            "/api/notes/export".to_string()
+        )]
+    );
+}

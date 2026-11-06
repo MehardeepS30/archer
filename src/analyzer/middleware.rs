@@ -30,11 +30,55 @@ thread_local! {
     static PATH_CONDITIONAL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Request-taking helpers that read the path, for `wrap_fn` closures.
     static PATH_READERS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// String constants and string-list constants of the crate
+    /// (`const IGNORE_ROUTES: [&str; 3] = [..]`, `const LOGIN: &str = ".."`),
+    /// by name, so a path rule naming one in another module is read. A name
+    /// defined twice with different values maps to `None`.
+    static STRING_CONSTS: RefCell<std::collections::HashMap<String, Option<Vec<String>>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn collect_string_consts(items: &[Item], consts: &mut std::collections::HashMap<String, Option<Vec<String>>>) {
+    for item in items {
+        let (name, expr) = match item {
+            Item::Const(item) => (item.ident.to_string(), &*item.expr),
+            Item::Static(item) => (item.ident.to_string(), &*item.expr),
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_string_consts(items, consts);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let Some(values) = string_literal(expr).map(|value| vec![value]).or_else(|| string_list(expr)) else {
+            continue;
+        };
+        consts
+            .entry(name)
+            .and_modify(|existing| {
+                if existing.as_ref() != Some(&values) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(values));
+    }
+}
+
+/// The values of a string or string-list constant named by `path`.
+fn const_values(path: &syn::Path) -> Option<Vec<String>> {
+    let name = path.segments.last()?.ident.to_string();
+    STRING_CONSTS.with(|consts| consts.borrow().get(&name).cloned().flatten())
 }
 
 /// Records the path-conditional components of the files about to be analyzed.
 pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn::File>) {
     let files: Vec<&syn::File> = files.into_iter().collect();
+    let mut consts = std::collections::HashMap::new();
+    for file in &files {
+        collect_string_consts(&file.items, &mut consts);
+    }
+    STRING_CONSTS.with(|set| *set.borrow_mut() = consts);
     // Helpers that read the request path (`fn should_skip_auth(req:
     // &ServiceRequest) -> bool`): a condition calling one branches on it.
     let mut readers: HashSet<String> = HashSet::new();
@@ -550,6 +594,7 @@ fn branch_kind(tokens: &str) -> Option<bool> {
 fn read_rule(block: &Block) -> Option<PathRule> {
     struct First {
         bindings: std::collections::HashMap<String, Expr>,
+        flags: HashSet<String>,
         rule: Option<Option<PathRule>>,
     }
     impl<'ast> Visit<'ast> for First {
@@ -558,6 +603,13 @@ fn read_rule(block: &Block) -> Option<PathRule> {
                 self.bindings.insert(name, (*init.expr).clone());
             }
             visit::visit_local(self, local);
+        }
+        // `for route in constants::IGNORE_ROUTES.iter() { if path.starts_with(route) { .. } }`
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            if let (Some(name), Some(values)) = (pattern_name(&node.pat), string_list(&node.expr)) {
+                self.bindings.insert(name, list_expr(&values));
+            }
+            visit::visit_expr_for_loop(self, node);
         }
         fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
             if self.rule.is_some() {
@@ -577,6 +629,13 @@ fn read_rule(block: &Block) -> Option<PathRule> {
                     // holds the check.
                     (None, None) if then.to_lowercase().contains("check") || then.contains('?') => {
                         Some(PathRule::RejectsWhen(Cond::And(vec![condition, Cond::Free])))
+                    }
+                    // `if path.starts_with(route) { passed = true; break; }`
+                    // and later `if !passed { 401 }`: the path skips the check.
+                    (None, None)
+                        if assigned_true(&node.then_branch).iter().any(|name| self.flags.contains(name)) =>
+                    {
+                        Some(PathRule::SkipsWhen(condition))
                     }
                     _ => None,
                 });
@@ -617,7 +676,7 @@ fn read_rule(block: &Block) -> Option<PathRule> {
             });
         }
     }
-    let mut first = First { bindings: std::collections::HashMap::new(), rule: None };
+    let mut first = First { bindings: std::collections::HashMap::new(), flags: pass_flags(block), rule: None };
     first.visit_block(block);
     first.rule.flatten()
 }
@@ -649,6 +708,11 @@ fn string_literal(expr: &Expr) -> Option<String> {
         Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. }) => Some(value.value()),
         Expr::Reference(reference) => string_literal(&reference.expr),
         Expr::Paren(paren) => string_literal(&paren.expr),
+        // `path == constants::LOGIN`
+        Expr::Path(path) if path.qself.is_none() => match const_values(&path.path) {
+            Some(values) if values.len() == 1 => values.into_iter().next(),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -656,9 +720,114 @@ fn string_literal(expr: &Expr) -> Option<String> {
 fn string_list(expr: &Expr) -> Option<Vec<String>> {
     match expr {
         Expr::Reference(reference) => string_list(&reference.expr),
+        Expr::Paren(paren) => string_list(&paren.expr),
         Expr::Array(array) => array.elems.iter().map(string_literal).collect(),
+        // `vec!["/login", "/health"]`
+        Expr::Macro(mac) if mac.mac.path.is_ident("vec") => mac
+            .mac
+            .parse_body_with(syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated)
+            .ok()
+            .and_then(|elems| elems.iter().map(string_literal).collect()),
+        // `constants::IGNORE_ROUTES`, `IGNORE_ROUTES.iter()`
+        Expr::Path(path) if path.qself.is_none() => const_values(&path.path),
+        Expr::MethodCall(call)
+            if ["iter", "into_iter", "to_vec", "as_slice"].contains(&call.method.to_string().as_str()) =>
+        {
+            string_list(&call.receiver)
+        }
         _ => None,
     }
+}
+
+/// The value or values an argument of a path test stands for: a literal, a
+/// constant, or a loop or closure variable bound to a list (`for route in
+/// IGNORE_ROUTES.iter() { path.starts_with(route) }`), which stands for
+/// each of the list's entries.
+fn argument_values(
+    expr: &Expr,
+    bindings: &std::collections::HashMap<String, Expr>,
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > 4 {
+        return None;
+    }
+    match expr {
+        Expr::Reference(reference) => argument_values(&reference.expr, bindings, depth + 1),
+        Expr::Paren(paren) => argument_values(&paren.expr, bindings, depth + 1),
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            argument_values(&unary.expr, bindings, depth + 1)
+        }
+        Expr::Path(path) if path.path.get_ident().is_some_and(|ident| bindings.contains_key(&ident.to_string())) => {
+            let bound = &bindings[&path.path.get_ident().expect("checked above").to_string()];
+            argument_values(bound, bindings, depth + 1)
+        }
+        _ => string_literal(expr).map(|value| vec![value]).or_else(|| string_list(expr)),
+    }
+}
+
+/// A list binding as an expression, so a loop or closure variable over a
+/// list resolves through the same bindings as a `let`.
+fn list_expr(values: &[String]) -> Expr {
+    syn::parse_quote!([#(#values),*])
+}
+
+fn pattern_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Reference(reference) => pattern_name(&reference.pat),
+        _ => simple_name(pat),
+    }
+}
+
+/// `flag = true` as a statement of a branch: the names it sets.
+fn assigned_true(block: &Block) -> Vec<String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            syn::Stmt::Expr(Expr::Assign(assign), _) => match (&*assign.left, &*assign.right) {
+                (Expr::Path(path), Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. })) if value.value => {
+                    path.path.get_ident().map(ToString::to_string)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Flags whose falseness rejects the request: `if !passed { 401 }`, or
+/// `if passed { srv.call(req) } else { 401 }`. Setting one on a path skips
+/// the check there.
+fn pass_flags(block: &Block) -> HashSet<String> {
+    struct Flags(HashSet<String>);
+    impl<'ast> Visit<'ast> for Flags {
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            let then = quote::ToTokens::to_token_stream(&node.then_branch).to_string();
+            let otherwise = node
+                .else_branch
+                .as_ref()
+                .map(|(_, branch)| quote::ToTokens::to_token_stream(branch).to_string());
+            let flag = |expr: &Expr| match expr {
+                Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+                _ => None,
+            };
+            match &*node.cond {
+                Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) && branch_kind(&then) == Some(true) => {
+                    self.0.extend(flag(&unary.expr));
+                }
+                cond if otherwise.as_deref().and_then(branch_kind) == Some(true)
+                    && branch_kind(&then) != Some(true) =>
+                {
+                    self.0.extend(flag(cond));
+                }
+                _ => {}
+            }
+            visit::visit_expr_if(self, node);
+        }
+    }
+    let mut flags = Flags(HashSet::new());
+    flags.visit_block(block);
+    flags.0
 }
 
 /// Whether an expression reads the request path, directly or through a binding.
@@ -686,11 +855,11 @@ fn cond_of(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>, dept
             syn::BinOp::Or(_) => Cond::Or(vec![recurse(&binary.left), recurse(&binary.right)]),
             syn::BinOp::Eq(_) | syn::BinOp::Ne(_) => {
                 let (left, right) = (&*binary.left, &*binary.right);
-                let literal = string_literal(right)
+                let literal = argument_values(right, bindings, 0)
                     .filter(|_| cond_reads(left, bindings))
-                    .or_else(|| string_literal(left).filter(|_| cond_reads(right, bindings)));
+                    .or_else(|| argument_values(left, bindings, 0).filter(|_| cond_reads(right, bindings)));
                 let equals = match literal {
-                    Some(value) => Cond::Equals(vec![value]),
+                    Some(values) => Cond::Equals(values),
                     None if cond_reads(expr, bindings) => Cond::Opaque,
                     None => return Cond::Free,
                 };
@@ -707,20 +876,37 @@ fn cond_of(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>, dept
             let method = call.method.to_string();
             let argument = call.args.first();
             if cond_reads(&call.receiver, bindings) {
-                let value = argument.and_then(string_literal);
-                return match (method.as_str(), value) {
-                    ("starts_with", Some(value)) => Cond::StartsWith(value),
-                    ("ends_with", Some(value)) => Cond::EndsWith(value),
-                    ("contains", Some(value)) => Cond::Contains(value),
-                    ("eq", Some(value)) => Cond::Equals(vec![value]),
+                let Some(values) = argument.and_then(|argument| argument_values(argument, bindings, 0)) else {
+                    return Cond::Opaque;
+                };
+                let each = |build: fn(String) -> Cond| {
+                    let mut parts: Vec<Cond> = values.iter().cloned().map(build).collect();
+                    if parts.len() == 1 { parts.remove(0) } else { Cond::Or(parts) }
+                };
+                return match method.as_str() {
+                    "starts_with" => each(Cond::StartsWith),
+                    "ends_with" => each(Cond::EndsWith),
+                    "contains" => each(Cond::Contains),
+                    "eq" => Cond::Equals(values),
                     _ => Cond::Opaque,
                 };
             }
-            // `["/login", "/health"].contains(&path)`
+            // `["/login", "/health"].contains(&path)`, `IGNORE_ROUTES.contains(&path)`
             if method == "contains"
                 && argument.is_some_and(|argument| cond_reads(argument, bindings))
             {
                 return string_list(&call.receiver).map_or(Cond::Opaque, Cond::Equals);
+            }
+            // `IGNORE_ROUTES.iter().any(|route| path.starts_with(route))`:
+            // the closure's variable stands for each entry.
+            if method == "any"
+                && let (Some(values), Some(Expr::Closure(closure))) = (string_list(&call.receiver), argument)
+                && closure.inputs.len() == 1
+                && let Some(name) = pattern_name(&closure.inputs[0])
+            {
+                let mut inner = bindings.clone();
+                inner.insert(name, list_expr(&values));
+                return cond_of(&closure.body, &inner, depth + 1);
             }
             if cond_reads(expr, bindings) { Cond::Opaque } else { Cond::Free }
         }
@@ -742,6 +928,10 @@ fn cond_of(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>, dept
         _ => Cond::Free,
     }
 }
+
+/// The settled evidence text of a component that exempts named paths and
+/// checks this one.
+pub(crate) const SKIP_RULE_MARK: &str = "checks the caller on this path (its path rule skips";
 
 /// Settles path-conditional middleware evidence on a route by its path:
 /// a component whose path rule is read checks the caller on every path the
