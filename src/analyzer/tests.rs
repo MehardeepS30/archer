@@ -4847,3 +4847,44 @@ fn exempt_lists_walked_in_a_loop_are_read() {
         )]
     );
 }
+
+#[test]
+fn path_rule_evidence_says_whether_listed_paths_are_exempt_or_covered() {
+    let report = drift_fixture(
+        "f28-wording",
+        include_str!("../../tests/fixtures/probes/drift/f28_path_conditional_middleware.rs"),
+    );
+    let mechanism = |path: &str| {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .and_then(|route| route.authorization.iter().find(|evidence| evidence.mechanism.contains("path rule")))
+            .map(|evidence| evidence.mechanism.clone())
+            .unwrap_or_default()
+    };
+    // `!logged_in && path != "/api/login"` exempts the login path.
+    assert!(mechanism("/api/orders").contains("exempts /api/login"), "{}", mechanism("/api/orders"));
+    // `path.contains("/private")` covers only the paths it names.
+    assert!(mechanism("/portal/private/drafts").contains("applies only to"), "{}", mechanism("/portal/private/drafts"));
+}
+
+#[test]
+fn groups_whose_protection_cannot_be_evaluated_are_not_called_public() {
+    let repo = TempRepo::new(
+        "unevaluated-group",
+        &[(
+            "main.rs",
+            "use actix_web::{web, App};
+fn app() { App::new().service(web::scope(\"/notes\").wrap(NoteGate).route(\"/a\", web::post().to(a)).route(\"/b\", web::post().to(b))); }
+struct NoteGate;
+async fn a() {}
+async fn b() {}
+",
+        )],
+    );
+    let report = repo.analyze();
+    let group = report.peer_groups.iter().find(|group| group.prefix == "/notes").unwrap();
+    assert!(group.description.contains("cannot evaluate"), "{}", group.description);
+    assert!(!group.description.contains("meant to be public"), "{}", group.description);
+}

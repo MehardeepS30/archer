@@ -314,19 +314,32 @@ pub(crate) fn build_analysis_layers_full(
             .peers
             .iter()
             .all(|peer| peer.best_tier() == EvidenceTier::None);
-        let description = format!(
-            "{} routes of {} {}{}",
-            key.class,
-            key.level.label(),
-            key.prefix,
-            if !unprotected {
-                ""
-            } else if key.class == MethodClass::Write {
-                " (no route carries protection, tier None; it holds writes, so check that they are meant to be public)"
-            } else {
-                " (no route carries protection, tier None)"
-            }
-        );
+        // Routes whose protection Archer could not evaluate (an unknown
+        // middleware, a path rule it could not decide) are not "public".
+        let unevaluated = group
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.authorization.iter().any(|evidence| {
+                    evidence.kind == AuthEvidenceKind::Unknown
+                        || (evidence.kind == AuthEvidenceKind::Delegated
+                            && evidence.mechanism.contains("checks the caller"))
+                })
+            })
+            .count();
+        let note = if !unprotected {
+            String::new()
+        } else if unevaluated > 0 {
+            format!(
+                " (no recognised protection, tier None; {unevaluated} of {} routes carry protection Archer cannot evaluate)",
+                group.peers.len()
+            )
+        } else if key.class == MethodClass::Write {
+            " (no route carries protection, tier None; it holds writes, so check that they are meant to be public)".to_string()
+        } else {
+            " (no route carries protection, tier None)".to_string()
+        };
+        let description = format!("{} routes of {} {}{note}", key.class, key.level.label(), key.prefix);
         peer_groups.push(PeerGroup {
             id: id.clone(),
             description,

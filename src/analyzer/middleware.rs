@@ -498,6 +498,20 @@ impl Cond {
         }
     }
 
+    /// Whether the paths the condition names appear negated
+    /// (`path != "/login"`, `!EXEMPT.contains(..)`).
+    pub(crate) fn names_negated(&self) -> bool {
+        fn walk(cond: &Cond, negated: bool) -> Option<bool> {
+            match cond {
+                Cond::Free | Cond::Opaque => None,
+                Cond::Not(inner) => walk(inner, !negated),
+                Cond::And(parts) | Cond::Or(parts) => parts.iter().find_map(|part| walk(part, negated)),
+                _ => Some(negated),
+            }
+        }
+        walk(self, false).unwrap_or(false)
+    }
+
     /// The literal paths or prefixes the condition names, for evidence text.
     pub(crate) fn literals(&self) -> Vec<String> {
         match self {
@@ -951,8 +965,12 @@ pub(crate) fn settle_path_rules(route: &mut super::model::Route) {
         let Some(rule) = path_rule_of(&name) else {
             return true;
         };
+        // `rejects unless path == "/login"` exempts the paths it names;
+        // `rejects when path starts with "/admin"` applies only to them.
         let (condition, verb) = match &rule {
+            PathRule::RejectsWhen(condition) if condition.names_negated() => (condition, "exempts"),
             PathRule::RejectsWhen(condition) => (condition, "applies only to"),
+            PathRule::SkipsWhen(condition) if condition.names_negated() => (condition, "applies only to"),
             PathRule::SkipsWhen(condition) => (condition, "skips"),
         };
         let named = condition.literals().join(", ");
