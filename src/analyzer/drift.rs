@@ -31,6 +31,11 @@ pub(crate) fn build_analysis_layers_with(
     (groups, invariants, details, findings)
 }
 
+/// A route to judge: its index, its group, for a write the reads it is held
+/// to, the levels passed over, and whether it is compared as the class its
+/// handler acts as rather than its method's.
+type Judged = (usize, GroupKey, Option<GroupKey>, Vec<String>, bool);
+
 /// The analysis layers, and every route that no comparison judged, with why.
 pub(crate) fn build_analysis_layers_full(
     routes: &[Route],
@@ -78,6 +83,7 @@ pub(crate) fn build_analysis_layers_full(
         ]
         .into_iter()
         .chain(place.subtrees().map(|prefix| place.subtree_key(prefix)))
+        .chain(place.fallbacks())
         {
             members.entry(key).or_default().push(index);
         }
@@ -86,7 +92,7 @@ pub(crate) fn build_analysis_layers_full(
 
     let mut stats: HashMap<GroupKey, GroupStats> = HashMap::new();
     let mut order: Vec<GroupKey> = Vec::new();
-    let mut judged: Vec<(usize, GroupKey, Option<GroupKey>)> = Vec::new();
+    let mut judged: Vec<Judged> = Vec::new();
     let compute = |key: &GroupKey| {
         let indices: Vec<usize> = members.get(key).cloned().unwrap_or_default();
         let peers: Vec<&Route> = indices.iter().map(|&member| candidates[member]).collect();
@@ -96,7 +102,10 @@ pub(crate) fn build_analysis_layers_full(
             .iter()
             .map(|&member| match key.level {
                 GroupLevel::Resource | GroupLevel::Handler | GroupLevel::Linked => 1.0,
-                GroupLevel::Namespace | GroupLevel::Subtree => {
+                GroupLevel::Namespace
+                | GroupLevel::Subtree
+                | GroupLevel::Version
+                | GroupLevel::App => {
                     1.0 / class_size(&placed[member].key(GroupLevel::Resource)).max(1) as f64
                 }
             })
@@ -104,28 +113,79 @@ pub(crate) fn build_analysis_layers_full(
         GroupStats::of(peers, weights, options)
     };
     for (index, place) in placed.iter().enumerate() {
-        // A POST named as a read is held to the reads, when there are
-        // reads to hold it to; it still counts among the writes as a peer,
-        // which its method makes it.
-        let as_read = Placement {
-            class: MethodClass::Read,
+        // A route whose handler acts against its method (a POST that only
+        // queries, a GET that writes) is held to the class it acts as, when
+        // that class has routes to hold it to; it still counts among the
+        // routes of its method's class as a peer.
+        let (acts_as, class_reason) = route_class_with_reason(candidates[index]);
+        let as_other = Placement {
+            class: acts_as,
             ..place.clone()
         };
-        let place = if place.class == MethodClass::Write
-            && route_class(candidates[index]) == MethodClass::Read
-            && comparison_key(&as_read, &class_size).is_some_and(|key| class_size(&key) >= 2)
-        {
-            &as_read
-        } else {
-            place
+        let switched = acts_as != place.class
+            && comparison_key(&as_other, &class_size).is_some_and(|key| class_size(&key) >= 2);
+        let place = if switched { &as_other } else { place };
+        // The levels tried before the one chosen, with why each was passed
+        // over; they go into the finding or the unjudged reason.
+        let mut trail: Vec<String> = Vec::new();
+        if switched && let Some(reason) = &class_reason {
+            trail.push(format!("compared as a {acts_as}: {reason}"));
+        }
+        let resource_key = place.key(GroupLevel::Resource);
+        let first = comparison_key(place, &class_size);
+        if first.as_ref() != Some(&resource_key) {
+            trail.push(format!(
+                "resource {}: {} {} route(s)",
+                resource_key.prefix,
+                class_size(&resource_key),
+                place.class
+            ));
+        }
+        let holds_reads = |key: &GroupKey| {
+            place.class == MethodClass::Write
+                && class_size(&GroupKey {
+                    class: MethodClass::Read,
+                    ..key.clone()
+                }) >= 2
         };
-        let Some(mut own) = comparison_key(place, &class_size) else {
+        let first = match first {
+            // A lone write is still held to the reads beside it.
+            Some(key) if class_size(&key) >= 2 || holds_reads(&key) => Some(key),
+            Some(key) => {
+                trail.push(format!(
+                    "{} {}: no other {} route",
+                    key.level.label(),
+                    key.prefix,
+                    place.class
+                ));
+                None
+            }
+            None => None,
+        };
+        // No scope the route is in holds a peer: fall back to its API
+        // version root, then to the whole app.
+        let first = first.or_else(|| {
+            place.fallbacks().find(|key| {
+                let size = class_size(key);
+                if size < 2 {
+                    trail.push(format!(
+                        "{} {}: no other {} route",
+                        key.level.label(),
+                        key.prefix,
+                        place.class
+                    ));
+                }
+                size >= 2
+            })
+        });
+        let Some(mut own) = first else {
             pending.push((
                 candidates[index],
                 UnjudgedReason::NoPeers,
                 format!(
-                    "no other {} route shares its resource {} or a scope above it",
-                    place.class, place.resource
+                    "no other {} route anywhere in the app (tried {})",
+                    place.class,
+                    trail.join("; ")
                 ),
             ));
             continue;
@@ -135,31 +195,95 @@ pub(crate) fn build_analysis_layers_full(
         // the wider group instead. A resource whose routes all lack auth
         // agrees that it is public and keeps its own verdict.
         // The same holds above: a namespace whose routes disagree, below
-        // the support threshold, defers to the enclosing scope tree, and so
-        // on up to the outermost scope that is not only generic segments.
+        // the support threshold, defers to the enclosing scope tree, then
+        // the API version root, then the whole app.
         loop {
             let undecided = {
                 let group = stats.entry(own.clone()).or_insert_with(|| compute(&own));
-                group.expected.is_none()
-                    && group
-                        .peers
-                        .iter()
-                        .any(|peer| peer.best_tier() > EvidenceTier::None)
+                let protected = group
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.best_tier() > EvidenceTier::None)
+                    .count();
+                let undecided = group.expected.is_none() && protected > 0;
+                if undecided && group.peers.len() < 2 {
+                    trail.push(format!(
+                        "{} {}: its only {} route",
+                        own.level.label(),
+                        own.prefix,
+                        own.class
+                    ));
+                } else if undecided {
+                    trail.push(format!(
+                        "{} {}: {protected} of {} {} routes protected, no pattern reaches support",
+                        own.level.label(),
+                        own.prefix,
+                        group.peers.len(),
+                        own.class
+                    ));
+                }
+                undecided
             };
             if !undecided {
                 break;
             }
             let next = match own.level {
-                GroupLevel::Resource => wider_key(place, &class_size),
+                GroupLevel::Resource => wider_key(place, &class_size)
+                    .filter(|key| class_size(key) >= 2)
+                    .or_else(|| fallback_key(place, &own, &class_size)),
                 GroupLevel::Namespace | GroupLevel::Subtree => {
                     parent_key(place, &own, &class_size)
+                        .or_else(|| fallback_key(place, &own, &class_size))
                 }
-                GroupLevel::Handler | GroupLevel::Linked => None,
+                GroupLevel::Version => fallback_key(place, &own, &class_size),
+                GroupLevel::Handler | GroupLevel::Linked | GroupLevel::App => None,
             };
             match next {
                 Some(next) if next != own => own = next,
                 _ => break,
             }
+        }
+        // Separate top-level scopes of one app often serve different
+        // callers by design (`/public` beside `/admin`), so the whole-app
+        // group only judges root-level routes. Any other route that
+        // reaches it is listed with the app-wide pattern for review.
+        // A flat app's root-level routes (`/about`, `/users`, no scope
+        // around them) form one root group: they are judged there.
+        let root_level = place.namespace == "/"
+            || (path_segments(without_mount_prefix(&candidates[index].scope_prefix)).is_empty()
+                && path_segments(without_mount_prefix(&candidates[index].path)).len() == 1);
+        if own.level == GroupLevel::App && !root_level {
+            let group = stats.entry(own.clone()).or_insert_with(|| compute(&own));
+            let protected = group
+                .peers
+                .iter()
+                .filter(|peer| peer.best_tier() > EvidenceTier::None)
+                .count();
+            // Peers that disagree below support, or none at all.
+            let disagree = trail
+                .iter()
+                .any(|step| !step.starts_with("whole app") && step.contains("routes protected"));
+            pending.push((
+                candidates[index],
+                if disagree {
+                    UnjudgedReason::BelowSupport
+                } else {
+                    UnjudgedReason::NoPeers
+                },
+                format!(
+                    "{} under {} or a scope above it; the whole app ({protected} of {} {} routes protected) is not used for a route inside a top-level scope, since separate scopes often serve different callers (tried {})",
+                    if disagree {
+                        format!("no group of {} routes reaches a verdict", place.class)
+                    } else {
+                        format!("no other {} route", place.class)
+                    },
+                    place.namespace,
+                    group.peers.len(),
+                    place.class,
+                    trail.join("; ")
+                ),
+            ));
+            continue;
         }
         let reads = (place.class == MethodClass::Write).then(|| GroupKey {
             class: MethodClass::Read,
@@ -167,17 +291,17 @@ pub(crate) fn build_analysis_layers_full(
         });
         for key in std::iter::once(&own).chain(reads.as_ref()) {
             let group = stats.entry(key.clone()).or_insert_with(|| compute(key));
-            if !order.contains(key)
-                && group.peers.len() >= 2
-                && group
-                    .peers
-                    .iter()
-                    .any(|peer| peer.best_tier() > EvidenceTier::None)
-            {
+            // Every group of two or more is formed, an unprotected one too
+            // (tier None, public by design).
+            if !order.contains(key) && group.peers.len() >= 2 {
                 order.push(key.clone());
             }
         }
-        judged.push((index, own, reads));
+        let by_behaviour = switched
+            && class_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("whose handler"));
+        judged.push((index, own, reads, trail, by_behaviour));
     }
 
     let mut peer_groups = Vec::new();
@@ -186,17 +310,22 @@ pub(crate) fn build_analysis_layers_full(
     for (position, key) in order.iter().enumerate() {
         let id = format!("peer-group-{:03}", position + 1);
         let group = &stats[key];
+        let unprotected = group
+            .peers
+            .iter()
+            .all(|peer| peer.best_tier() == EvidenceTier::None);
         let description = format!(
-            "{} routes of {} {}",
+            "{} routes of {} {}{}",
             key.class,
-            match key.level {
-                GroupLevel::Resource => "resource",
-                GroupLevel::Namespace => "namespace",
-                GroupLevel::Subtree => "scope tree",
-                GroupLevel::Handler => "handler",
-                GroupLevel::Linked => "linked routes",
-            },
-            key.prefix
+            key.level.label(),
+            key.prefix,
+            if !unprotected {
+                ""
+            } else if key.class == MethodClass::Write {
+                " (no route carries protection, tier None; it holds writes, so check that they are meant to be public)"
+            } else {
+                " (no route carries protection, tier None)"
+            }
         );
         peer_groups.push(PeerGroup {
             id: id.clone(),
@@ -211,7 +340,15 @@ pub(crate) fn build_analysis_layers_full(
     }
 
     let mut finding_details = Vec::new();
-    for (index, own, reads) in judged {
+    // Findings from a fallback level, kept until every narrower check has
+    // had its say: a route another check reports is reported by that one.
+    let mut fallback_details: Vec<Finding> = Vec::new();
+    for (index, own, reads, trail, switched) in judged {
+        let tried = if trail.is_empty() {
+            String::new()
+        } else {
+            format!(" (grouping: {})", trail.join("; "))
+        };
         let route = candidates[index];
         // The groups this route is held to: its own class, and for a write
         // the reads of the same resource. Writes are never less protected.
@@ -239,13 +376,13 @@ pub(crate) fn build_analysis_layers_full(
             let (reason, detail) = if group.peers.len() < 2 {
                 (
                     UnjudgedReason::NoPeers,
-                    format!("the only {} route under {}", own.class, own.prefix),
+                    format!("the only {} route under {}{tried}", own.class, own.prefix),
                 )
             } else {
                 (
                     UnjudgedReason::PeersUnprotected,
                     format!(
-                        "none of its {} {} peers under {} carries protection; read as public by design",
+                        "none of its {} {} peers under {} carries protection; read as public by design{tried}",
                         group.peers.len() - 1,
                         own.class,
                         own.prefix
@@ -261,11 +398,16 @@ pub(crate) fn build_analysis_layers_full(
                 .iter()
                 .filter(|peer| peer.best_tier() > EvidenceTier::None)
                 .count();
+            // An unprotected group judges its routes: none is expected to
+            // carry protection, and none falls short.
+            if protected == 0 {
+                continue;
+            }
             pending.push((
                 route,
                 UnjudgedReason::BelowSupport,
                 format!(
-                    "{protected} of {} {} routes under {} carry protection, below the {} routes and {:.0}% a pattern needs",
+                    "{protected} of {} {} routes under {} carry protection, below the {} routes and {:.0}% a pattern needs{tried}",
                     basis.peers.len(),
                     basis_key.class,
                     basis_key.prefix,
@@ -333,20 +475,43 @@ pub(crate) fn build_analysis_layers_full(
                     extra.join(", "),
                 );
             }
-            finding_details.push(reported);
+            let reported = at_level(reported, key, &tried, switched);
+            if key.level.is_fallback() {
+                fallback_details.push(reported);
+            } else {
+                finding_details.push(reported);
+            }
             continue;
         } else {
             continue;
         };
-        finding_details.push(finding(
-            route, category, expected, basis, basis_key, basis_id, options,
-        ));
+        let reported = at_level(
+            finding(route, category, expected, basis, basis_key, basis_id, options),
+            basis_key,
+            &tried,
+            switched,
+        );
+        if basis_key.level.is_fallback() {
+            fallback_details.push(reported);
+        } else {
+            finding_details.push(reported);
+        }
     }
     inconsistent_registrations(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     writes_below_resource(&candidates, &mut peer_groups, &mut invariants, &mut finding_details);
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     per_route_permissions(routes, &mut finding_details);
+    for fallback in fallback_details {
+        let route = &fallback.suspicious_route;
+        if !finding_details.iter().any(|finding| {
+            finding.suspicious_route.method == route.method
+                && finding.suspicious_route.path == route.path
+                && finding.suspicious_route.handler == route.handler
+        }) {
+            finding_details.push(fallback);
+        }
+    }
     // A route its groups could not judge falls back to the routes linked to
     // it by data; if those judged it, it is not left unjudged.
     let reported: HashSet<_> = finding_details
@@ -884,6 +1049,8 @@ pub(crate) struct Placement {
     pub(crate) namespace: String,
     pub(crate) resource: String,
     pub(crate) class: MethodClass,
+    /// The route's leading generic segments (`/api/v1`), if any.
+    pub(crate) version: Option<String>,
 }
 
 impl Placement {
@@ -892,7 +1059,12 @@ impl Placement {
             level,
             prefix: match level {
                 GroupLevel::Resource => self.resource.clone(),
-                GroupLevel::Namespace | GroupLevel::Subtree | GroupLevel::Handler | GroupLevel::Linked => {
+                GroupLevel::Namespace
+                | GroupLevel::Subtree
+                | GroupLevel::Handler
+                | GroupLevel::Linked
+                | GroupLevel::Version
+                | GroupLevel::App => {
                     self.namespace.clone()
                 }
             },
@@ -928,6 +1100,43 @@ impl Placement {
             .collect();
         prefixes.into_iter()
     }
+}
+
+impl Placement {
+    /// The last-resort groups, nearest first: the route's API version root
+    /// (`/api/v1`, its leading generic segments) when that is wider than its
+    /// namespace, then the whole app.
+    pub(crate) fn fallbacks(&self) -> impl Iterator<Item = GroupKey> + use<> {
+        let mut keys = Vec::new();
+        if let Some(version) = &self.version
+            && *version != self.namespace
+        {
+            keys.push(GroupKey {
+                level: GroupLevel::Version,
+                prefix: version.clone(),
+                class: self.class,
+            });
+        }
+        keys.push(GroupKey {
+            level: GroupLevel::App,
+            prefix: "/".into(),
+            class: self.class,
+        });
+        keys.into_iter()
+    }
+}
+
+/// The next fallback above `own` with more routes of its class.
+fn fallback_key(
+    place: &Placement,
+    own: &GroupKey,
+    class_size: &impl Fn(&GroupKey) -> usize,
+) -> Option<GroupKey> {
+    let size = class_size(own);
+    place
+        .fallbacks()
+        .filter(|key| own.level != GroupLevel::Version || key.level == GroupLevel::App)
+        .find(|key| *key != *own && class_size(key) > size)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -969,13 +1178,11 @@ fn comparison_key(
 /// `/users/{id}/self/delete`) is its own operation with its own policy.
 fn targets_record(route: &Route) -> bool {
     let resource = placement(route).resource;
-    let depth = resource.split('/').filter(|segment| !segment.is_empty()).count();
-    route
-        .path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .skip(depth)
-        .all(is_dynamic_segment)
+    let depth = path_segments(&resource).len();
+    let segments = path_segments(without_mount_prefix(&route.path));
+    // A catch-all (`/files/{tail:.*}`) serves any path below, not a record.
+    !segments.iter().any(|segment| is_catch_all_segment(segment))
+        && segments.iter().skip(depth).all(|segment| is_dynamic_segment(segment))
 }
 
 /// Whether a route's own-class group gives no verdict, so that a wider or
@@ -1377,6 +1584,28 @@ fn finding(
     }
 }
 
+/// Notes the level a finding was judged at. A finding from a fallback
+/// level (API version root, whole app) compares unrelated routes, so it is
+/// at most Low; one for a route compared as the class its handler acts as
+/// is at most Medium.
+fn at_level(mut finding: Finding, key: &GroupKey, tried: &str, switched: bool) -> Finding {
+    // A class read from what the handler does is an inference: a finding
+    // that rests on it is at most Medium.
+    if switched && finding.severity == Severity::High {
+        finding.severity = Severity::Medium;
+    }
+    if key.level.is_fallback() {
+        finding.severity = Severity::Low;
+        finding.rationale.push_str(&format!(
+            " Compared at the {} level ({}), since no narrower group had peers that agree.",
+            key.level.label(),
+            key.prefix
+        ));
+    }
+    finding.rationale.push_str(tried);
+    finding
+}
+
 /// The highest tier that a dominant share of the group reaches, each route
 /// counting with its weight.
 pub(crate) fn group_tier(
@@ -1523,15 +1752,8 @@ pub(crate) fn placement(route: &Route) -> Placement {
     // same for every route under it: place routes as if it were the root.
     let path = without_mount_prefix(&route.path);
     let scope_prefix = without_mount_prefix(&route.scope_prefix);
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    let scope_segments = scope_prefix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-        .min(segments.len());
+    let segments: Vec<&str> = path_segments(path);
+    let scope_segments = path_segments(scope_prefix).len().min(segments.len());
     let namespace_length = if scope_segments > 0 {
         scope_segments
     } else {
@@ -1568,10 +1790,15 @@ pub(crate) fn placement(route: &Route) -> Placement {
             .collect();
         format!("/{}", normalized.join("/"))
     };
+    let generic = segments
+        .iter()
+        .take_while(|segment| is_generic_segment(segment))
+        .count();
     Placement {
         namespace: prefix(namespace_length),
         resource: prefix(resource_length),
         class: MethodClass::of(&route.method),
+        version: (generic > 0 && generic < segments.len()).then(|| prefix(generic)),
     }
 }
 
@@ -1590,14 +1817,47 @@ pub(crate) fn peer_prefix(route: &Route) -> String {
 }
 
 pub(crate) fn is_dynamic_segment(segment: &str) -> bool {
-    (segment.starts_with('{') && segment.ends_with('}'))
+    (segment.starts_with('{') && (segment.ends_with('}') || segment.ends_with("}*")))
         || (segment.starts_with('<') && segment.ends_with('>'))
+}
+
+/// A path's segments, empty ones dropped (so `""`, `"/"` and a trailing
+/// `/` agree), splitting only outside `{..}`: a parameter whose pattern
+/// holds a slash (`{path:.*/raw}`) stays one dynamic segment.
+pub(crate) fn path_segments(path: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (index, character) in path.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => {
+                segments.push(&path[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&path[start..]);
+    segments.retain(|segment| !segment.is_empty());
+    segments
+}
+
+/// A tail parameter that matches the rest of the path (`{tail}*`,
+/// `{rest:.*}`, `{path:.+}`): it names no record.
+pub(crate) fn is_catch_all_segment(segment: &str) -> bool {
+    segment.ends_with("}*")
+        || (segment.starts_with('{')
+            && segment
+                .split_once(':')
+                .is_some_and(|(_, pattern)| pattern.contains(".*") || pattern.contains(".+") || pattern.contains("/")))
 }
 
 /// Static segments of a path, in order.
 fn static_segments(path: &str) -> Vec<String> {
-    path.split('/')
-        .filter(|segment| !segment.is_empty() && !is_dynamic_segment(segment))
+    path_segments(path)
+        .into_iter()
+        .filter(|segment| !is_dynamic_segment(segment))
         .map(str::to_ascii_lowercase)
         .collect()
 }
@@ -1639,11 +1899,43 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
         return false;
     };
     // `password_reset`, `request-reset`, `email_confirm`.
-    last.split(['_', '-'])
+    let named = last.split(['_', '-'])
         .any(|word| ENDPOINTS.contains(&word))
         && before.iter().all(|segment| {
             is_generic_segment(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str())
-        })
+        });
+    named && authenticates_structurally(route)
+}
+
+/// The structural half of an authentication endpoint: what its handler
+/// does, beyond its path. It issues or clears a session or token, or takes
+/// credentials, as its handler's name, the functions it calls, the models
+/// it uses, or how it uses the caller say (`password_length_check`, `LoginResponse`,
+/// `Identity::forget`, `read_auth_token`). A handler that checks a
+/// privilege (`/auth/check_admin`, `validate_admin_session`) is not one:
+/// logging in cannot require it. A handler Archer knows nothing about
+/// keeps the name's verdict, so a login page is not compared with the
+/// routes behind it.
+fn authenticates_structurally(route: &Route) -> bool {
+    const SIGNS: [&str; 30] = [
+        "login", "logout", "signin", "signout", "signup", "register", "password", "credential",
+        "token", "jwt", "session", "cookie", "forget", "remember", "oauth", "otp", "totp",
+        "2fa", "captcha", "refresh", "verif", "reset", "confirm", "revoke", "cert", "jwks",
+        "callback", "authorize", "forgot", "device",
+    ];
+    let behaviour: Vec<String> = route
+        .resource_keys
+        .iter()
+        .chain(route.caller_use.iter().filter(|feature| !feature.starts_with("scheme:")))
+        .map(|text| text.to_ascii_lowercase())
+        .collect();
+    if behaviour.is_empty() || route.origin.takes_credentials {
+        return true;
+    }
+    route.best_tier() < EvidenceTier::Privilege
+        && behaviour
+            .iter()
+            .any(|text| SIGNS.iter().any(|sign| text.contains(sign)))
 }
 
 /// Health, readiness, version, metrics, and API-documentation endpoints at
@@ -1683,14 +1975,17 @@ pub(crate) fn is_well_known_public_route(route: &Route) -> bool {
     {
         return true;
     }
-    if path.split('/').any(is_dynamic_segment) {
+    if path_segments(path).into_iter().any(is_dynamic_segment) {
         return false;
     }
     let statics = static_segments(path);
     let Some((last, before)) = statics.split_last() else {
         return false;
     };
-    PUBLIC.contains(&last.as_str()) && before.iter().all(|segment| is_generic_segment(segment))
+    // `health_check`, `health-check` and `healthcheck` are one name.
+    let squash = |name: &str| name.replace(['_', '-'], "");
+    PUBLIC.iter().any(|public| squash(public) == squash(last))
+        && before.iter().all(|segment| is_generic_segment(segment))
 }
 
 pub(crate) fn unique_routes<'a, I>(routes: I) -> Vec<&'a Route>
@@ -1709,6 +2004,81 @@ where
 /// is a read: APIs send a query body with POST, and such a route is
 /// protected like the reads of its resource, not like its writes.
 pub(crate) fn route_class(route: &Route) -> MethodClass {
+    route_class_with_reason(route).0
+}
+
+/// The repository functions a route's handler calls, by name.
+fn called_names(route: &Route) -> Vec<&str> {
+    route.origin.called.iter().map(String::as_str).collect()
+}
+
+/// A route's method class with why, when it differs from its method's:
+/// what the handler does wins over its name. A GET whose handler calls a
+/// writing function (`delete_session`, `update_counter`) is a write; a
+/// POST whose handler, unnamed by verb, calls only reading functions
+/// (`search_points`, `get_stats`) is a read. Otherwise the handler's or
+/// path's name decides, as below.
+pub(crate) fn route_class_with_reason(route: &Route) -> (MethodClass, Option<String>) {
+    let class = MethodClass::of(&route.method);
+    let verbs = |name: &str| -> (bool, bool) {
+        let words: Vec<String> = name
+            .split(['_', '-'])
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        (
+            words.iter().any(|word| CLASS_READ_WORDS.contains(&word.as_str())),
+            words.iter().any(|word| CLASS_WRITE_WORDS.contains(&word.as_str())),
+        )
+    };
+    let called = called_names(route);
+    let handler = route.handler.as_deref().map(|handler| handler.rsplit("::").next().unwrap_or(handler));
+    let (handler_reads, handler_writes) = handler.map_or((false, false), verbs);
+    let writer = called.iter().copied().find(|name| {
+        let (reads, writes) = verbs(name);
+        writes && !reads
+    });
+    if class == MethodClass::Read {
+        return match writer {
+            Some(name) if !handler_reads && route.method == "GET" => (
+                MethodClass::Write,
+                Some(format!("a GET whose handler calls `{name}`, which writes")),
+            ),
+            _ => (class, None),
+        };
+    }
+    if route.method != "POST" {
+        return (class, None);
+    }
+    if !handler_reads && !handler_writes && writer.is_none() {
+        let readers: Vec<&str> = called
+            .iter()
+            .copied()
+            .filter(|name| verbs(name).0)
+            .collect();
+        if !readers.is_empty() && readers.len() == called.iter().filter(|name| verbs(name) != (false, false)).count() {
+            return (
+                MethodClass::Read,
+                Some(format!("a POST whose handler only calls reading functions ({})", readers.join(", "))),
+            );
+        }
+    }
+    let class = route_class_by_name(route);
+    let reason = (class == MethodClass::Read).then(|| "a POST named as a read".to_string());
+    (class, reason)
+}
+
+const CLASS_READ_WORDS: [&str; 15] = [
+    "get", "list", "search", "fetch", "count", "query", "find", "autocomplete", "suggest",
+    "recommend", "retrieve", "lookup", "filter", "filters", "read",
+];
+const CLASS_WRITE_WORDS: [&str; 23] = [
+    "create", "update", "delete", "remove", "add", "set", "put", "post", "upsert", "insert",
+    "patch", "edit", "clear", "move", "upload", "send", "trigger", "cancel", "reset", "revoke",
+    "invite", "import", "save",
+];
+
+fn route_class_by_name(route: &Route) -> MethodClass {
     let class = MethodClass::of(&route.method);
     if route.method != "POST" {
         return class;

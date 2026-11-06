@@ -109,6 +109,10 @@ fn run(cli: &Cli) -> Result<bool> {
         "Route sites: {} of {} route-like call sites were read as routes",
         coverage.route_sites_read, coverage.route_sites
     );
+    println!(
+        "Peer groups: {} of {} routes compared in {} peer groups",
+        coverage.routes_compared, coverage.routes_total, coverage.peer_groups
+    );
     if coverage.unresolved_handlers > 0 || coverage.unresolved_paths > 0 {
         println!(
             "  routes with unresolved handlers: {}; with unresolved paths: {}",

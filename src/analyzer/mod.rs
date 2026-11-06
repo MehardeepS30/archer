@@ -228,6 +228,9 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // Builder chains are visited outermost call first; report routes in the
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
+    for route in &mut routes {
+        middleware::settle_path_rules(route);
+    }
 
     // Requirement subjects describe what a privilege check requires; on
     // identity or unrecognized evidence they would only be noise.
@@ -245,8 +248,10 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         parsed_files.iter().map(|(_, _, syntax)| syntax),
         &routes,
     );
-    for (route, keys) in routes.iter_mut().zip(keys) {
+    for (route, (keys, called, credentials)) in routes.iter_mut().zip(keys) {
         route.resource_keys = keys;
+        route.origin.called = called;
+        route.origin.takes_credentials = credentials;
     }
     let uses = caller_use::caller_use(
         &index,
@@ -325,9 +330,42 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         ));
     }
     coverage.unread_route_sites = unread_route_sites;
+    let identities: std::collections::HashSet<(&str, &str)> = routes
+        .iter()
+        .map(|route| (route.method.as_str(), route.path.as_str()))
+        .collect();
+    let compared: std::collections::HashSet<(&str, &str)> = peer_groups
+        .iter()
+        .flat_map(|group| group.routes.iter())
+        .map(|route| (route.method.as_str(), route.path.as_str()))
+        .filter(|identity| identities.contains(identity))
+        .filter(|identity| {
+            !unjudged
+                .iter()
+                .any(|route| (route.method.as_str(), route.path.as_str()) == *identity)
+        })
+        .collect();
+    coverage.routes_total = identities.len();
+    coverage.routes_compared = compared.len();
+    coverage.peer_groups = peer_groups.len();
     if peer_groups.is_empty() && !routes.is_empty() {
+        // Name the cause: the reason most routes were left out.
+        let mut causes: Vec<(String, usize)> = Vec::new();
+        for route in &unjudged {
+            let reason = route.reason.to_string();
+            match causes.iter_mut().find(|(known, _)| *known == reason) {
+                Some((_, count)) => *count += 1,
+                None => causes.push((reason, 1)),
+            }
+        }
+        causes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let cause = match causes.first() {
+            Some((reason, count)) => format!("most routes were left out because {reason} ({count} of {})", identities.len()),
+            None if identities.len() < 2 => "the app has fewer than two routes".to_string(),
+            None => "no two routes share a method class".to_string(),
+        };
         warnings.push(format!(
-            "no peer groups formed: {} route(s) read, {} not comparable (see `unjudged`); a group needs at least two comparable routes of the same kind under one scope, so this report cannot show drift",
+            "no peer groups formed: {} route(s) read, {} not comparable (see `unjudged`); {cause}, so this report cannot show drift",
             routes.len(),
             unjudged.len()
         ));

@@ -358,9 +358,15 @@ fn sibling_nested_scopes_extract_routes_and_preserve_admin_drift_evidence() {
         .unwrap();
     assert_eq!(admin_group.routes.len(), 4);
     assert!(admin_group.routes.iter().all(|route| route.method == "GET"));
-    assert_eq!(invariants.len(), 1);
-    assert_eq!(invariants[0].total_routes, 4);
-    assert_eq!(invariants[0].routes_with_authorization, 3);
+    // Unprotected groups are formed too; the admin group's invariant is
+    // the one with protection.
+    let invariant = invariants
+        .iter()
+        .find(|invariant| invariant.peer_group_id == admin_group.id)
+        .unwrap();
+    assert_eq!(invariants.len(), groups.len());
+    assert_eq!(invariant.total_routes, 4);
+    assert_eq!(invariant.routes_with_authorization, 3);
     assert_eq!(details.len(), 1);
     assert_eq!(details[0].suspicious_route.path, "/api/admin/payments");
     assert_eq!(details[0].authorized_peer_routes.len(), 3);
@@ -4067,20 +4073,27 @@ fn middleware_that_checks_only_some_paths_is_unverified() {
     };
     // Evaluated and unconditional: authentication, as before.
     assert_eq!(kinds("/members/profile"), [AuthEvidenceKind::IdentityExtraction]);
-    // Branches on the request path: not counted as protection.
-    assert_eq!(kinds("/portal/private/drafts"), [AuthEvidenceKind::Delegated]);
+    // A literal path test is settled per route: `path.contains("/private")`
+    // protects the private routes and leaves `/portal/shared/drafts` out.
+    assert_eq!(kinds("/portal/private/drafts"), [AuthEvidenceKind::IdentityExtraction]);
+    assert!(kinds("/portal/shared/drafts").is_empty());
+    // `path != "/api/login"` exempts the login route and checks the rest.
+    assert!(kinds("/api/login").is_empty());
+    assert_eq!(kinds("/api/orders"), [AuthEvidenceKind::IdentityExtraction]);
+    assert_eq!(kinds("/api/orders/{id}"), [AuthEvidenceKind::IdentityExtraction]);
+    // Tests Archer cannot settle (a helper, a guarded match arm, a closure)
+    // stay unverified: not counted as protection.
     assert_eq!(kinds("/board/posts"), [AuthEvidenceKind::Delegated]);
     assert_eq!(kinds("/desk/tickets"), [AuthEvidenceKind::Delegated]);
     assert_eq!(kinds("/inbox/messages"), [AuthEvidenceKind::Delegated]);
-    // The draft route falls short of its peers' handler-level identity. The
-    // middleware all three share does not explain the difference, so it is
-    // reported as missing, not covered by the middleware.
+    // The shared draft route is the one its `/portal` peers' middleware
+    // does not cover.
     assert_eq!(
         reported(&report),
         [(
-            FindingCategory::MissingAuthentication,
+            FindingCategory::InconsistentRegistration,
             "GET".to_string(),
-            "/portal/private/drafts".to_string()
+            "/portal/shared/drafts".to_string()
         )]
     );
 }
@@ -4168,7 +4181,18 @@ fn small_groups_fall_back_to_enclosing_scopes_and_unjudged_routes_say_why() {
             .map(|route| route.reason)
     };
     assert_eq!(reason("/misc/about"), Some(UnjudgedReason::NoPeers));
-    assert_eq!(reason("/blog/posts"), Some(UnjudgedReason::PeersUnprotected));
+    // The detail names the levels tried and the app-wide pattern.
+    let about = report.unjudged.iter().find(|route| route.path == "/misc/about").unwrap();
+    assert!(about.detail.contains("resource /misc/about"), "{}", about.detail);
+    assert!(about.detail.contains("the whole app"), "{}", about.detail);
+    // An unprotected group is formed (tier None) and judges its routes.
+    assert_eq!(reason("/blog/posts"), None);
+    let blog = report
+        .peer_groups
+        .iter()
+        .find(|group| group.routes.iter().any(|route| route.path == "/blog/posts"))
+        .unwrap();
+    assert!(blog.description.contains("tier None"), "{}", blog.description);
     // Judged routes are not listed.
     assert_eq!(reason("/shop/orders/place"), None);
     assert_eq!(reason("/shop/cart/clear"), None);
@@ -4349,7 +4373,7 @@ fn routes_declared_in_mounted_route_tables_are_analyzed() {
         .iter()
         .map(|finding| (finding.suspicious_route.method.clone(), finding.suspicious_route.path.clone(), finding.severity))
         .collect();
-    assert!(found.contains(&("DELETE".into(), "/api/keys/{key}".into(), Severity::High)), "{found:#?}");
+    assert!(found.contains(&("DELETE".into(), "/api/keys/{key}".into(), Severity::High)), "{found:#?} {:#?}", report.finding_details.iter().map(|f| (&f.rationale, &f.peer_group_id)).collect::<Vec<_>>());
     assert!(
         found.contains(&("GET".into(), "/api/indexes/{uid}/stats".into(), Severity::Low))
             && !found.iter().any(|(_, path, severity)| path == "/api/indexes/{uid}/stats" && *severity != Severity::Low),
@@ -4626,4 +4650,150 @@ fn main() { App::new().route("/a", web::get().to(h)).service(make(web::get().to(
     assert!(report.coverage.unread_route_sites[0].contains(":5 "));
     assert!(report.warnings.iter().any(|warning| warning.contains("did not read as a route")));
     assert!(report.warnings.iter().any(|warning| warning.starts_with("no peer groups formed")));
+}
+
+#[test]
+fn peer_groups_form_at_every_level_and_say_how() {
+    let report = drift_fixture(
+        "f45",
+        include_str!("../../tests/fixtures/probes/drift/f45_peer_formation.rs"),
+    );
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| {
+            (
+                finding.category,
+                finding.severity,
+                finding.suspicious_route.method.clone(),
+                finding.suspicious_route.path.clone(),
+            )
+        })
+        .collect();
+    // Item 3: the lone unprotected read is judged at its API version root,
+    // at most Low, and the finding names the level and the levels passed over.
+    assert!(
+        found.contains(&(
+            FindingCategory::MissingAuthentication,
+            Severity::Low,
+            "GET".into(),
+            "/api/v1/notes/all".into()
+        )),
+        "{found:#?}"
+    );
+    let notes = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/api/v1/notes/all")
+        .unwrap();
+    assert!(notes.rationale.contains("API version level (/api/v1)"), "{}", notes.rationale);
+    assert!(notes.rationale.contains("(grouping: resource /api/v1/notes/all"), "{}", notes.rationale);
+    // Item 7: a GET whose handler writes is compared with the writes.
+    let empty = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/shop/cart/{cart}/empty")
+        .expect("GET /shop/cart/{cart}/empty is held to the cart writes");
+    assert_eq!(empty.category, FindingCategory::MissingAuthentication);
+    assert!(empty.rationale.contains("calls `delete_cart_items`"), "{}", empty.rationale);
+    // Item 8: a name alone does not exclude a route.
+    assert!(
+        found.iter().any(|(_, _, _, path)| path == "/account/verify"),
+        "{found:#?}"
+    );
+    let reason = |path: &str| {
+        report
+            .unjudged
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.reason)
+    };
+    assert_eq!(reason("/account/login"), Some(UnjudgedReason::AuthenticationEndpoint));
+    // Item 2: an unprotected group is formed with tier None.
+    assert_eq!(reason("/pages/about"), None);
+    let pages = report
+        .peer_groups
+        .iter()
+        .find(|group| group.prefix == "/pages")
+        .expect("the /pages group is formed");
+    assert!(pages.description.contains("tier None"), "{}", pages.description);
+    // Item 11: the coverage counts.
+    assert_eq!(report.coverage.routes_total, report.routes.len());
+    assert!(report.coverage.routes_compared >= 9, "{:?}", report.coverage.routes_compared);
+    assert_eq!(report.coverage.peer_groups, report.peer_groups.len());
+}
+
+#[test]
+fn path_segments_normalise_slashes_and_parameters() {
+    use super::drift::{is_catch_all_segment, is_dynamic_segment, path_segments};
+    assert!(path_segments("").is_empty());
+    assert!(path_segments("/").is_empty());
+    assert_eq!(path_segments("/users/"), ["users"]);
+    assert_eq!(path_segments("users"), ["users"]);
+    // A parameter pattern with a slash stays one segment.
+    assert_eq!(path_segments("/files/{path:.*/raw}"), ["files", "{path:.*/raw}"]);
+    assert!(is_dynamic_segment("{id:\\d+}"));
+    assert!(is_dynamic_segment("{tail}*"));
+    assert!(is_catch_all_segment("{tail}*"));
+    assert!(is_catch_all_segment("{rest:.*}"));
+    assert!(!is_catch_all_segment("{id}"));
+    assert!(!is_catch_all_segment("{id:\\d+}"));
+}
+
+#[test]
+fn no_peer_groups_warning_names_the_cause() {
+    let repo = TempRepo::new(
+        "no-groups",
+        &[(
+            "main.rs",
+            "use actix_web::{web, App};
+fn app() { App::new().route(\"/login\", web::post().to(login)).route(\"/health\", web::get().to(health)); }
+async fn login() {}
+async fn health() {}
+",
+        )],
+    );
+    let report = repo.analyze();
+    assert!(report.peer_groups.is_empty());
+    let warning = report
+        .warnings
+        .iter()
+        .find(|warning| warning.starts_with("no peer groups formed"))
+        .unwrap();
+    assert!(warning.contains("most routes were left out because"), "{warning}");
+}
+
+#[test]
+fn flat_apps_form_a_root_group_and_shared_unknown_middleware_does_not_block_groups() {
+    let report = drift_fixture(
+        "f46",
+        include_str!("../../tests/fixtures/probes/drift/f46_flat_app_and_shared_unknown.rs"),
+    );
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.category, finding.severity, finding.suspicious_route.path.clone()))
+        .collect();
+    // Item 4: the root-level routes are compared in one root group, so the
+    // odd one out is reported, at Low. (Here another Low check, the peers'
+    // use of the caller, reports it first; the root group's finding yields.)
+    assert!(
+        found.iter().any(|(_, severity, path)| path == "/reports" && *severity == Severity::Low),
+        "{found:#?}"
+    );
+    assert!(report.peer_groups.iter().any(|group| group.level == GroupLevel::App));
+    // Item 9: `TeamGate` wraps every route of /team, so the odd one out is
+    // reported as missing authentication, not as unverified.
+    assert!(
+        found.contains(&(FindingCategory::MissingAuthentication, Severity::High, "/team/export".into())),
+        "{found:#?}"
+    );
+    assert!(report.unjudged.iter().all(|route| !route.path.starts_with("/team")));
+}
+
+#[test]
+fn well_known_names_ignore_separators() {
+    assert!(is_well_known_public_route(&route("GET", "/health_check", "", "NONE")));
+    assert!(is_well_known_public_route(&route("GET", "/api/health-check", "/api", "NONE")));
+    assert!(!is_well_known_public_route(&route("GET", "/admin/health_check", "/admin", "NONE")));
 }

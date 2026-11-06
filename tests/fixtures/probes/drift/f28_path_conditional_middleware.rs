@@ -15,8 +15,9 @@ impl<S> Service<ServiceRequest> for RequireAuthMiddleware<S> {
     }
 }
 
-// Checks the caller only when the path matches: which routes it protects is
-// decided at runtime.
+// Checks the caller only when the path contains `/private`: the literal
+// test is settled per route, so it protects `/portal/private/*` and not
+// `/portal/shared/*`.
 pub struct AuthService;
 impl<S> Transform<S, ServiceRequest> for AuthService {
     type Transform = AuthMiddleware<S>;
@@ -50,6 +51,24 @@ fn should_skip_auth(req: &ServiceRequest) -> bool {
     SKIPPED.iter().any(|path| req.path() == *path)
 }
 
+// Exempts one literal path and checks every other: `/api/login` is public,
+// the rest of `/api` is authenticated.
+pub struct JwtAuth;
+impl<S> Transform<S, ServiceRequest> for JwtAuth {
+    type Transform = JwtAuthMiddleware<S>;
+}
+pub struct JwtAuthMiddleware<S> { service: S }
+impl<S> Service<ServiceRequest> for JwtAuthMiddleware<S> {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let logged_in = decode_jwt(&req).is_ok();
+        let unauthorized = !logged_in && req.path() != "/api/login";
+        if unauthorized {
+            return Box::pin(async move { Ok(req.into_response(HttpResponse::Unauthorized().finish())) });
+        }
+        self.service.call(req)
+    }
+}
+
 // A function middleware with the same shape.
 async fn auth_middleware(req: ServiceRequest, next: Next) -> Result<ServiceResponse, Error> {
     match req.path() {
@@ -69,7 +88,13 @@ fn app() {
             .wrap(AuthService)
             .route("/private/notes", web::get().to(notes))
             .route("/private/files", web::get().to(files))
-            .route("/private/drafts", web::get().to(drafts)))
+            .route("/private/drafts", web::get().to(drafts))
+            .route("/shared/drafts", web::get().to(drafts)))
+        .service(web::scope("/api")
+            .wrap(JwtAuth)
+            .route("/login", web::post().to(login))
+            .route("/orders", web::get().to(orders))
+            .route("/orders/{id}", web::get().to(order)))
         .service(web::scope("/desk")
             .wrap(Authentication)
             .route("/tickets", web::get().to(tickets)))
@@ -89,6 +114,9 @@ async fn billing() {}
 async fn notes(user: Identity) {}
 async fn files(user: Identity) {}
 async fn drafts() {}
+async fn login() {}
+async fn orders() {}
+async fn order() {}
 async fn posts() {}
 async fn tickets() {}
 async fn messages() {}

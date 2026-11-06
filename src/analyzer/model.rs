@@ -208,6 +208,11 @@ pub(crate) struct RouteOrigin {
     pub(crate) enclosing: Option<usize>,
     /// The handler definition the route resolved to, if any.
     pub(crate) definition: Option<usize>,
+    /// Names of the repository functions its handler calls, other than
+    /// checks and other handlers, for telling what the handler does.
+    pub(crate) called: Vec<String>,
+    /// Its handler takes a request body with a credential field.
+    pub(crate) takes_credentials: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +272,31 @@ pub enum GroupLevel {
     /// Routes linked by the data they serve: a shared handler, repository
     /// function, or model type, whatever their paths.
     Linked,
+    /// Every route under one API version root (`/api/v1`), used when no
+    /// scope below it holds peers. Findings at this level are Low.
+    Version,
+    /// Every route of the application, the last fallback for a route with
+    /// no peers anywhere narrower. Findings at this level are Low.
+    App,
+}
+
+impl GroupLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resource => "resource",
+            Self::Namespace => "namespace",
+            Self::Subtree => "scope tree",
+            Self::Handler => "handler",
+            Self::Linked => "linked routes",
+            Self::Version => "API version",
+            Self::App => "whole app",
+        }
+    }
+
+    /// A last-resort level, wider than any scope the route is in.
+    pub fn is_fallback(self) -> bool {
+        matches!(self, Self::Version | Self::App)
+    }
 }
 
 /// Reads and writes of one resource are compared separately: reads are often
@@ -651,6 +681,11 @@ pub struct Coverage {
     pub route_sites_read: usize,
     /// The unread ones, as `file:line `code``.
     pub unread_route_sites: Vec<String>,
+    /// Distinct routes, and how many of them a peer group judged: they sit
+    /// in a group and are not listed in `unjudged`.
+    pub routes_total: usize,
+    pub routes_compared: usize,
+    pub peer_groups: usize,
     /// Macros that name unrouted handlers, with how many each names.
     pub macro_registrations: Vec<(String, usize)>,
     /// Names of the unrouted handler-like functions.

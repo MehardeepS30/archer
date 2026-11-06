@@ -570,6 +570,8 @@ impl<'a> RouteVisitor<'a> {
                     attribute: None,
                     enclosing: self.enclosing,
                     definition: resolved_definition,
+                    called: Vec::new(),
+                    takes_credentials: false,
                 },
             });
         }
@@ -964,6 +966,8 @@ impl RouteVisitor<'_> {
                     attribute: definition.map(|definition| (definition, attribute_path.clone())),
                     enclosing: None,
                     definition,
+                    called: Vec::new(),
+                    takes_credentials: false,
                 },
             });
         }
@@ -1452,6 +1456,11 @@ pub(crate) fn configuration_call_evidence(
             configuration_call_evidence(&call, file, handler, evidence);
             HELPER_DEPTH.with(|depth| depth.set(depth.get() - 1));
             let found = &mut evidence[start..];
+            // A helper returning a known harmless component
+            // (`IdentityService::new(..)`, `Cors::default()`) adds nothing.
+            if found.is_empty() {
+                continue;
+            }
             if found.iter().any(|found| found.kind != AuthEvidenceKind::Unknown) {
                 let written = arg.to_token_stream().to_string().replace(' ', "");
                 for found in found.iter_mut() {

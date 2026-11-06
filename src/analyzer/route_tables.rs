@@ -358,6 +358,8 @@ fn expand(
                     attribute: None,
                     enclosing,
                     definition,
+                    called: Vec::new(),
+                    takes_credentials: false,
                 },
             });
         }

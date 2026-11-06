@@ -22,10 +22,14 @@ pub(crate) fn resource_keys<'a>(
     index: &HandlerIndex,
     files: impl IntoIterator<Item = &'a syn::File>,
     routes: &[Route],
-) -> Vec<Vec<String>> {
-    let models = model_types(files);
+) -> Vec<(Vec<String>, Vec<String>, bool)> {
+    let files: Vec<&syn::File> = files.into_iter().collect();
+    let models = model_types(files.iter().copied());
+    let credentials = credential_types(files.iter().copied());
+    let mut takes_credentials: HashSet<usize> = HashSet::new();
     let handlers: HashSet<usize> = routes.iter().filter_map(|route| route.origin.definition).collect();
     let mut by_definition: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut called: HashMap<usize, Vec<String>> = HashMap::new();
     for &definition in &handlers {
         let mut keys = vec![format!("handler {}", index.definitions[definition].rust_path())];
         let mut data = RequestData::default();
@@ -33,6 +37,10 @@ pub(crate) fn resource_keys<'a>(
         data.visit_block(&index.items[definition].block);
         for (callee, _) in index.resolved_calls(definition).calls {
             let target = &index.definitions[callee];
+            let checks = !target.own.body_evidence.is_empty() || !target.own.predicate_evidence.is_empty();
+            if !handlers.contains(&callee) && !checks {
+                called.entry(definition).or_default().push(target.name.clone());
+            }
             // Only calls that take a value from the request (`find(id)`
             // with `id` from the path) address the data the route serves;
             // `server_busy_error()` and `get_conn(&pool)` do not.
@@ -41,11 +49,18 @@ pub(crate) fn resource_keys<'a>(
             }
             // Another handler, an authorization helper, or the caller's
             // identity says nothing about which data the route serves.
-            let checks = !target.own.body_evidence.is_empty() || !target.own.predicate_evidence.is_empty();
             if handlers.contains(&callee) || checks || names_caller_source(&target.name) {
                 continue;
             }
             keys.push(format!("calls {}", target.rust_path()));
+        }
+        // The request types the handler takes (`web::Json<LoginForm>`).
+        let signature = quote::ToTokens::to_token_stream(&index.items[definition].sig.inputs).to_string();
+        if signature
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .any(|word| credentials.contains(word))
+        {
+            takes_credentials.insert(definition);
         }
         for name in &data.types {
             if models.contains(name) && !names_caller_source(name) {
@@ -66,7 +81,13 @@ pub(crate) fn resource_keys<'a>(
     routes
         .iter()
         .map(|route| {
-            route
+            let names = route
+                .origin
+                .definition
+                .and_then(|definition| called.get(&definition))
+                .cloned()
+                .unwrap_or_default();
+            let keys = route
                 .origin
                 .definition
                 .and_then(|definition| by_definition.get(&definition))
@@ -79,9 +100,49 @@ pub(crate) fn resource_keys<'a>(
                         .cloned()
                         .collect()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let credentials = route
+                .origin
+                .definition
+                .is_some_and(|definition| takes_credentials.contains(&definition));
+            (keys, names, credentials)
         })
         .collect()
+}
+
+/// Structs defined in the repository with a credential field
+/// (`password`, `passwd`, `otp_code`): a handler taking one in its request
+/// takes credentials.
+fn credential_types<'a>(files: impl IntoIterator<Item = &'a syn::File>) -> HashSet<String> {
+    const FIELDS: [&str; 6] = ["password", "passwd", "passphrase", "credential", "otp", "totp"];
+    fn collect(items: &[Item], out: &mut HashSet<String>) {
+        for item in items {
+            match item {
+                Item::Struct(item) => {
+                    let credential = item.fields.iter().any(|field| {
+                        field.ident.as_ref().is_some_and(|ident| {
+                            let name = ident.to_string().to_ascii_lowercase();
+                            FIELDS.iter().any(|word| name.contains(word))
+                        })
+                    });
+                    if credential {
+                        out.insert(item.ident.to_string());
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        collect(items, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for file in files {
+        collect(&file.items, &mut out);
+    }
+    out
 }
 
 /// Structs and enums defined in the repository.

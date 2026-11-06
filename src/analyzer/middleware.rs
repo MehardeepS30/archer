@@ -41,6 +41,9 @@ pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn
     for file in &files {
         collect_readers(&file.items, &mut readers);
     }
+    PATH_RULES.with(|rules| rules.borrow_mut().clear());
+    PRIVILEGED.with(|set| set.borrow_mut().clear());
+    PATH_READERS.with(|set| *set.borrow_mut() = readers.clone());
     let mut transforms: Vec<(String, String)> = Vec::new();
     let mut conditional: HashSet<String> = HashSet::new();
     for file in &files {
@@ -53,6 +56,12 @@ pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn
         changed = false;
         for (factory, service) in &transforms {
             if conditional.contains(service) && conditional.insert(factory.clone()) {
+                if let Some(rule) = path_rule_of(service) {
+                    PATH_RULES.with(|rules| rules.borrow_mut().insert(factory.clone(), Some(rule)));
+                }
+                if rule_checks_privilege(service) {
+                    PRIVILEGED.with(|set| set.borrow_mut().insert(factory.clone()));
+                }
                 changed = true;
             }
         }
@@ -152,6 +161,7 @@ fn collect(
                 // a free function that receives the request.
                 if takes_service_request(&function.sig) && decides_by_path(&function.block, readers) {
                     conditional.insert(function.sig.ident.to_string());
+                    record_rule(&function.sig.ident.to_string(), &function.block);
                 }
             }
             Item::Mod(module) => {
@@ -196,6 +206,7 @@ fn collect_impl(
                 if let ImplItem::Fn(function) = member {
                     if function.sig.ident == "call" && decides_by_path(&function.block, readers) {
                         conditional.insert(self_name.clone());
+                        record_rule(&self_name, &function.block);
                     }
                 }
             }
@@ -330,4 +341,444 @@ impl<'ast> Visit<'ast> for PathBranches {
         }
         visit::visit_expr_while(self, node);
     }
+}
+
+/// When a path-conditional component applies its check, as read from the
+/// first branch in its body that tests the request path.
+#[derive(Clone, Debug)]
+pub(crate) enum PathRule {
+    /// The check rejects when `condition` holds (`if !logged_in && path != "/login" { 401 }`).
+    RejectsWhen(Cond),
+    /// The check is skipped when `condition` holds (`if path == "/login" { return srv.call(req) }`).
+    SkipsWhen(Cond),
+}
+
+/// A condition over the request path; anything else it tests is `Free`.
+#[derive(Clone, Debug)]
+pub(crate) enum Cond {
+    Free,
+    /// Reads the path in a way not modelled: the rule is undecided.
+    Opaque,
+    And(Vec<Cond>),
+    Or(Vec<Cond>),
+    Not(Box<Cond>),
+    Equals(Vec<String>),
+    StartsWith(String),
+    EndsWith(String),
+    Contains(String),
+}
+
+/// What a route's path makes of a condition: always true, always false, or
+/// still depending on something else (`Free`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Truth {
+    True,
+    False,
+    Free,
+    Undecided,
+}
+
+impl Cond {
+    pub(crate) fn eval(&self, path: &str) -> Truth {
+        // Path parameters stand for ids, not for the literal words a rule
+        // tests: `/users/{id}` does not start with `/users/admin`.
+        let concrete: String = {
+            let mut out = String::new();
+            let mut depth = 0;
+            for character in path.chars() {
+                match character {
+                    '{' => {
+                        depth += 1;
+                        if depth == 1 {
+                            out.push('\u{0}');
+                        }
+                    }
+                    '}' => depth -= 1,
+                    _ if depth > 0 => {}
+                    _ => out.push(character),
+                }
+            }
+            let trimmed = out.trim_end_matches('/');
+            if trimmed.is_empty() { "/".to_owned() } else { trimmed.to_owned() }
+        };
+        let normalize = |value: &str| {
+            let trimmed = value.trim_end_matches('/');
+            if trimmed.is_empty() { "/".to_owned() } else { trimmed.to_owned() }
+        };
+        let truth = |value: bool| if value { Truth::True } else { Truth::False };
+        match self {
+            Cond::Free => Truth::Free,
+            Cond::Opaque => Truth::Undecided,
+            Cond::Equals(values) => truth(values.iter().any(|value| normalize(value) == concrete)),
+            Cond::StartsWith(value) => truth(concrete.starts_with(value.as_str())),
+            Cond::EndsWith(value) => truth(concrete.ends_with(value.trim_end_matches('/'))),
+            Cond::Contains(value) => truth(concrete.contains(value.as_str())),
+            Cond::Not(inner) => match inner.eval(path) {
+                Truth::True => Truth::False,
+                Truth::False => Truth::True,
+                other => other,
+            },
+            Cond::And(parts) => {
+                let values: Vec<Truth> = parts.iter().map(|part| part.eval(path)).collect();
+                if values.contains(&Truth::False) {
+                    Truth::False
+                } else if values.contains(&Truth::Undecided) {
+                    Truth::Undecided
+                } else if values.contains(&Truth::Free) {
+                    Truth::Free
+                } else {
+                    Truth::True
+                }
+            }
+            Cond::Or(parts) => {
+                let values: Vec<Truth> = parts.iter().map(|part| part.eval(path)).collect();
+                if values.contains(&Truth::True) {
+                    Truth::True
+                } else if values.contains(&Truth::Undecided) {
+                    Truth::Undecided
+                } else if values.contains(&Truth::Free) {
+                    Truth::Free
+                } else {
+                    Truth::False
+                }
+            }
+        }
+    }
+
+    fn reads_path(&self) -> bool {
+        match self {
+            Cond::Free => false,
+            Cond::And(parts) | Cond::Or(parts) => parts.iter().any(Cond::reads_path),
+            Cond::Not(inner) => inner.reads_path(),
+            _ => true,
+        }
+    }
+
+    /// The literal paths or prefixes the condition names, for evidence text.
+    pub(crate) fn literals(&self) -> Vec<String> {
+        match self {
+            Cond::Free | Cond::Opaque => Vec::new(),
+            Cond::And(parts) | Cond::Or(parts) => parts.iter().flat_map(Cond::literals).collect(),
+            Cond::Not(inner) => inner.literals(),
+            Cond::Equals(values) => values.clone(),
+            Cond::StartsWith(value) => vec![format!("{value}*")],
+            Cond::EndsWith(value) => vec![format!("*{value}")],
+            Cond::Contains(value) => vec![format!("*{value}*")],
+        }
+    }
+}
+
+/// Whether a component with `rule` checks the caller on `path`:
+/// `Some(true)` protected, `Some(false)` exempt, `None` undecided.
+pub(crate) fn protects(rule: &PathRule, path: &str) -> Option<bool> {
+    match rule {
+        PathRule::RejectsWhen(condition) => match condition.eval(path) {
+            Truth::False => Some(false),
+            Truth::Undecided => None,
+            _ => Some(true),
+        },
+        PathRule::SkipsWhen(condition) => match condition.eval(path) {
+            Truth::True => Some(false),
+            Truth::Undecided => None,
+            _ => Some(true),
+        },
+    }
+}
+
+thread_local! {
+    /// The path rule of each path-conditional component, when one was read.
+    static PATH_RULES: RefCell<std::collections::HashMap<String, Option<PathRule>>> =
+        RefCell::new(std::collections::HashMap::new());
+    static PRIVILEGED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+pub(crate) fn path_rule_of(name: &str) -> Option<PathRule> {
+    PATH_RULES.with(|rules| rules.borrow().get(name).cloned().flatten())
+}
+
+/// Whether a recorded component checks privileges (roles, permissions),
+/// not only who the caller is.
+pub(crate) fn rule_checks_privilege(name: &str) -> bool {
+    PRIVILEGED.with(|set| set.borrow().contains(name))
+}
+
+fn record_rule(name: &str, block: &Block) {
+    let text = quote::ToTokens::to_token_stream(block).to_string().to_lowercase();
+    // A middleware that skips some paths and, on the rest, only loads the
+    // caller (`req.extensions_mut().insert(principal)`) without ever
+    // rejecting a request checks nothing: its path rule is not protection.
+    let rejects = REJECT_WORDS.iter().any(|word| text.contains(word));
+    let rule = read_rule(block).filter(|rule| match rule {
+        PathRule::SkipsWhen(_) => rejects,
+        PathRule::RejectsWhen(_) => true,
+    });
+    // A privilege check rejects with a forbidden status, or names a role
+    // or permission next to a rejection.
+    if text.contains("forbidden")
+        || text.contains("403")
+        || (rejects && ["has_role", "is_admin", "permission"].iter().any(|word| text.contains(word)))
+    {
+        PRIVILEGED.with(|set| set.borrow_mut().insert(name.to_owned()));
+    }
+    PATH_RULES.with(|rules| {
+        rules
+            .borrow_mut()
+            .entry(name.to_owned())
+            .and_modify(|entry| *entry = None)
+            .or_insert(rule);
+    });
+}
+
+const REJECT_WORDS: [&str; 6] = ["unauthorized", "forbidden", "unauthenticated", "denied", "reject", "401"];
+
+/// Whether a branch rejects the request, or passes it on unchecked.
+fn branch_kind(tokens: &str) -> Option<bool> {
+    let lower = tokens.to_lowercase().replace(' ', "");
+    if REJECT_WORDS.iter().any(|word| lower.contains(word))
+        || lower.contains("status_code::forbidden")
+        || lower.contains("err(")
+    {
+        return Some(true);
+    }
+    if lower.contains(".call(") {
+        return Some(false);
+    }
+    None
+}
+
+/// The rule of the first `if`/`match` on the path in a middleware body.
+fn read_rule(block: &Block) -> Option<PathRule> {
+    struct First {
+        bindings: std::collections::HashMap<String, Expr>,
+        rule: Option<Option<PathRule>>,
+    }
+    impl<'ast> Visit<'ast> for First {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let (Some(init), Some(name)) = (&local.init, simple_name(&local.pat)) {
+                self.bindings.insert(name, (*init.expr).clone());
+            }
+            visit::visit_local(self, local);
+        }
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if self.rule.is_some() {
+                return;
+            }
+            let condition = cond_of(&node.cond, &self.bindings, 0);
+            if condition.reads_path() {
+                let then = quote::ToTokens::to_token_stream(&node.then_branch).to_string();
+                let otherwise = node
+                    .else_branch
+                    .as_ref()
+                    .map(|(_, branch)| quote::ToTokens::to_token_stream(branch).to_string());
+                self.rule = Some(match (branch_kind(&then), otherwise.as_deref().and_then(branch_kind)) {
+                    (Some(true), _) | (None, Some(false)) => Some(PathRule::RejectsWhen(condition)),
+                    (Some(false), _) | (None, Some(true)) => Some(PathRule::SkipsWhen(condition)),
+                    // `if path.contains("/admin") { <check> }`: the branch
+                    // holds the check.
+                    (None, None) if then.to_lowercase().contains("check") || then.contains('?') => {
+                        Some(PathRule::RejectsWhen(Cond::And(vec![condition, Cond::Free])))
+                    }
+                    _ => None,
+                });
+                return;
+            }
+            visit::visit_expr_if(self, node);
+        }
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if self.rule.is_some() {
+                return;
+            }
+            if !cond_reads(&node.expr, &self.bindings) {
+                visit::visit_expr_match(self, node);
+                return;
+            }
+            let mut literals = Vec::new();
+            let mut literal_kind = None;
+            let mut rest_kind = None;
+            for arm in &node.arms {
+                let body = quote::ToTokens::to_token_stream(&arm.body).to_string();
+                let kind = branch_kind(&body);
+                match pattern_literals(&arm.pat) {
+                    Some(values) => {
+                        literals.extend(values);
+                        literal_kind = literal_kind.or(kind);
+                    }
+                    _ => rest_kind = rest_kind.or(kind),
+                }
+            }
+            self.rule = Some(match (literal_kind, rest_kind) {
+                (Some(false), _) | (None, Some(true)) if !literals.is_empty() => {
+                    Some(PathRule::SkipsWhen(Cond::Equals(literals)))
+                }
+                (Some(true), _) | (None, Some(false)) if !literals.is_empty() => {
+                    Some(PathRule::RejectsWhen(Cond::Equals(literals)))
+                }
+                _ => None,
+            });
+        }
+    }
+    let mut first = First { bindings: std::collections::HashMap::new(), rule: None };
+    first.visit_block(block);
+    first.rule.flatten()
+}
+
+fn simple_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+        syn::Pat::Type(typed) => simple_name(&typed.pat),
+        _ => None,
+    }
+}
+
+fn pattern_literals(pat: &syn::Pat) -> Option<Vec<String>> {
+    match pat {
+        syn::Pat::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. }) => Some(vec![value.value()]),
+        syn::Pat::Or(or) => {
+            let mut values = Vec::new();
+            for case in &or.cases {
+                values.extend(pattern_literals(case)?);
+            }
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
+fn string_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. }) => Some(value.value()),
+        Expr::Reference(reference) => string_literal(&reference.expr),
+        Expr::Paren(paren) => string_literal(&paren.expr),
+        _ => None,
+    }
+}
+
+fn string_list(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Reference(reference) => string_list(&reference.expr),
+        Expr::Array(array) => array.elems.iter().map(string_literal).collect(),
+        _ => None,
+    }
+}
+
+/// Whether an expression reads the request path, directly or through a binding.
+fn cond_reads(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>) -> bool {
+    let readers = PATH_READERS.with(|set| set.borrow().clone());
+    let names: HashSet<String> = bindings
+        .iter()
+        .filter(|(_, value)| PathBranches { readers: readers.clone(), ..PathBranches::default() }.reads_path(value))
+        .map(|(name, _)| name.clone())
+        .collect();
+    PathBranches { bindings: names, readers, found: false }.reads_path(expr)
+}
+
+fn cond_of(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>, depth: usize) -> Cond {
+    if depth > 8 {
+        return Cond::Opaque;
+    }
+    let recurse = |expr: &Expr| cond_of(expr, bindings, depth + 1);
+    match expr {
+        Expr::Paren(paren) => recurse(&paren.expr),
+        Expr::Group(group) => recurse(&group.expr),
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => Cond::Not(Box::new(recurse(&unary.expr))),
+        Expr::Binary(binary) => match binary.op {
+            syn::BinOp::And(_) => Cond::And(vec![recurse(&binary.left), recurse(&binary.right)]),
+            syn::BinOp::Or(_) => Cond::Or(vec![recurse(&binary.left), recurse(&binary.right)]),
+            syn::BinOp::Eq(_) | syn::BinOp::Ne(_) => {
+                let (left, right) = (&*binary.left, &*binary.right);
+                let literal = string_literal(right)
+                    .filter(|_| cond_reads(left, bindings))
+                    .or_else(|| string_literal(left).filter(|_| cond_reads(right, bindings)));
+                let equals = match literal {
+                    Some(value) => Cond::Equals(vec![value]),
+                    None if cond_reads(expr, bindings) => Cond::Opaque,
+                    None => return Cond::Free,
+                };
+                if matches!(binary.op, syn::BinOp::Ne(_)) { Cond::Not(Box::new(equals)) } else { equals }
+            }
+            _ if cond_reads(expr, bindings) => Cond::Opaque,
+            _ => Cond::Free,
+        },
+        Expr::Path(path) => match path.path.get_ident().and_then(|ident| bindings.get(&ident.to_string())) {
+            Some(value) => recurse(value),
+            None => Cond::Free,
+        },
+        Expr::MethodCall(call) => {
+            let method = call.method.to_string();
+            let argument = call.args.first();
+            if cond_reads(&call.receiver, bindings) {
+                let value = argument.and_then(string_literal);
+                return match (method.as_str(), value) {
+                    ("starts_with", Some(value)) => Cond::StartsWith(value),
+                    ("ends_with", Some(value)) => Cond::EndsWith(value),
+                    ("contains", Some(value)) => Cond::Contains(value),
+                    ("eq", Some(value)) => Cond::Equals(vec![value]),
+                    _ => Cond::Opaque,
+                };
+            }
+            // `["/login", "/health"].contains(&path)`
+            if method == "contains"
+                && argument.is_some_and(|argument| cond_reads(argument, bindings))
+            {
+                return string_list(&call.receiver).map_or(Cond::Opaque, Cond::Equals);
+            }
+            if cond_reads(expr, bindings) { Cond::Opaque } else { Cond::Free }
+        }
+        Expr::Macro(mac) if mac.mac.path.is_ident("matches") => {
+            let Ok((scrutinee, pattern)) = mac.mac.parse_body_with(|input: syn::parse::ParseStream| {
+                let scrutinee: Expr = input.parse()?;
+                let _: syn::Token![,] = input.parse()?;
+                let pattern = syn::Pat::parse_multi_with_leading_vert(input)?;
+                Ok((scrutinee, pattern))
+            }) else {
+                return Cond::Opaque;
+            };
+            if !cond_reads(&scrutinee, bindings) {
+                return Cond::Free;
+            }
+            pattern_literals(&pattern).map_or(Cond::Opaque, Cond::Equals)
+        }
+        _ if cond_reads(expr, bindings) => Cond::Opaque,
+        _ => Cond::Free,
+    }
+}
+
+/// Settles path-conditional middleware evidence on a route by its path:
+/// a component whose path rule is read checks the caller on every path the
+/// rule does not exempt. Evidence for exempt paths is dropped; an
+/// undecided rule keeps the fail-closed evidence.
+pub(crate) fn settle_path_rules(route: &mut super::model::Route) {
+    use super::model::{AuthEvidenceKind, AuthStrength};
+    const MARK: &str = "checks the caller only for some request paths";
+    let path = route.path.clone();
+    route.authorization.retain_mut(|evidence| {
+        if evidence.kind != AuthEvidenceKind::Delegated || !evidence.mechanism.contains(MARK) {
+            return true;
+        }
+        let Some(name) = evidence.mechanism.split('`').nth(1).map(str::to_owned) else {
+            return true;
+        };
+        let Some(rule) = path_rule_of(&name) else {
+            return true;
+        };
+        let (condition, verb) = match &rule {
+            PathRule::RejectsWhen(condition) => (condition, "applies only to"),
+            PathRule::SkipsWhen(condition) => (condition, "skips"),
+        };
+        let named = condition.literals().join(", ");
+        match protects(&rule, &path) {
+            Some(true) => {
+                evidence.kind = if rule_checks_privilege(&name) {
+                    AuthEvidenceKind::AuthorizationMiddleware
+                } else {
+                    AuthEvidenceKind::IdentityExtraction
+                };
+                evidence.strength = AuthStrength::Medium;
+                evidence.mechanism = format!("`{name}` checks the caller on this path (its path rule {verb} {named})");
+                true
+            }
+            Some(false) => false,
+            None => true,
+        }
+    });
 }
