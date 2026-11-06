@@ -564,7 +564,7 @@ fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
         .collect();
     let mut coverage = Coverage::default();
     for (index_position, item) in index.items.iter().enumerate() {
-        if !looks_like_handler(item) {
+        if index.definitions[index_position].owner.is_some() || !looks_like_handler(item) {
             continue;
         }
         coverage.likely_handlers += 1;

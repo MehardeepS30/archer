@@ -1493,11 +1493,38 @@ fn finding(
     } else {
         format!("its {} peers under {}", key.class, key.prefix)
     };
+    // Where a peer gets the expected tier through a call chain, cited so
+    // the finding can be checked: a check deep in a service function is
+    // not visible from the handler.
+    let example = group
+        .peers
+        .iter()
+        .filter(|peer| !std::ptr::eq(**peer, route))
+        .find_map(|peer| {
+            peer.authorization
+                .iter()
+                .filter(|evidence| EvidenceTier::of(&evidence.kind) >= expected.max(EvidenceTier::Identity))
+                .filter(|evidence| evidence.symbol.as_deref().is_some_and(|symbol| symbol.contains(" -> ")))
+                // The deepest link: the comparison itself, not the call to it.
+                .max_by_key(|evidence| evidence.symbol.as_deref().map_or(0, |symbol| symbol.matches(" -> ").count()))
+                .map(|evidence| {
+                    format!(
+                        " For example, {} {} reaches it as {} -> {} ({}:{}).",
+                        peer.method,
+                        peer.path,
+                        peer.handler.as_deref().unwrap_or("its handler"),
+                        evidence.symbol.as_deref().unwrap_or_default(),
+                        short_file(&evidence.file),
+                        evidence.line
+                    )
+                })
+        })
+        .unwrap_or_default();
     let (severity, rationale) = match category {
         FindingCategory::MissingAuthentication => (
             Severity::High,
             format!(
-                "No authentication or authorization evidence, while {compared} at least authenticate the caller."
+                "No authentication or authorization evidence, while {compared} at least authenticate the caller.{example}"
             ),
         ),
         FindingCategory::MissingAuthorization => (
@@ -1506,11 +1533,11 @@ fn finding(
             } else {
                 Severity::Medium
             },
-            format!("Best evidence is {tier}, while {compared} reach {expected}."),
+            format!("Best evidence is {tier}, while {compared} reach {expected}.{example}"),
         ),
         FindingCategory::WeakerAuthorization => (
             Severity::Medium,
-            format!("Best evidence is {tier}, while {compared} reach {expected}."),
+            format!("Best evidence is {tier}, while {compared} reach {expected}.{example}"),
         ),
         FindingCategory::DifferentAuthorization => (
             Severity::Medium,
@@ -1951,7 +1978,9 @@ fn authenticates_structurally(route: &Route) -> bool {
     let behaviour: Vec<String> = route
         .resource_keys
         .iter()
-        .chain(route.caller_use.iter().filter(|feature| !feature.starts_with("scheme:")))
+        .chain(route.caller_use.iter().filter(|feature| {
+            !feature.starts_with("scheme:") && !feature.starts_with(super::caller_use::SITE)
+        }))
         .map(|text| text.to_ascii_lowercase())
         .collect();
     if behaviour.is_empty() || route.origin.takes_credentials {
@@ -2154,4 +2183,13 @@ pub(crate) fn route_identity(route: &Route) -> (&str, &str, &str, Option<&str>) 
         &route.scope_prefix,
         route.handler.as_deref(),
     )
+}
+
+/// The last three components of a path, for evidence text.
+fn short_file(path: &std::path::Path) -> String {
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    components[components.len().saturating_sub(3)..].join("/")
 }

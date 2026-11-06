@@ -4,16 +4,15 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-use syn::{Item, ItemFn, UseTree};
+use std::borrow::Cow;
+use syn::{ImplItem, Item, ItemFn, Type, UseTree};
 
-use super::{evidence::*, model::*, routes::*};
+use super::{caller_use::block_rejects, evidence::*, model::*, routes::*};
 
 pub(crate) type ModuleKey = (PathBuf, Vec<String>);
 
 pub(crate) const MAX_RESOLUTION_DEPTH: usize = 16;
 
-/// How many calls deep a handler's helpers are searched for evidence.
-pub(crate) const MAX_HELPER_DEPTH: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HandlerDefinition {
@@ -25,6 +24,14 @@ pub(crate) struct HandlerDefinition {
     pub(crate) evidence: Vec<AuthEvidence>,
     /// The function's own evidence and calls, before helpers are combined.
     pub(crate) own: FunctionEvidence,
+    /// Its `#[cfg(..)]` attributes, as written, so that a call can pick the
+    /// variant compiled with the caller (`#[cfg(feature = "v1")]`).
+    pub(crate) cfg: Vec<String>,
+    /// Its body is only a placeholder (`todo!()`, `unimplemented!()`).
+    pub(crate) stub: bool,
+    /// For a method or associated function, the type of its `impl` block.
+    /// Methods are reached through calls only, never as route handlers.
+    pub(crate) owner: Option<String>,
 }
 
 /// Resolved calls of one function: `(callee, enforced)` for its body, and
@@ -33,12 +40,35 @@ pub(crate) struct HandlerDefinition {
 pub(crate) struct ResolvedCalls {
     pub(crate) calls: Vec<(usize, bool)>,
     pub(crate) predicate_calls: Vec<usize>,
+    /// Callees passed a caller value: a binding of an identity type, or
+    /// `self` in a method of one. A check a callee makes on its own caller
+    /// parameter is about this request's caller only for these.
+    pub(crate) passes_caller: HashSet<usize>,
+}
+
+/// Request types: the caller's credentials travel in them.
+const REQUEST_TYPES: &[&str] = &["HttpRequest", "ServiceRequest"];
+
+/// Evidence a callee holds about a caller value it was handed: a branch on
+/// it, its presence, a query scoped to it, or where it is passed on. It
+/// holds for a caller only if that caller passes its own caller value; a
+/// record loaded for another user, or no user at all, is not the caller.
+/// Role and permission checks hold wherever the callee runs.
+fn is_about_passed_caller(found: &AuthEvidence) -> bool {
+    found.mechanism.starts_with(super::evidence::STRUCTURAL_CHECK)
+        || matches!(
+            found.kind,
+            AuthEvidenceKind::IdentityExtraction
+                | AuthEvidenceKind::OwnershipCheck
+                | AuthEvidenceKind::Delegated
+        )
 }
 
 impl HandlerDefinition {
     pub(crate) fn rust_path(&self) -> String {
         std::iter::once("crate")
             .chain(self.module.iter().map(String::as_str))
+            .chain(self.owner.as_deref())
             .chain(std::iter::once(self.name.as_str()))
             .collect::<Vec<_>>()
             .join("::")
@@ -74,8 +104,21 @@ pub(crate) enum Lookup {
 pub(crate) struct HandlerIndex<'a> {
     pub(crate) definitions: Vec<HandlerDefinition>,
     /// The syntax of each definition, parallel to `definitions`, so that
-    /// `.configure(f)` can visit `f`'s body.
-    pub(crate) items: Vec<&'a ItemFn>,
+    /// `.configure(f)` can visit `f`'s body. A method is copied into a free
+    /// function's shape.
+    pub(crate) items: Vec<Cow<'a, ItemFn>>,
+    /// Methods and associated functions by `(type, name)`, from inherent
+    /// and trait `impl` blocks.
+    pub(crate) methods: HashMap<(String, String), Vec<usize>>,
+    /// Struct fields by struct name: named fields, or `0`, `1`.. for a
+    /// tuple struct.
+    pub(crate) structs: HashMap<String, Vec<Vec<(String, Type)>>>,
+    /// `type Name = ..;` aliases, and `Deref` targets of the crate's types.
+    pub(crate) aliases: HashMap<String, Vec<Type>>,
+    pub(crate) deref_targets: HashMap<String, Vec<Type>>,
+    /// The types of each definition's named values, computed when a
+    /// method call in it is resolved.
+    pub(crate) local_types: std::cell::RefCell<HashMap<usize, std::rc::Rc<HashMap<String, Type>>>>,
     /// `const NAME: &str = "..."` items, keyed by crate, module, and name.
     pub(crate) consts: HashMap<(PathBuf, Vec<String>, String), String>,
     pub(crate) by_name: HashMap<String, Vec<usize>>,
@@ -117,33 +160,120 @@ impl<'a> HandlerIndex<'a> {
     }
 
     /// Adds to each function the evidence of the repository functions it
-    /// calls, up to `MAX_HELPER_DEPTH` calls deep, so that a handler whose
-    /// check sits in a wrapper (`ensure_can_manage(&user)` calling
-    /// `require_admin`) is not reported as unauthorized. A helper's own
+    /// calls, however deep, so that a handler whose check sits in a wrapper
+    /// (`ensure_can_manage(&user)` calling `require_admin`), a method of the
+    /// caller's type (`principal.validate()`), or a service function in
+    /// another module is not reported as unauthorized. A helper's own
     /// enforced checks count wherever it is called; the predicate a `bool`
     /// helper returns (`fn can_edit(u) -> bool { u.role == Role::Admin }`)
     /// counts only where the caller enforces it. Only calls that resolve by
-    /// Rust's scoping rules count; a unique-name guess does not, since wrongly
-    /// added evidence would hide a finding. The evidence keeps the callee's
-    /// location; its symbol names the call path.
+    /// Rust's scoping rules or by a value's declared type count; a
+    /// unique-name guess does not, since wrongly added evidence would hide a
+    /// finding. The evidence keeps the callee's location; its symbol names
+    /// the call chain.
+    ///
+    /// Each function gets a summary, computed bottom-up and repeated until
+    /// nothing changes, so call cycles are safe: what its body enforces
+    /// wherever it is called, and what its returned predicate enforces where
+    /// a caller enforces it.
     pub(crate) fn add_helper_evidence(&mut self) {
-        let resolved: Vec<ResolvedCalls> = (0..self.definitions.len())
+        let count = self.definitions.len();
+        let resolved: Vec<ResolvedCalls> = (0..count)
             .map(|definition| self.resolved_calls(definition))
             .collect();
-        let combined: Vec<Vec<AuthEvidence>> = (0..self.definitions.len())
+        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (caller, calls) in resolved.iter().enumerate() {
+            for callee in calls
+                .calls
+                .iter()
+                .map(|(callee, _)| *callee)
+                .chain(calls.predicate_calls.iter().copied())
+            {
+                if !callers[callee].contains(&caller) {
+                    callers[callee].push(caller);
+                }
+            }
+        }
+        let own = |select: fn(&FunctionEvidence) -> &Vec<AuthEvidence>| -> Vec<Vec<AuthEvidence>> {
+            self.definitions
+                .iter()
+                .map(|definition| select(&definition.own).clone())
+                .collect()
+        };
+        let (first_body, _) = self.summarize(
+            &resolved,
+            &callers,
+            own(|own| &own.body_evidence),
+            own(|own| &own.predicate_evidence),
+        );
+        // A method call recorded as "not analyzed" is analyzed once it
+        // resolves. The callee's checks replace the note; a callee that
+        // checks nothing (a getter) drops it; a callee that can reject but
+        // makes no check Archer recognizes keeps it, saying where it is.
+        let rejecting = self.can_reject(&resolved, &callers);
+        let notes: Vec<HashMap<String, Option<String>>> = (0..count)
             .map(|definition| {
-                let mut evidence = self.definitions[definition].own.evidence.clone();
-                let mut stack = vec![definition];
-                self.gather(
-                    definition,
-                    definition,
-                    String::new(),
-                    false,
-                    0,
-                    &resolved,
-                    &mut stack,
-                    &mut evidence,
-                );
+                self.resolved_methods(definition)
+                    .into_iter()
+                    .map(|(symbol, callee)| {
+                        let recognized = first_body[callee].iter().any(|found| {
+                            !matches!(found.kind, AuthEvidenceKind::Delegated | AuthEvidenceKind::Unknown)
+                        });
+                        let note = (!recognized && rejecting[callee]).then(|| {
+                            let target = &self.definitions[callee];
+                            format!(
+                                "`{symbol}` runs `{}` ({}:{}), which can reject the request by a check Archer cannot classify",
+                                target.rust_path().trim_start_matches("crate::"),
+                                target.file.display(),
+                                self.items[callee].sig.ident.span().start().line
+                            )
+                        });
+                        (symbol, note)
+                    })
+                    .collect()
+            })
+            .collect();
+        let annotate = |definition: usize, evidence: &[AuthEvidence]| -> Vec<AuthEvidence> {
+            evidence
+                .iter()
+                .filter_map(|found| {
+                    let Some(note) = (found.kind == AuthEvidenceKind::Delegated)
+                        .then(|| found.symbol.as_ref().and_then(|symbol| notes[definition].get(symbol)))
+                        .flatten()
+                    else {
+                        return Some(found.clone());
+                    };
+                    let mut found = found.clone();
+                    found.mechanism = note.clone()?;
+                    Some(found)
+                })
+                .collect()
+        };
+        let (body, _) = self.summarize(
+            &resolved,
+            &callers,
+            (0..count)
+                .map(|definition| annotate(definition, &self.definitions[definition].own.body_evidence))
+                .collect(),
+            (0..count)
+                .map(|definition| {
+                    annotate(definition, &self.definitions[definition].own.predicate_evidence)
+                })
+                .collect(),
+        );
+        let combined: Vec<Vec<AuthEvidence>> = (0..count)
+            .map(|definition| {
+                let own_body = annotate(definition, &self.definitions[definition].own.body_evidence);
+                let mut evidence = annotate(definition, &self.definitions[definition].own.evidence);
+                let name = &self.definitions[definition].name;
+                for found in &body[definition] {
+                    if own_body.iter().any(|own| same_evidence(own, found)) {
+                        continue;
+                    }
+                    let mut found = found.clone();
+                    found.handler = Some(name.clone());
+                    merge_evidence(&mut evidence, found);
+                }
                 evidence
             })
             .collect();
@@ -152,97 +282,130 @@ impl<'a> HandlerIndex<'a> {
         }
     }
 
-    /// Adds the evidence that `current`, reached from `root` through `via`,
-    /// contributes: its own enforced checks, its returned predicate when the
-    /// caller enforces it, and its callees' in turn.
-    #[allow(clippy::too_many_arguments)]
-    fn gather(
+    /// Bottom-up summaries: what each function's body enforces wherever it
+    /// is called, and what its returned predicate enforces where a caller
+    /// enforces it, grown from its callees' until nothing changes.
+    fn summarize(
         &self,
-        root: usize,
-        current: usize,
-        via: String,
-        predicate: bool,
-        depth: usize,
         resolved: &[ResolvedCalls],
-        stack: &mut Vec<usize>,
-        out: &mut Vec<AuthEvidence>,
-    ) {
-        let own = &self.definitions[current].own;
-        let contributed = (current != root)
-            .then_some(own.body_evidence.iter())
-            .into_iter()
-            .flatten()
-            .chain(
-                predicate
-                    .then_some(own.predicate_evidence.iter())
-                    .into_iter()
-                    .flatten(),
-            );
-        for found in contributed {
-            let mut found = found.clone();
-            found.handler = Some(self.definitions[root].name.clone());
-            found.symbol = Some(format!(
-                "{via} -> {}",
-                found.symbol.as_deref().unwrap_or(&found.mechanism)
-            ));
-            if !out.iter().any(|existing| {
-                existing.kind == found.kind
-                    && existing.file == found.file
-                    && existing.line == found.line
-            }) {
-                out.push(found);
-            }
-        }
-        if depth == MAX_HELPER_DEPTH {
-            return;
-        }
-        let calls = &resolved[current];
-        let next: Vec<(usize, bool)> = calls
-            .calls
-            .iter()
-            .copied()
-            .chain(
-                predicate
-                    .then_some(calls.predicate_calls.iter().map(|&callee| (callee, true)))
-                    .into_iter()
-                    .flatten(),
-            )
+        callers: &[Vec<usize>],
+        mut body: Vec<Vec<AuthEvidence>>,
+        mut predicate: Vec<Vec<AuthEvidence>>,
+    ) -> (Vec<Vec<AuthEvidence>>, Vec<Vec<AuthEvidence>>) {
+        let count = body.len();
+        let mut queued: Vec<bool> = vec![false; count];
+        // Functions whose summary grew: their callers are recomputed.
+        let mut grown: Vec<usize> = (0..count)
+            .filter(|&definition| !body[definition].is_empty() || !predicate[definition].is_empty())
             .collect();
-        for (callee, enforced) in next {
-            if stack.contains(&callee) {
-                continue;
+        while !grown.is_empty() {
+            let mut next = Vec::new();
+            for callee in grown {
+                for &caller in &callers[callee] {
+                    if !queued[caller] {
+                        queued[caller] = true;
+                        next.push(caller);
+                    }
+                }
             }
-            stack.push(callee);
-            let name = &self.definitions[callee].name;
-            let via = if via.is_empty() {
-                name.clone()
-            } else {
-                format!("{via} -> {name}")
-            };
-            self.gather(root, callee, via, enforced, depth + 1, resolved, stack, out);
-            stack.pop();
+            let mut changed = Vec::new();
+            for caller in next {
+                queued[caller] = false;
+                let mut added = false;
+                for &(callee, enforced) in &resolved[caller].calls {
+                    let passes = resolved[caller].passes_caller.contains(&callee);
+                    let inherited: Vec<AuthEvidence> = body[callee]
+                        .iter()
+                        .chain(enforced.then_some(predicate[callee].iter()).into_iter().flatten())
+                        .filter(|found| passes || !is_about_passed_caller(found))
+                        .map(|found| self.through(callee, found))
+                        .collect();
+                    for found in inherited {
+                        added |= merge_evidence(&mut body[caller], found);
+                    }
+                }
+                for &callee in &resolved[caller].predicate_calls {
+                    let passes = resolved[caller].passes_caller.contains(&callee);
+                    let inherited: Vec<AuthEvidence> = body[callee]
+                        .iter()
+                        .chain(predicate[callee].iter())
+                        .filter(|found| passes || !is_about_passed_caller(found))
+                        .map(|found| self.through(callee, found))
+                        .collect();
+                    for found in inherited {
+                        added |= merge_evidence(&mut predicate[caller], found);
+                    }
+                }
+                if added {
+                    changed.push(caller);
+                }
+            }
+            grown = changed;
         }
+        (body, predicate)
     }
 
-    /// Repository functions that a function's body calls by path, with
-    /// whether the call's result is enforced.
+    /// Whether each function can reject a request: it builds an error or a
+    /// 401/403 response itself, or propagates one from a callee it enforces.
+    fn can_reject(&self, resolved: &[ResolvedCalls], callers: &[Vec<usize>]) -> Vec<bool> {
+        let mut rejecting: Vec<bool> = self
+            .items
+            .iter()
+            .map(|item| block_rejects(&item.block))
+            .collect();
+        let mut pending: Vec<usize> = (0..rejecting.len()).filter(|&index| rejecting[index]).collect();
+        while let Some(callee) = pending.pop() {
+            for &caller in &callers[callee] {
+                if !rejecting[caller]
+                    && resolved[caller]
+                        .calls
+                        .iter()
+                        .any(|&(called, enforced)| called == callee && enforced)
+                {
+                    rejecting[caller] = true;
+                    pending.push(caller);
+                }
+            }
+        }
+        rejecting
+    }
+
+    /// The method calls in a definition's body that resolve, written as
+    /// the delegation note writes them (`principal.validate()`), with
+    /// their callee.
+    fn resolved_methods(&self, definition: usize) -> HashMap<String, usize> {
+        self.definitions[definition]
+            .own
+            .calls
+            .iter()
+            .filter_map(|call| match &call.target {
+                HandlerTarget::Method { receiver, method } => self
+                    .resolve_callee(definition, &call.target)
+                    .map(|callee| (format!("{receiver}.{method}()"), callee)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Evidence a caller inherits through a call of `callee`: its symbol
+    /// gains the callee's name, `validate -> is_admin`.
+    fn through(&self, callee: usize, found: &AuthEvidence) -> AuthEvidence {
+        let mut found = found.clone();
+        found.symbol = Some(format!(
+            "{} -> {}",
+            self.definitions[callee].name,
+            found.symbol.as_deref().unwrap_or(&found.mechanism)
+        ));
+        found
+    }
+
+    /// Repository functions that a function's body calls, by path or as a
+    /// method of a typed value, with whether the call's result is enforced.
     pub(crate) fn resolved_calls(&self, definition: usize) -> ResolvedCalls {
         let caller = &self.definitions[definition];
-        let resolve = |target: &HandlerTarget| match self.resolve_handler_index(
-            &caller.crate_key,
-            &caller.module,
-            target,
-        ) {
-            (Some(callee), resolution)
-                if !matches!(resolution, HandlerResolution::UniqueName) && callee != definition =>
-            {
-                Some(callee)
-            }
-            _ => None,
-        };
         let mut resolved = ResolvedCalls::default();
         for call in &caller.own.calls {
-            if let Some(callee) = resolve(&call.target) {
+            if let Some(callee) = self.resolve_callee(definition, &call.target) {
                 let enforced = call.use_ == Use::Enforcing;
                 match resolved
                     .calls
@@ -254,8 +417,18 @@ impl<'a> HandlerIndex<'a> {
                 }
             }
         }
+        let types = self.local_types(definition);
+        for (target, roots) in &caller.own.call_roots {
+            if roots
+                .iter()
+                .any(|root| types.get(root).is_some_and(|ty| self.holds_caller(ty)))
+                && let Some(callee) = self.resolve_callee(definition, target)
+            {
+                resolved.passes_caller.insert(callee);
+            }
+        }
         for target in &caller.own.predicate_calls {
-            if let Some(callee) = resolve(target)
+            if let Some(callee) = self.resolve_callee(definition, target)
                 && !resolved.predicate_calls.contains(&callee)
             {
                 resolved.predicate_calls.push(callee);
@@ -287,7 +460,7 @@ impl<'a> HandlerIndex<'a> {
                         .entry(name.clone())
                         .or_default()
                         .push(self.definitions.len());
-                    self.items.push(function);
+                    self.items.push(Cow::Borrowed(function));
                     self.definitions.push(HandlerDefinition {
                         file: file.to_path_buf(),
                         crate_key: crate_key.to_path_buf(),
@@ -295,7 +468,81 @@ impl<'a> HandlerIndex<'a> {
                         name,
                         evidence: Vec::new(),
                         own: function_evidence(file, function),
+                        cfg: cfg_attributes(&function.attrs),
+                        stub: is_stub_body(&function.block),
+                        owner: None,
                     });
+                }
+                Item::Impl(implementation) => {
+                    let Some(owner) = type_name(&implementation.self_ty) else {
+                        continue;
+                    };
+                    let is_deref = implementation.trait_.as_ref().is_some_and(|(path, _)| {
+                        path.segments.last().is_some_and(|segment| segment.ident == "Deref")
+                    });
+                    for impl_item in &implementation.items {
+                        match impl_item {
+                            ImplItem::Type(target) if is_deref && target.ident == "Target" => {
+                                self.deref_targets
+                                    .entry(owner.clone())
+                                    .or_default()
+                                    .push(target.ty.clone());
+                            }
+                            ImplItem::Fn(method) => {
+                                let function = ItemFn {
+                                    attrs: method.attrs.clone(),
+                                    vis: method.vis.clone(),
+                                    modifiers: method.modifiers.clone(),
+                                    sig: method.sig.clone(),
+                                    block: Box::new(method.block.clone()),
+                                };
+                                let name = method.sig.ident.to_string();
+                                self.methods
+                                    .entry((owner.clone(), name.clone()))
+                                    .or_default()
+                                    .push(self.definitions.len());
+                                let mut attrs = cfg_attributes(&implementation.attrs);
+                                attrs.extend(cfg_attributes(&method.attrs));
+                                self.definitions.push(HandlerDefinition {
+                                    file: file.to_path_buf(),
+                                    crate_key: crate_key.to_path_buf(),
+                                    module: module.clone(),
+                                    name,
+                                    evidence: Vec::new(),
+                                    own: function_evidence_in(file, &function, Some(&owner)),
+                                    cfg: attrs,
+                                    stub: is_stub_body(&function.block),
+                                    owner: Some(owner.clone()),
+                                });
+                                self.items.push(Cow::Owned(function));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Item::Struct(item_struct) => {
+                    let fields = item_struct
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(position, field)| {
+                            let name = field
+                                .ident
+                                .as_ref()
+                                .map_or_else(|| position.to_string(), ToString::to_string);
+                            (name, field.ty.clone())
+                        })
+                        .collect();
+                    self.structs
+                        .entry(item_struct.ident.to_string())
+                        .or_default()
+                        .push(fields);
+                }
+                Item::Type(alias) => {
+                    self.aliases
+                        .entry(alias.ident.to_string())
+                        .or_default()
+                        .push((*alias.ty).clone());
                 }
                 Item::Mod(item_mod) => {
                     module.push(item_mod.ident.to_string());
@@ -418,6 +665,77 @@ impl<'a> HandlerIndex<'a> {
         module: &[String],
         target: &HandlerTarget,
     ) -> (Option<usize>, HandlerResolution) {
+        self.resolve_handler_index_for(None, crate_key, module, target)
+    }
+
+    /// Resolves a call that `caller` makes. Among same-named functions that
+    /// differ only by `#[cfg(..)]`, the one compiled with the caller is
+    /// called; see `pick_variant`.
+    pub(crate) fn resolve_call(
+        &self,
+        caller: usize,
+        target: &HandlerTarget,
+    ) -> (Option<usize>, HandlerResolution) {
+        let definition = &self.definitions[caller];
+        self.resolve_handler_index_for(
+            Some(&definition.cfg),
+            &definition.crate_key,
+            &definition.module,
+            target,
+        )
+    }
+
+    /// One of several definitions a path names, when they are build
+    /// variants of one function: all in one module, told apart by
+    /// `#[cfg(..)]`. The variant whose conditions the caller also has is
+    /// the one compiled with it; otherwise placeholders (`todo!()`) are set
+    /// aside, and a single remaining variant is taken.
+    fn pick_variant(&self, candidates: &[usize], caller_cfg: Option<&[String]>) -> Option<usize> {
+        let first = &self.definitions[*candidates.first()?];
+        let variants = candidates.iter().all(|&index| {
+            let definition = &self.definitions[index];
+            definition.crate_key == first.crate_key
+                && definition.module == first.module
+                && !definition.cfg.is_empty()
+        });
+        if !variants {
+            return None;
+        }
+        let single = |found: Vec<usize>| match found.as_slice() {
+            [index] => Some(*index),
+            _ => None,
+        };
+        if let Some(caller_cfg) = caller_cfg.filter(|cfg| !cfg.is_empty()) {
+            let matching: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    self.definitions[index]
+                        .cfg
+                        .iter()
+                        .all(|condition| caller_cfg.contains(condition))
+                })
+                .collect();
+            if let Some(index) = single(matching) {
+                return Some(index);
+            }
+        }
+        single(
+            candidates
+                .iter()
+                .copied()
+                .filter(|&index| !self.definitions[index].stub)
+                .collect(),
+        )
+    }
+
+    fn resolve_handler_index_for(
+        &self,
+        caller_cfg: Option<&[String]>,
+        crate_key: &Path,
+        module: &[String],
+        target: &HandlerTarget,
+    ) -> (Option<usize>, HandlerResolution) {
         let HandlerTarget::Path {
             segments,
             leading_colon,
@@ -455,7 +773,17 @@ impl<'a> HandlerIndex<'a> {
 
         match lookup {
             Lookup::Found(index, resolution) => (Some(index), resolution),
-            Lookup::Ambiguous(candidates) => (None, self.ambiguous(candidates)),
+            Lookup::Ambiguous(candidates) => match self.pick_variant(&candidates, caller_cfg) {
+                Some(index) => (
+                    Some(index),
+                    if qualifier.is_empty() {
+                        HandlerResolution::Local
+                    } else {
+                        HandlerResolution::Qualified
+                    },
+                ),
+                None => (None, self.ambiguous(candidates)),
+            },
             Lookup::NotFound { explicit: true } => (None, HandlerResolution::Unresolved),
             Lookup::NotFound { explicit: false } => {
                 let search_crate = qualifier_module
@@ -472,7 +800,10 @@ impl<'a> HandlerIndex<'a> {
                 match candidates.as_slice() {
                     [] => (None, HandlerResolution::Unresolved),
                     [index] => (Some(*index), HandlerResolution::UniqueName),
-                    _ => (None, self.ambiguous(candidates)),
+                    _ => match self.pick_variant(&candidates, caller_cfg) {
+                        Some(index) => (Some(index), HandlerResolution::UniqueName),
+                        None => (None, self.ambiguous(candidates)),
+                    },
                 }
             }
         }
@@ -795,4 +1126,400 @@ pub(crate) fn module_location(root: &Path, file: &Path) -> ModuleKey {
         segments.push(stem.to_owned());
     }
     (crate_dir.to_path_buf(), segments)
+}
+
+/// A function's `#[cfg(..)]` attributes as token text.
+pub(crate) fn cfg_attributes(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg"))
+        .map(|attr| quote::ToTokens::to_token_stream(&attr.meta).to_string())
+        .collect()
+}
+
+/// A body that is only a placeholder macro: `todo!()`, `unimplemented!()`.
+pub(crate) fn is_stub_body(block: &syn::Block) -> bool {
+    let [statement] = block.stmts.as_slice() else {
+        return false;
+    };
+    let mac = match statement {
+        syn::Stmt::Macro(stmt) => &stmt.mac,
+        syn::Stmt::Expr(syn::Expr::Macro(expr), _) => &expr.mac,
+        _ => return false,
+    };
+    mac.path
+        .get_ident()
+        .is_some_and(|name| name == "todo" || name == "unimplemented")
+}
+
+/// The last name of a type path, through references: `Principal` for
+/// `&Principal`, `ReqData` for `web::ReqData<Principal>`.
+pub(crate) fn type_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Reference(reference) => type_name(&reference.elem),
+        Type::Paren(paren) => type_name(&paren.elem),
+        Type::Group(group) => type_name(&group.elem),
+        Type::Path(path) if path.qself.is_none() => {
+            path.path.segments.last().map(|segment| segment.ident.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The type arguments of a type path's last segment.
+fn type_arguments(ty: &Type) -> Vec<&Type> {
+    match ty {
+        Type::Reference(reference) => type_arguments(&reference.elem),
+        Type::Paren(paren) => type_arguments(&paren.elem),
+        Type::Group(group) => type_arguments(&group.elem),
+        Type::Path(path) => match path.path.segments.last().map(|segment| &segment.arguments) {
+            Some(syn::PathArguments::AngleBracketed(arguments)) => arguments
+                .args
+                .iter()
+                .filter_map(|argument| match argument {
+                    syn::GenericArgument::Type(inner) => Some(inner),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// How deep type aliases, `Deref` targets and wrappers are followed.
+const MAX_TYPE_DEPTH: usize = 8;
+
+impl HandlerIndex<'_> {
+    /// The types a value of type `ty` can be used as: the type itself, then
+    /// what it stands for or dereferences to: an alias's definition, a
+    /// `Deref` target from the crate, or the one type argument of a wrapper
+    /// (`ReqData<T>`, `Arc<T>`, `Data<T>`), as method calls auto-deref.
+    fn deref_chain(&self, ty: &Type) -> Vec<Type> {
+        let mut chain = vec![ty.clone()];
+        let mut current = ty.clone();
+        for _ in 0..MAX_TYPE_DEPTH {
+            let Some(name) = type_name(&current) else {
+                break;
+            };
+            let next = if let Some([alias]) = self.aliases.get(&name).map(Vec::as_slice) {
+                alias.clone()
+            } else if let Some([target]) = self.deref_targets.get(&name).map(Vec::as_slice) {
+                target.clone()
+            } else if let [inner] = type_arguments(&current).as_slice() {
+                (*inner).clone()
+            } else {
+                break;
+            };
+            chain.push(next.clone());
+            current = next;
+        }
+        chain
+    }
+
+    /// Definitions of `method` for a receiver of type `ty`: on the first
+    /// type in its deref chain that has a method of that name.
+    fn methods_of(&self, ty: &Type, method: &str) -> Vec<usize> {
+        for candidate in self.deref_chain(ty) {
+            if let Some(name) = type_name(&candidate)
+                && let Some(found) = self.methods.get(&(name, method.to_owned()))
+            {
+                return found.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// The type of field `field` (a name, or a tuple index) of a value of
+    /// type `ty`, from the one struct of that name in the scan.
+    pub(crate) fn field_type(&self, ty: &Type, field: &str) -> Option<Type> {
+        for candidate in self.deref_chain(ty) {
+            let Some(name) = type_name(&candidate) else {
+                continue;
+            };
+            if let Some([fields]) = self.structs.get(&name).map(Vec::as_slice) {
+                return fields
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, ty)| ty.clone());
+            }
+        }
+        None
+    }
+
+    /// The declared types of a definition's named values: its parameters
+    /// (`self` included), and locals and closure parameters with a written
+    /// type or one Archer can read off the initializer. A name bound with
+    /// two different types has none.
+    pub(crate) fn local_types(&self, definition: usize) -> std::rc::Rc<HashMap<String, Type>> {
+        if let Some(found) = self.local_types.borrow().get(&definition) {
+            return found.clone();
+        }
+        let mut collector = LocalTypes {
+            index: self,
+            owner: self.definitions[definition].owner.clone(),
+            types: HashMap::new(),
+            conflicted: HashSet::new(),
+        };
+        let item = &self.items[definition];
+        for input in &item.sig.inputs {
+            match input {
+                syn::FnArg::Receiver(_) => {
+                    if let Some(owner) = &collector.owner
+                        && let Ok(ty) = syn::parse_str::<Type>(owner)
+                    {
+                        collector.insert("self".to_owned(), ty);
+                    }
+                }
+                syn::FnArg::Typed(typed) => collector.bind(&typed.pat, &typed.ty),
+            }
+        }
+        syn::visit::Visit::visit_block(&mut collector, &item.block);
+        let types = std::rc::Rc::new(collector.types);
+        self.local_types
+            .borrow_mut()
+            .insert(definition, types.clone());
+        types
+    }
+
+    /// Whether a value of this type carries the caller: an identity type,
+    /// the request whose credentials name it, or a reference, alias or
+    /// wrapper of either.
+    fn holds_caller(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Reference(reference) => self.holds_caller(&reference.elem),
+            Type::Paren(inner) => self.holds_caller(&inner.elem),
+            Type::Group(inner) => self.holds_caller(&inner.elem),
+            _ => {
+                let carries = |ty: &Type| {
+                    super::evidence::identity_type(ty)
+                        || type_name(ty).is_some_and(|name| REQUEST_TYPES.contains(&name.as_str()))
+                };
+                carries(ty) || self.deref_chain(ty).iter().any(carries)
+            }
+        }
+    }
+
+    /// The type of a receiver written as a binding and fields.
+    fn receiver_type(&self, definition: usize, receiver: &str) -> Option<Type> {
+        let mut parts = receiver.split('.');
+        let mut ty = self.local_types(definition).get(parts.next()?)?.clone();
+        for field in parts {
+            ty = self.field_type(&ty, field)?;
+        }
+        Some(ty)
+    }
+
+    /// The single definition a set of candidates names, or the build
+    /// variant compiled with the caller.
+    fn single(&self, candidates: &[usize], caller: usize) -> Option<usize> {
+        match candidates {
+            [] => None,
+            [only] => Some(*only),
+            _ => self.pick_variant(candidates, Some(&self.definitions[caller].cfg)),
+        }
+    }
+
+    /// The repository function a call in `caller`'s body reaches, if Rust's
+    /// rules pin it down: a path by scoping (a unique-name guess does not
+    /// count), `Type::f` and `Self::f` by the `impl` blocks of that type,
+    /// and `value.method()` by the type of `value`. Anything else stays
+    /// unresolved.
+    pub(crate) fn resolve_callee(&self, caller: usize, target: &HandlerTarget) -> Option<usize> {
+        let found = match target {
+            HandlerTarget::Method { receiver, method } => {
+                let ty = self.receiver_type(caller, receiver)?;
+                self.single(&self.methods_of(&ty, method), caller)
+            }
+            HandlerTarget::Path { segments, .. } => {
+                match self.resolve_call(caller, target) {
+                    (Some(callee), resolution) if !matches!(resolution, HandlerResolution::UniqueName) => {
+                        Some(callee)
+                    }
+                    _ => {
+                        let [.., owner, name] = segments.as_slice() else {
+                            return None;
+                        };
+                        let owner = if owner == "Self" {
+                            self.definitions[caller].owner.clone()?
+                        } else if owner.starts_with(char::is_uppercase) {
+                            owner.clone()
+                        } else {
+                            return None;
+                        };
+                        let ty = syn::parse_str::<Type>(&owner).ok()?;
+                        self.single(&self.methods_of(&ty, name), caller)
+                    }
+                }
+            }
+            HandlerTarget::Other => None,
+        };
+        found.filter(|&callee| callee != caller)
+    }
+}
+
+/// Collects the declared types of a function's named values.
+struct LocalTypes<'i, 'a> {
+    index: &'i HandlerIndex<'a>,
+    owner: Option<String>,
+    types: HashMap<String, Type>,
+    conflicted: HashSet<String>,
+}
+
+impl LocalTypes<'_, '_> {
+    fn insert(&mut self, name: String, ty: Type) {
+        if self.conflicted.contains(&name) {
+            return;
+        }
+        match self.types.get(&name) {
+            Some(existing)
+                if quote::ToTokens::to_token_stream(existing).to_string()
+                    != quote::ToTokens::to_token_stream(&ty).to_string() =>
+            {
+                self.types.remove(&name);
+                self.conflicted.insert(name);
+            }
+            Some(_) => {}
+            None => {
+                self.types.insert(name, ty);
+            }
+        }
+    }
+
+    /// Binds the names of `pattern`, matched against a value of type `ty`:
+    /// `ActixAuth(auth): ActixAuth` gives `auth` the type of the struct's
+    /// field `0`.
+    fn bind(&mut self, pattern: &syn::Pat, ty: &Type) {
+        match pattern {
+            syn::Pat::Ident(ident) => {
+                self.insert(ident.ident.to_string(), ty.clone());
+                if let Some((_, inner)) = &ident.subpat {
+                    self.bind(inner, ty);
+                }
+            }
+            syn::Pat::Reference(reference) => self.bind(&reference.pat, ty),
+            syn::Pat::Paren(paren) => self.bind(&paren.pat, ty),
+            syn::Pat::Type(typed) => self.bind(&typed.pat, &typed.ty),
+            syn::Pat::TupleStruct(tuple) => {
+                for (position, element) in tuple.elems.iter().enumerate() {
+                    if let Some(field) = self.index.field_type(ty, &position.to_string()) {
+                        self.bind(element, &field);
+                    }
+                }
+            }
+            syn::Pat::Struct(structure) => {
+                for field in &structure.fields {
+                    if let syn::Member::Named(name) = &field.member
+                        && let Some(field_ty) = self.index.field_type(ty, &name.to_string())
+                    {
+                        self.bind(&field.pat, &field_ty);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The type of an initializer Archer can read without inference: a
+    /// struct literal, or `Type::f(..)` with `f`'s declared return type,
+    /// through `?` and `.await`.
+    fn initializer_type(&self, expr: &syn::Expr) -> Option<Type> {
+        match expr {
+            syn::Expr::Struct(literal) if literal.qself.is_none() => {
+                let name = literal.path.segments.last()?.ident.to_string();
+                let name = if name == "Self" { self.owner.clone()? } else { name };
+                syn::parse_str::<Type>(&name).ok()
+            }
+            syn::Expr::Await(inner) => self.initializer_type(&inner.base),
+            syn::Expr::Try(inner) => {
+                let ty = self.initializer_type(&inner.expr)?;
+                match type_name(&ty).as_deref() {
+                    Some(name) if name.ends_with("Result") || name == "Option" => {
+                        type_arguments(&ty).first().map(|inner| (*inner).clone())
+                    }
+                    _ => Some(ty),
+                }
+            }
+            syn::Expr::Call(call) => {
+                let syn::Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                let [.., owner, name] = segments.as_slice() else {
+                    return None;
+                };
+                let owner = if owner == "Self" { self.owner.clone()? } else { owner.clone() };
+                if !owner.starts_with(char::is_uppercase) {
+                    return None;
+                }
+                let [callee] = self.index.methods.get(&(owner.clone(), name.clone()))?.as_slice() else {
+                    return None;
+                };
+                let syn::ReturnType::Type(_, returned) = &self.index.items[*callee].sig.output else {
+                    return None;
+                };
+                Some(replace_self(returned, &owner))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `ty` with `Self` written as `owner`: `Result<Self, E>` read in
+/// `impl Session` is `Result<Session, E>`.
+fn replace_self(ty: &Type, owner: &str) -> Type {
+    let written = quote::ToTokens::to_token_stream(ty).to_string();
+    let replaced: Vec<String> = written
+        .split(' ')
+        .map(|token| if token == "Self" { owner.to_owned() } else { token.to_owned() })
+        .collect();
+    syn::parse_str::<Type>(&replaced.join(" ")).unwrap_or_else(|_| ty.clone())
+}
+
+impl<'ast> syn::visit::Visit<'ast> for LocalTypes<'_, '_> {
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        match &node.pat {
+            syn::Pat::Type(typed) => self.bind(&typed.pat, &typed.ty),
+            pattern => {
+                if let Some(init) = &node.init
+                    && init.diverge.is_none()
+                    && let Some(ty) = self.initializer_type(&init.expr)
+                {
+                    self.bind(pattern, &ty);
+                }
+            }
+        }
+        syn::visit::visit_local(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        for input in &node.inputs {
+            if let syn::Pat::Type(typed) = input {
+                self.bind(&typed.pat, &typed.ty);
+            }
+        }
+        syn::visit::visit_expr_closure(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+    fn visit_item_impl(&mut self, _: &'ast syn::ItemImpl) {}
+}
+
+fn same_evidence(left: &AuthEvidence, right: &AuthEvidence) -> bool {
+    left.kind == right.kind && left.file == right.file && left.line == right.line
+}
+
+/// Adds `found` unless the same check (kind and location) is there; the
+/// first, shortest chain is kept.
+fn merge_evidence(evidence: &mut Vec<AuthEvidence>, found: AuthEvidence) -> bool {
+    if evidence.iter().any(|existing| same_evidence(existing, &found)) {
+        return false;
+    }
+    evidence.push(found);
+    true
 }

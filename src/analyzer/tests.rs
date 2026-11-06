@@ -4888,3 +4888,203 @@ async fn b() {}
     assert!(group.description.contains("cannot evaluate"), "{}", group.description);
     assert!(!group.description.contains("meant to be public"), "{}", group.description);
 }
+
+fn followed_checks_fixture() -> Report {
+    TempRepo::new(
+        "f48-followed-checks",
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (
+                "src/main.rs",
+                include_str!("../../tests/fixtures/probes/drift/f48_followed_checks/main.rs"),
+            ),
+            (
+                "src/store.rs",
+                include_str!("../../tests/fixtures/probes/drift/f48_followed_checks/store.rs"),
+            ),
+        ],
+    )
+    .analyze()
+}
+
+fn evidence_symbols(report: &Report, method: &str, path: &str) -> Vec<(AuthEvidenceKind, String)> {
+    report
+        .routes
+        .iter()
+        .find(|route| route.method == method && route.path == path)
+        .unwrap_or_else(|| panic!("no route {method} {path}"))
+        .authorization
+        .iter()
+        .map(|evidence| (evidence.kind.clone(), evidence.symbol.clone().unwrap_or_default()))
+        .collect()
+}
+
+#[test]
+fn checks_in_methods_and_service_functions_are_followed() {
+    let report = followed_checks_fixture();
+    // The routes that skip the check their peers make are the ones reported.
+    assert_eq!(
+        reported(&report),
+        vec![
+            (FindingCategory::MissingAuthorization, "DELETE".to_string(), "/boards/{id}".to_string()),
+            (FindingCategory::SkipsPeerCheck, "POST".to_string(), "/notes/d".to_string()),
+        ]
+    );
+    // A method of the caller type, two levels deep, is cited with its chain.
+    let skipped = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.path == "/notes/d")
+        .unwrap();
+    assert!(
+        skipped.rationale.contains("create_a -> require_account -> `require_active` at"),
+        "{}",
+        skipped.rationale
+    );
+    // `store::Boards::rename(..)`, an associated function in another module,
+    // and the helper behind a recursive one are both followed to the owner
+    // comparison.
+    for method in ["PATCH", "POST", "PUT"] {
+        let found = evidence_symbols(&report, method, "/boards/{id}");
+        assert!(
+            found.iter().any(|(kind, symbol)| *kind == AuthEvidenceKind::OwnershipCheck
+                && symbol.contains("ensure_owner -> caller . account != Some (board . owner)")),
+            "{method}: {found:?}"
+        );
+    }
+    let missing = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.suspicious_route.method == "DELETE")
+        .unwrap();
+    assert!(missing.rationale.contains("ensure_owner"), "{}", missing.rationale);
+    assert!(missing.rationale.contains("store.rs:"), "{}", missing.rationale);
+}
+
+#[test]
+fn build_variants_and_deep_helper_chains_are_followed() {
+    let report = drift_fixture(
+        "f49",
+        include_str!("../../tests/fixtures/probes/drift/f49_build_variants_and_deep_helpers.rs"),
+    );
+    // `ops::remove` has a `full` and a `lite` variant; the handler is built
+    // with `full`, whose variant makes the check.
+    let removed = evidence_symbols(&report, "DELETE", "/items/{id}");
+    assert!(
+        removed.contains(&(AuthEvidenceKind::RoleCheck, "remove -> require_admin".to_string())),
+        "{removed:?}"
+    );
+    // Four calls deep: past the old limit of three.
+    let replaced = evidence_symbols(&report, "PUT", "/items/{id}");
+    assert!(
+        replaced.contains(&(
+            AuthEvidenceKind::RoleCheck,
+            "step_one -> step_two -> step_three -> step_four -> require_admin".to_string()
+        )),
+        "{replaced:?}"
+    );
+}
+
+#[test]
+fn structural_checks_need_a_branch_on_the_callers_own_value() {
+    let repo = TempRepo::new(
+        "structural-checks",
+        &[(
+            "main.rs",
+            "use actix_web::{web, App, HttpResponse};
+pub struct AuthenticatedUser { pub id: u64, pub suspended: bool }
+pub struct Fault;
+fn app() { App::new().route(\"/a\", web::post().to(a)).route(\"/b\", web::post().to(b)); }
+async fn a(user: AuthenticatedUser) -> Result<HttpResponse, Fault> {
+    if user.suspended { return Err(Fault); }
+    Ok(HttpResponse::Ok().finish())
+}
+async fn b(user: AuthenticatedUser) -> Result<HttpResponse, Fault> {
+    match lookup(user.id) { Some(_) => Ok(HttpResponse::Ok().finish()), None => Err(Fault) }
+}
+fn lookup(id: u64) -> Option<u64> { Some(id) }
+",
+        )],
+    );
+    let report = repo.analyze();
+    let structural = |path: &str| -> Vec<String> {
+        evidence_symbols(&report, "POST", path)
+            .into_iter()
+            .filter(|(kind, symbol)| *kind == AuthEvidenceKind::IdentityExtraction && symbol != "AuthenticatedUser")
+            .map(|(_, symbol)| symbol)
+            .collect()
+    };
+    // A branch on the caller's attribute is a check on the caller.
+    assert_eq!(structural("/a"), vec!["user . suspended".to_string()]);
+    // A branch on what a free function returns for the caller's id is not:
+    // the result need not be about the caller.
+    assert!(structural("/b").is_empty(), "{:?}", structural("/b"));
+}
+
+#[test]
+fn a_resolved_method_replaces_the_not_analyzed_note() {
+    let repo = TempRepo::new(
+        "resolved-method-note",
+        &[(
+            "main.rs",
+            "use actix_web::{web, App, HttpResponse};
+pub struct AuthenticatedUser { pub id: u64 }
+impl AuthenticatedUser {
+    pub fn display_id(&self) -> u64 { self.id }
+}
+fn app() { App::new().route(\"/a\", web::get().to(a)); }
+async fn a(user: AuthenticatedUser) -> HttpResponse {
+    let _ = user.display_id();
+    HttpResponse::Ok().finish()
+}
+",
+        )],
+    );
+    let report = repo.analyze();
+    // `display_id` is a getter: once resolved, nothing is left unanalyzed.
+    let found = evidence_symbols(&report, "GET", "/a");
+    assert!(
+        !found.iter().any(|(kind, _)| *kind == AuthEvidenceKind::Delegated),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_helpers_check_on_its_caller_parameter_needs_the_callers_own_value() {
+    let repo = TempRepo::new(
+        "structural-through-helpers",
+        &[(
+            "main.rs",
+            "use actix_web::{web, App, HttpResponse};
+pub struct AuthenticatedUser { pub id: u64, pub suspended: bool }
+pub struct Submission { pub author: AuthenticatedUser }
+pub struct Fault;
+fn app() { App::new().route(\"/c\", web::post().to(c)).route(\"/d\", web::post().to(d)); }
+fn ensure_active(user: &AuthenticatedUser) -> Result<(), Fault> {
+    if user.suspended { return Err(Fault); }
+    Ok(())
+}
+async fn c(user: AuthenticatedUser) -> Result<HttpResponse, Fault> {
+    ensure_active(&user)?;
+    Ok(HttpResponse::Ok().finish())
+}
+async fn d(form: web::Json<Submission>) -> Result<HttpResponse, Fault> {
+    ensure_active(&form.author)?;
+    Ok(HttpResponse::Ok().finish())
+}
+",
+        )],
+    );
+    let report = repo.analyze();
+    let structural = |path: &str| -> Vec<String> {
+        evidence_symbols(&report, "POST", path)
+            .into_iter()
+            .filter(|(kind, symbol)| *kind == AuthEvidenceKind::IdentityExtraction && symbol != "AuthenticatedUser")
+            .map(|(_, symbol)| symbol)
+            .collect()
+    };
+    // The handler passes its own caller: the helper's branch checks it.
+    assert_eq!(structural("/c"), vec!["ensure_active -> user . suspended".to_string()]);
+    // A user record read from the request body is not the caller.
+    assert!(structural("/d").is_empty(), "{:?}", structural("/d"));
+}

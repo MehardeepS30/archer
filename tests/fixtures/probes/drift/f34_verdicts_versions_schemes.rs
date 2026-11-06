@@ -44,7 +44,11 @@ async fn search(user: Option<LocalUserView>, site: web::Data<Site>) { check_priv
 async fn get_feeds(user: Option<LocalUserView>, site: web::Data<Site>) { check_private_instance(&user, &site)?; }
 async fn get_multi(user: Option<LocalUserView>, site: web::Data<Site>) { let multi = MultiView::read(&site, &user)?; }
 
-fn check_private_instance(user: &Option<LocalUserView>, site: &Site) -> LemmyResult<()> { Ok(()) }
+// A verdict: it rejects in a branch on the caller.
+fn check_private_instance(user: &Option<LocalUserView>, site: &Site) -> LemmyResult<()> {
+    if user.is_none() && site.private_instance { return Err(LemmyErrorType::InstanceIsPrivate.into()); }
+    Ok(())
+}
 
 async fn set_bio(user: LocalUserView) { refresh_profile(&user)?; }
 async fn set_avatar(user: LocalUserView) { refresh_profile(&user)?; }

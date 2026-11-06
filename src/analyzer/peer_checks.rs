@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    caller_use::UNKNOWN_TYPE,
+    caller_use::{SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
     drift::{
         is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
         placement, route_identity, unique_routes,
@@ -39,9 +39,10 @@ const NAMED: usize = 3;
 /// A feature as peers are compared on it. A call's identity label is
 /// dropped: a helper that takes `&LocalUserView` and a handler that holds
 /// `Option<LocalUserView>` make the same check.
-fn compared(feature: &str) -> String {
+pub(crate) fn compared(feature: &str) -> String {
     match feature.strip_prefix("checks:") {
-        Some(rest) => match rest.rsplit_once(':') {
+        // The label has no `:`; the callee can (`Post::read`).
+        Some(rest) => match rest.split_once(':') {
             Some((_, callee)) => format!("checks:{callee}"),
             None => feature.to_string(),
         },
@@ -59,6 +60,8 @@ struct Features {
     calls: BTreeSet<String>,
     /// Requirement arguments it passes them, as `f#i`, with what it passes.
     requires: BTreeMap<String, String>,
+    /// Where each compared check is made (see `caller_use::SITE`).
+    sites: BTreeMap<String, String>,
 }
 
 impl Features {
@@ -77,8 +80,13 @@ fn features(route: &Route) -> Features {
     let mut auths = BTreeSet::new();
     let mut calls = BTreeSet::new();
     let mut requires = BTreeMap::new();
+    let mut sites = BTreeMap::new();
     for feature in &route.caller_use {
-        if let Some(label) = feature.strip_prefix("takes:") {
+        if let Some(site) = feature.strip_prefix(SITE) {
+            if let Some((feature, chain)) = site.split_once(SITE_SEPARATOR) {
+                sites.insert(feature.to_string(), chain.to_string());
+            }
+        } else if let Some(label) = feature.strip_prefix("takes:") {
             takes.insert(label.to_string());
         } else if let Some(name) = feature.strip_prefix("scheme:") {
             schemes.insert(name.to_string());
@@ -103,6 +111,7 @@ fn features(route: &Route) -> Features {
         auths,
         calls,
         requires,
+        sites,
     }
 }
 
@@ -797,10 +806,32 @@ pub(crate) fn skipped_peer_checks(
             dominant_requirement: Some(top_feature.clone()),
         };
         invariants.push(invariant.clone());
+        // A route that gets the caller from an identity source those peers
+        // do not call (a login step's `auth_finish(&req, ..)`) may
+        // establish it by a different means.
+        let own_source: Option<&String> = own.calls.iter().find(|source| {
+            top_having
+                .iter()
+                .all(|&other| !featured[other].calls.contains(*source))
+        });
+        // Where one of those peers makes the check, so the finding can be
+        // verified: the call chain from its handler to the check call.
+        let example = top_having.iter().find_map(|&other| {
+            featured[other].sites.get(top_feature).map(|site| {
+                format!(
+                    " For example, {} {} makes it as {site}.",
+                    eligible[other].method, eligible[other].path
+                )
+            })
+        });
         let rationale = format!(
-            "Its {} peers make a check with the caller that this route does not: {}. Dismiss if the difference is intended.",
+            "Its {} peers make a check with the caller that this route does not: {}.{}{} Dismiss if the difference is intended.",
             place.class,
-            named.join("; ")
+            named.join("; "),
+            example.unwrap_or_default(),
+            own_source
+                .map(|source| format!(" It gets the caller through `{source}` instead, which they do not call."))
+                .unwrap_or_default()
         );
         // A field the peers read and this route does not is a lead, not a
         // skipped check, unless a call or comparison backs it.
@@ -822,6 +853,7 @@ pub(crate) fn skipped_peer_checks(
         });
         let severity = if app_wide
             || unknown
+            || own_source.is_some()
             || skipped
                 .iter()
                 .all(|(feature, _)| feature.starts_with("reads:"))

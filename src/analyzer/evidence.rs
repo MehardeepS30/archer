@@ -62,6 +62,31 @@ pub(crate) struct FunctionEvidence {
     pub(crate) calls: Vec<HelperCall>,
     /// Repository functions called in a `bool` function's returned value.
     pub(crate) predicate_calls: Vec<HandlerTarget>,
+    /// Every repository call with the bindings its receiver and arguments
+    /// are read from (`check(&user.person)` reads `user`).
+    pub(crate) call_roots: Vec<(HandlerTarget, Vec<String>)>,
+}
+
+/// Mechanism of a check read from a function's structure: a branch on a
+/// caller value that rejects (see `structural_checks`).
+pub(crate) const STRUCTURAL_CHECK: &str = "rejects the request unless a caller";
+
+/// The binding an expression is read from: `user` for `&user.person.id`,
+/// `principal.validate()?` or `*user`.
+pub(crate) fn root_binding(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) if path.qself.is_none() => path.path.get_ident().map(ToString::to_string),
+        Expr::Field(field) => root_binding(&field.base),
+        Expr::MethodCall(call) => root_binding(&call.receiver),
+        Expr::Reference(inner) => root_binding(&inner.expr),
+        Expr::Paren(inner) => root_binding(&inner.expr),
+        Expr::Group(inner) => root_binding(&inner.expr),
+        Expr::Unary(inner) => root_binding(&inner.expr),
+        Expr::Try(inner) => root_binding(&inner.expr),
+        Expr::Await(inner) => root_binding(&inner.base),
+        Expr::Cast(inner) => root_binding(&inner.expr),
+        _ => None,
+    }
 }
 
 pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> {
@@ -69,6 +94,12 @@ pub(crate) fn handler_evidence(file: &Path, item: &ItemFn) -> Vec<AuthEvidence> 
 }
 
 pub(crate) fn function_evidence(file: &Path, item: &ItemFn) -> FunctionEvidence {
+    function_evidence_in(file, item, None)
+}
+
+/// Like `function_evidence`, for a function of an `impl` block of `owner`:
+/// in a method of an identity type, `self` is the caller.
+pub(crate) fn function_evidence_in(file: &Path, item: &ItemFn, owner: Option<&str>) -> FunctionEvidence {
     let handler = item.sig.ident.to_string();
     let mut evidence = signature_evidence(file, &handler, &item.attrs, &item.sig.inputs);
     let mut visitor = AuthEvidenceVisitor::new(file, &handler);
@@ -91,6 +122,25 @@ pub(crate) fn function_evidence(file: &Path, item: &ItemFn) -> FunctionEvidence 
             FnArg::Receiver(_) => None,
         })),
     ));
+    let mut caller = identity_bindings(item.sig.inputs.iter().filter_map(|input| match input {
+        FnArg::Typed(typed) => Some((&*typed.pat, &*typed.ty)),
+        FnArg::Receiver(_) => None,
+    }));
+    if item.sig.receiver().is_some()
+        && owner
+            .and_then(|owner| syn::parse_str::<Type>(owner).ok())
+            .is_some_and(|ty| identity_type(&ty))
+    {
+        caller.insert("self".to_owned());
+    }
+    for found in structural_checks(file, &handler, &item.block, caller) {
+        if !body_evidence
+            .iter()
+            .any(|existing| existing.line == found.line && EvidenceTier::of(&existing.kind) >= EvidenceTier::of(&found.kind))
+        {
+            body_evidence.push(found);
+        }
+    }
     evidence.extend(body_evidence.iter().cloned());
     FunctionEvidence {
         evidence,
@@ -98,6 +148,7 @@ pub(crate) fn function_evidence(file: &Path, item: &ItemFn) -> FunctionEvidence 
         predicate_evidence: visitor.predicate_evidence,
         calls: visitor.calls,
         predicate_calls: visitor.predicate_calls,
+        call_roots: visitor.call_roots,
     }
 }
 
@@ -790,6 +841,7 @@ pub(crate) struct AuthEvidenceVisitor {
     pub(crate) predicate_evidence: Vec<AuthEvidence>,
     pub(crate) calls: Vec<HelperCall>,
     pub(crate) predicate_calls: Vec<HandlerTarget>,
+    pub(crate) call_roots: Vec<(HandlerTarget, Vec<String>)>,
     use_: Use,
     /// The function returns `bool`: its returned value is a predicate.
     returns_bool: bool,
@@ -852,6 +904,7 @@ impl AuthEvidenceVisitor {
             predicate_evidence: Vec::new(),
             calls: Vec::new(),
             predicate_calls: Vec::new(),
+            call_roots: Vec::new(),
             use_: Use::Statement,
             returns_bool: false,
             in_returned_value: false,
@@ -1104,6 +1157,8 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             self.record(evidence, imperative);
         }
         if let Some(target) = handler_target(&node.func) {
+            let roots = node.args.iter().filter_map(root_binding).collect();
+            self.call_roots.push((target.clone(), roots));
             self.record_call(target);
         }
         self.with_use(Use::Value, |visitor| {
@@ -1129,6 +1184,19 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             evidence.requirements = requirement_keys(&method, &node.args);
             let imperative = is_imperative(&method, &evidence.kind);
             self.record(evidence, imperative);
+        }
+        // Resolved later by the receiver's type, like a call by path.
+        if let Some(receiver) = receiver_path(&node.receiver) {
+            let target = HandlerTarget::Method {
+                receiver,
+                method: method.clone(),
+            };
+            let roots = std::iter::once(&*node.receiver)
+                .chain(&node.args)
+                .filter_map(root_binding)
+                .collect();
+            self.call_roots.push((target.clone(), roots));
+            self.record_call(target);
         }
         self.visit_expr(&node.receiver);
         // A filter whose result decides a rejection (`let Some(a) =
@@ -2687,4 +2755,259 @@ fn component_name(path: &syn::Path) -> Option<String> {
         .find(|name| name.chars().next().is_some_and(char::is_uppercase))
         .or_else(|| segments.iter().rev().find(meaningful))
         .cloned()
+}
+
+/// A method call's receiver as a binding and fields: `principal`,
+/// `self.auth`, `auth.0`, through references and conversions
+/// (`principal.clone()`, `&*auth`).
+pub(crate) fn receiver_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) if path.qself.is_none() => path.path.get_ident().map(ToString::to_string),
+        Expr::Field(field) => {
+            let base = receiver_path(&field.base)?;
+            Some(match &field.member {
+                syn::Member::Named(name) => format!("{base}.{name}"),
+                syn::Member::Unnamed(index) => format!("{base}.{}", index.index),
+            })
+        }
+        Expr::Reference(reference) => receiver_path(&reference.expr),
+        Expr::Paren(paren) => receiver_path(&paren.expr),
+        Expr::Group(group) => receiver_path(&group.expr),
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => receiver_path(&unary.expr),
+        Expr::MethodCall(call)
+            if ["clone", "as_ref", "borrow", "deref", "into_inner", "as_deref"]
+                .iter()
+                .any(|name| call.method == name)
+                && call.args.is_empty() =>
+        {
+            receiver_path(&call.receiver)
+        }
+        _ => None,
+    }
+}
+
+/// Checks a function makes by its structure, whatever its names: a branch
+/// that rejects the request (`Err(..)`, a 401/403 response, `bail!`) and
+/// whose condition depends on the caller. What the condition does with
+/// the caller decides the kind:
+/// - it tests that a caller value is present (`if let Some(s) =
+///   &self.session`, `let Some(u) = .. else`): identity;
+/// - it compares a caller value with a value that is neither the caller's
+///   nor a constant (`post.creator_id != user.id`): ownership;
+/// - it tests a caller attribute or a flag computed from the caller
+///   (`if !user.admin`, `if user.banned`, `if !self.is_admin()`): identity
+///   as well, since the structure does not say whether the attribute is a
+///   privilege or an account state. Named checks (`is_admin`, `has_role`)
+///   still raise it to a role check.
+///
+/// Comparisons with constants (`state == SessionState::Auth`) are left to
+/// the named checks: their meaning depends on the constant.
+fn structural_checks(
+    file: &Path,
+    handler: &str,
+    block: &Block,
+    caller: HashSet<String>,
+) -> Vec<AuthEvidence> {
+    if caller.is_empty() {
+        return Vec::new();
+    }
+    let mut visitor = StructuralChecks {
+        file,
+        handler,
+        caller,
+        evidence: Vec::new(),
+    };
+    visitor.visit_block(block);
+    visitor.evidence
+}
+
+struct StructuralChecks<'f> {
+    file: &'f Path,
+    handler: &'f str,
+    /// Names holding the caller or a value computed from it.
+    caller: HashSet<String>,
+    evidence: Vec<AuthEvidence>,
+}
+
+impl StructuralChecks<'_> {
+    /// Whether an expression is a caller value itself: a caller binding, a
+    /// field of one, or a method called on one (`self.session`,
+    /// `user.local_user.admin`, `principal.is_admin()`), through `&`, `*`,
+    /// `?` and `.await`. A value a free function computes from the caller
+    /// is not: what it returns need not be about the caller.
+    fn derives(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(path) if path.qself.is_none() => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.caller.contains(&ident.to_string())),
+            Expr::Field(field) => self.derives(&field.base),
+            Expr::MethodCall(call) => self.derives(&call.receiver),
+            Expr::Reference(inner) => self.derives(&inner.expr),
+            Expr::Paren(inner) => self.derives(&inner.expr),
+            Expr::Group(inner) => self.derives(&inner.expr),
+            Expr::Unary(inner) => self.derives(&inner.expr),
+            Expr::Try(inner) => self.derives(&inner.expr),
+            Expr::Await(inner) => self.derives(&inner.base),
+            Expr::Cast(inner) => self.derives(&inner.expr),
+            _ => false,
+        }
+    }
+
+    fn constant(expr: &Expr) -> bool {
+        match expr {
+            Expr::Lit(_) => true,
+            Expr::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                segment.ident.to_string().starts_with(char::is_uppercase)
+            }),
+            Expr::Reference(reference) => Self::constant(&reference.expr),
+            Expr::Paren(paren) => Self::constant(&paren.expr),
+            Expr::Call(call) => {
+                matches!(&*call.func, Expr::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Some"))
+                    && call.args.iter().all(Self::constant)
+            }
+            _ => false,
+        }
+    }
+
+    /// The kind of check a rejecting branch's condition makes.
+    fn classify(&self, condition: &Expr) -> Option<AuthEvidenceKind> {
+        let strongest = |left: Option<AuthEvidenceKind>, right: Option<AuthEvidenceKind>| match (left, right) {
+            (Some(left), Some(right)) => Some(if EvidenceTier::of(&right) > EvidenceTier::of(&left) { right } else { left }),
+            (left, right) => left.or(right),
+        };
+        match condition {
+            Expr::Paren(inner) => self.classify(&inner.expr),
+            Expr::Group(inner) => self.classify(&inner.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => self.classify(&unary.expr),
+            Expr::Await(inner) => self.classify(&inner.base),
+            Expr::Let(binding) => self
+                .derives(&binding.expr)
+                .then_some(AuthEvidenceKind::IdentityExtraction),
+            Expr::Binary(binary) => match binary.op {
+                BinOp::And(_) | BinOp::Or(_) => {
+                    strongest(self.classify(&binary.left), self.classify(&binary.right))
+                }
+                BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_) => {
+                    let (left, right) = (self.derives(&binary.left), self.derives(&binary.right));
+                    let other = match (left, right) {
+                        (true, false) => &binary.right,
+                        (false, true) => &binary.left,
+                        _ => return None,
+                    };
+                    (!Self::constant(other)).then_some(AuthEvidenceKind::OwnershipCheck)
+                }
+                _ => None,
+            },
+            Expr::MethodCall(call) => {
+                let method = call.method.to_string();
+                let receiver = self.derives(&call.receiver);
+                if ["is_some", "is_none", "is_ok", "is_err"].contains(&method.as_str()) {
+                    return receiver.then_some(AuthEvidenceKind::IdentityExtraction);
+                }
+                if receiver {
+                    Some(AuthEvidenceKind::IdentityExtraction)
+                } else if call.args.iter().any(|argument| self.derives(argument)) {
+                    // `post.editors.contains(&user.id)`: the caller in a
+                    // record's list.
+                    Some(AuthEvidenceKind::OwnershipCheck)
+                } else {
+                    None
+                }
+            }
+            Expr::Field(_) | Expr::Path(_) => self
+                .derives(condition)
+                .then_some(AuthEvidenceKind::IdentityExtraction),
+            _ => None,
+        }
+    }
+
+    fn push(&mut self, kind: AuthEvidenceKind, condition: &Expr, line: usize) {
+        let what = match (&kind, condition) {
+            (AuthEvidenceKind::OwnershipCheck, _) => "a caller value matches the data",
+            (_, Expr::Let(_)) => "a caller value is present",
+            (_, Expr::MethodCall(call)) if ["is_some", "is_none", "is_ok", "is_err"].iter().any(|probe| call.method == probe) => {
+                "a caller value is present"
+            }
+            _ => "a caller attribute allows it",
+        };
+        self.push_described(kind, what, condition, line);
+    }
+
+    fn push_described(&mut self, kind: AuthEvidenceKind, what: &str, condition: &Expr, line: usize) {
+        if self.evidence.iter().any(|existing| existing.line == line && existing.kind == kind) {
+            return;
+        }
+        let mut written = condition.to_token_stream().to_string();
+        if written.len() > 60 {
+            written.truncate(written.floor_char_boundary(57));
+            written.push_str("...");
+        }
+        self.evidence.push(AuthEvidence {
+            kind,
+            mechanism: format!("rejects the request unless {what} (`{written}`)"),
+            symbol: Some(written),
+            file: self.file.to_path_buf(),
+            line,
+            handler: Some(self.handler.to_owned()),
+            strength: AuthStrength::Medium,
+            requirements: Vec::new(),
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for StructuralChecks<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Some(init) = &node.init {
+            let derived = self.derives(&init.expr);
+            if derived
+                && let Some((_, diverge)) = &init.diverge
+                && super::caller_use::rejects_in(diverge)
+            {
+                self.push(AuthEvidenceKind::IdentityExtraction, &init.expr, node.let_token.span.start().line);
+            }
+            if derived {
+                let mut names = HashSet::new();
+                pattern_bindings(&node.pat, &mut names);
+                self.caller.extend(names);
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        let rejects = super::caller_use::rejects_in_block(&node.then_branch)
+            || node
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, otherwise)| super::caller_use::rejects_in(otherwise));
+        if rejects && let Some(kind) = self.classify(&node.cond) {
+            self.push(kind, &node.cond, node.if_token.span.start().line);
+        }
+        visit::visit_expr_if(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        if self.derives(&node.expr)
+            && node.arms.iter().any(|arm| super::caller_use::rejects_in(&arm.body))
+        {
+            let presence = node.arms.iter().all(|arm| match &arm.pat {
+                Pat::TupleStruct(tuple) => tuple
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| ["Some", "Ok", "Err"].contains(&segment.ident.to_string().as_str())),
+                Pat::Ident(ident) => ident.ident == "None",
+                Pat::Path(path) => path.path.is_ident("None"),
+                Pat::Wild(_) => true,
+                _ => false,
+            });
+            let what = if presence { "a caller value is present" } else { "a caller attribute allows it" };
+            self.push_described(AuthEvidenceKind::IdentityExtraction, what, &node.expr, node.match_token.span.start().line);
+        }
+        visit::visit_expr_match(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
 }

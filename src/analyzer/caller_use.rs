@@ -32,16 +32,16 @@
 //! - `compares:T`: it compares a value derived from the parameter with a
 //!   value that is not (a record's owner field, an id from the path).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::{
     BinOp, Expr, ExprClosure, FnArg, GenericArgument, ItemFn, Pat, PathArguments, Type,
     visit::{self, Visit},
 };
 
 use super::{
-    evidence::{identity_type, names_authentication},
-    handlers::{HandlerIndex, MAX_HELPER_DEPTH},
-    model::{HandlerResolution, Route},
+    evidence::{identity_type, names_authentication, receiver_path},
+    handlers::HandlerIndex,
+    model::Route,
     routes::{HandlerTarget, handler_target},
 };
 
@@ -90,119 +90,57 @@ const PROBES: [&str; 7] = [
 /// Caller-use features for each route, parallel to `routes`.
 ///
 /// A handler's features include those of the repository functions it
-/// calls, up to `MAX_HELPER_DEPTH` deep. A helper's parameter counts as the
+/// calls, however deep: free functions, methods of a typed value
+/// (`principal.validate()`), associated functions (`Type::check(..)`), and
+/// service functions in other modules. A callee's parameter counts as the
 /// caller's identity when its type is an identity type or when the call
 /// passes it a value derived from one (`delete_evidence(state,
-/// auth.profile_id, ..)`), so a check made in a service function is the
-/// handler's check.
+/// auth.profile_id, ..)`, or the receiver of `principal.validate()`), so a
+/// check made in a service function is the handler's check. Summaries are
+/// memoized per function and identity-bound parameters, and recomputed
+/// until they stop changing when calls form a cycle.
 pub(crate) fn caller_use<'f>(
     index: &HandlerIndex,
     files: impl IntoIterator<Item = &'f syn::File>,
     routes: &[Route],
 ) -> Vec<Vec<String>> {
-    let shapes = return_shapes(files);
-    let sources = std::rc::Rc::new(identity_sources(index, routes));
-    // A deciding call counts as a check only when the function it calls
-    // returns a verdict: `bool`, or a `Result`/`Option` of `()`. A call
-    // whose value is thrown away after `?` but that returns data
-    // (`update_profile(..)?;`) is a side effect, not a check. A call Archer
-    // cannot find stays a check.
-    let is_check = |caller: usize, candidate: &CheckCandidate| -> bool {
-        let definition = &index.definitions[caller];
-        if let Some(target) = &candidate.target
-            && let (Some(callee), resolution) =
-                index.resolve_handler_index(&definition.crate_key, &definition.module, target)
-            && !matches!(resolution, HandlerResolution::UniqueName)
-        {
-            return returns_verdict(&index.items[callee].sig.output);
-        }
-        match shapes.get(&candidate.name) {
-            Some(verdicts) if !verdicts.is_empty() => verdicts.iter().any(|verdict| *verdict),
-            _ => true,
-        }
+    let mut walker = Walker {
+        index,
+        shapes: return_shapes(files),
+        sources: std::rc::Rc::new(identity_sources(index, routes)),
+        analyzed: HashMap::new(),
+        summaries: HashMap::new(),
+        previous: HashMap::new(),
+        in_progress: HashSet::new(),
+        cycle: false,
     };
-    let mut analyzed: HashMap<(usize, Vec<(usize, String)>), Analysis> = HashMap::new();
-    let mut analyze = |definition: usize, bound: &[(usize, String)]| -> Analysis {
-        analyzed
-            .entry((definition, bound.to_vec()))
-            .or_insert_with(|| {
-                let mut analysis = analyze_function(index.items[definition], bound, &sources);
-                for candidate in std::mem::take(&mut analysis.checks) {
-                    if is_check(definition, &candidate) {
-                        analysis.features.insert(candidate.feature);
-                    } else if let Some(label) = candidate
-                        .feature
-                        .strip_prefix("checks:")
-                        .and_then(|rest| rest.rsplit_once(':'))
-                        .map(|(label, _)| label)
-                    {
-                        // Not a check, but the handler acts on the caller
-                        // deliberately; see `peer_checks`.
-                        analysis.features.insert(format!("acts:{label}"));
-                    }
-                }
-                analysis
-            })
-            .clone()
+    let roots: Vec<usize> = {
+        let mut seen = HashSet::new();
+        routes
+            .iter()
+            .filter_map(|route| route.origin.definition)
+            .filter(|definition| seen.insert(*definition))
+            .collect()
     };
     let mut combined: HashMap<usize, Vec<String>> = HashMap::new();
-    for route in routes {
-        let Some(definition) = route.origin.definition else {
-            continue;
-        };
-        if combined.contains_key(&definition) {
-            continue;
+    for _ in 0..MAX_ROUNDS {
+        walker.cycle = false;
+        for &definition in &roots {
+            let summary = walker.summary(definition, &[]);
+            let name = &index.definitions[definition].name;
+            let mut features: Vec<String> = summary.features.into_iter().collect();
+            features.extend(
+                summary
+                    .sites
+                    .iter()
+                    .map(|(feature, site)| format!("{SITE}{feature}{SITE_SEPARATOR}{name} -> {site}")),
+            );
+            combined.insert(definition, features);
         }
-        let root = analyze(definition, &[]);
-        let mut features = root.features.clone();
-        let mut stack = vec![(definition, root, 0usize)];
-        let mut seen: HashSet<(usize, Vec<(usize, String)>)> =
-            HashSet::from([(definition, Vec::new())]);
-        while let Some((current, analysis, depth)) = stack.pop() {
-            if depth == MAX_HELPER_DEPTH {
-                continue;
-            }
-            let caller = &index.definitions[current];
-            let mut callees: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
-            for (target, bound) in &analysis.flows {
-                if let (Some(callee), resolution) =
-                    index.resolve_handler_index(&caller.crate_key, &caller.module, target)
-                    && !matches!(resolution, HandlerResolution::UniqueName)
-                    && callee != current
-                {
-                    callees.push((callee, bound.clone()));
-                }
-            }
-            for (callee, _) in index.resolved_calls(current).calls {
-                callees.push((callee, Vec::new()));
-            }
-            // An identity source's own checks are compared through what
-            // its callers pass it (`calls:`, `requires:`), not credited to
-            // every caller.
-            callees.retain(|(callee, _)| !sources.contains(&index.definitions[*callee].name));
-            for (callee, bound) in callees {
-                if !seen.insert((callee, bound.clone())) {
-                    continue;
-                }
-                let helper = analyze(callee, &bound);
-                // A helper's parameters are values handed to it, not
-                // extractors: only what it reads, checks, and compares
-                // is the handler's doing.
-                features.extend(
-                    helper
-                        .features
-                        .iter()
-                        .filter(|feature| {
-                            !feature.starts_with("takes:")
-                                && !feature.starts_with("scheme:")
-                                && !feature.starts_with("auths:")
-                        })
-                        .cloned(),
-                );
-                stack.push((callee, helper, depth + 1));
-            }
+        if !walker.cycle || walker.summaries == walker.previous {
+            break;
         }
-        combined.insert(definition, features.into_iter().collect());
+        walker.previous = std::mem::take(&mut walker.summaries);
     }
     routes
         .iter()
@@ -216,23 +154,202 @@ pub(crate) fn caller_use<'f>(
         .collect()
 }
 
+/// Not a feature: where a route's check `feature` is made, written
+/// `site:feature\u{1f}chain`. `peer_checks` cites it in findings.
+pub(crate) const SITE: &str = "site:";
+pub(crate) const SITE_SEPARATOR: char = '\u{1f}';
+
+/// The last three components of a path, for evidence text.
+fn short_path(path: &std::path::Path) -> String {
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    components[components.len().saturating_sub(3)..].join("/")
+}
+
+/// How many times summaries are recomputed when calls form a cycle.
+const MAX_ROUNDS: usize = 4;
+
+/// A function, with the positions of its parameters bound to the caller's
+/// identity and that identity's label.
+type SummaryKey = (usize, Vec<(usize, String)>);
+
+#[derive(Clone, Default, PartialEq)]
+struct Summary {
+    features: BTreeSet<String>,
+    /// It can reject the request, in a branch that depends on the caller:
+    /// `if !self.is_admin() { return Err(..) }`, or a check call under `?`.
+    rejects: bool,
+    /// Where each check is made, by compared feature: the call chain from
+    /// this function and the check call's location.
+    sites: BTreeMap<String, String>,
+}
+
+struct Walker<'i, 'a> {
+    index: &'i HandlerIndex<'a>,
+    shapes: HashMap<String, Vec<bool>>,
+    sources: std::rc::Rc<HashSet<String>>,
+    analyzed: HashMap<SummaryKey, Analysis>,
+    summaries: HashMap<SummaryKey, Summary>,
+    /// The last round's summaries, used for a function met again while its
+    /// own summary is being computed.
+    previous: HashMap<SummaryKey, Summary>,
+    in_progress: HashSet<SummaryKey>,
+    cycle: bool,
+}
+
+impl Walker<'_, '_> {
+    fn analysis(&mut self, definition: usize, bound: &[(usize, String)]) -> Analysis {
+        let key = (definition, bound.to_vec());
+        if let Some(found) = self.analyzed.get(&key) {
+            return found.clone();
+        }
+        let analysis = analyze_function(&self.index.items[definition], bound, &self.sources);
+        self.analyzed.insert(key, analysis.clone());
+        analysis
+    }
+
+    /// Whether a deciding call is a check, and whether it makes the calling
+    /// function a check too: when Archer resolved it, or it is outside the
+    /// scan. A resolved call is a check when that function
+    /// returns `bool` or can reject on the identity it is given (a branch on
+    /// it rejects, or it makes such a check itself); a `Result<()>` that only
+    /// propagates other errors (`update_profile(..)?;`) is a side effect,
+    /// not a check. A call Archer cannot resolve stays a check when its name
+    /// returns a verdict somewhere, or nowhere is known.
+    fn is_check(&mut self, caller: usize, candidate: &CheckCandidate) -> (bool, bool) {
+        if let Some(target) = &candidate.target
+            && let Some(callee) = self.index.resolve_callee(caller, target)
+        {
+            let predicate = returns_bool(&self.index.items[callee].sig.output);
+            return (predicate || self.summary(callee, &candidate.bound).rejects, true);
+        }
+        match self.shapes.get(&candidate.name) {
+            // Defined in the scan but not resolved: its shape is a guess.
+            Some(verdicts) if !verdicts.is_empty() => (verdicts.iter().any(|verdict| *verdict), false),
+            // Outside the scan (a library's `authorize(&user)?`): a check
+            // whose code Archer cannot read.
+            _ => (true, true),
+        }
+    }
+
+    fn summary(&mut self, definition: usize, bound: &[(usize, String)]) -> Summary {
+        let key = (definition, bound.to_vec());
+        if let Some(found) = self.summaries.get(&key) {
+            return found.clone();
+        }
+        if self.in_progress.contains(&key) {
+            self.cycle = true;
+            return self.previous.get(&key).cloned().unwrap_or_default();
+        }
+        self.in_progress.insert(key.clone());
+        let analysis = self.analysis(definition, bound);
+        let mut summary = Summary {
+            features: analysis.features.clone(),
+            rejects: analysis.rejects,
+            sites: BTreeMap::new(),
+        };
+        for candidate in &analysis.checks {
+            let (check, resolved) = self.is_check(definition, candidate);
+            if check {
+                summary.features.insert(candidate.feature.clone());
+                // A check Archer followed, or library code, makes this
+                // function a check; a guess from a name defined in the scan
+                // does not.
+                summary.rejects |= resolved;
+                summary
+                    .sites
+                    .entry(super::peer_checks::compared(&candidate.feature))
+                    .or_insert_with(|| {
+                        format!(
+                            "`{}` at {}:{}",
+                            candidate.name,
+                            short_path(&self.index.definitions[definition].file),
+                            candidate.line
+                        )
+                    });
+            } else if let Some(label) = candidate
+                .feature
+                .strip_prefix("checks:")
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(label, _)| label)
+            {
+                // Not a check, but the handler acts on the caller
+                // deliberately; see `peer_checks`.
+                summary.features.insert(format!("acts:{label}"));
+            }
+        }
+        let mut callees: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
+        for (target, bound) in &analysis.flows {
+            if let Some(callee) = self.index.resolve_callee(definition, target) {
+                callees.push((callee, bound.clone()));
+            }
+        }
+        for (callee, _) in self.index.resolved_calls(definition).calls {
+            callees.push((callee, Vec::new()));
+        }
+        // An identity source's own checks are compared through what its
+        // callers pass it (`calls:`, `requires:`), not credited to every
+        // caller.
+        callees.retain(|(callee, _)| !self.sources.contains(&self.index.definitions[*callee].name));
+        let mut seen = HashSet::new();
+        for (callee, bound) in callees {
+            if !seen.insert((callee, bound.clone())) {
+                continue;
+            }
+            let helper = self.summary(callee, &bound);
+            let name = &self.index.definitions[callee].name;
+            for (feature, site) in &helper.sites {
+                summary
+                    .sites
+                    .entry(feature.clone())
+                    .or_insert_with(|| format!("{name} -> {site}"));
+            }
+            // A helper's parameters are values handed to it, not
+            // extractors: only what it reads, checks, and compares is the
+            // handler's doing.
+            summary.features.extend(
+                helper
+                    .features
+                    .iter()
+                    .filter(|feature| {
+                        !feature.starts_with("takes:")
+                            && !feature.starts_with("scheme:")
+                            && !feature.starts_with("auths:")
+                    })
+                    .cloned(),
+            );
+        }
+        self.in_progress.remove(&key);
+        self.summaries.insert(key, summary.clone());
+        summary
+    }
+}
+
 /// A call that decides something with the caller's identity, before Archer
 /// knows whether the called function returns a verdict.
 #[derive(Clone)]
 struct CheckCandidate {
     target: Option<HandlerTarget>,
+    /// The call's identity-derived arguments, by parameter position (the
+    /// receiver of a method call is position 0).
+    bound: Vec<(usize, String)>,
     /// The function or method name, for lookup when the path does not resolve.
     name: String,
     feature: String,
+    /// The line of the call.
+    line: usize,
 }
 
 #[derive(Clone, Default)]
 struct Analysis {
     features: BTreeSet<String>,
     checks: Vec<CheckCandidate>,
-    /// Calls by path that receive identity-derived arguments: the target,
-    /// and each such argument's position and identity label.
+    /// Calls that receive identity-derived arguments: the target, and each
+    /// such argument's position and identity label.
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
+    rejects: bool,
 }
 
 /// One function's features, with `bound` naming parameters (by position)
@@ -247,8 +364,14 @@ fn analyze_function(
         ..CallerUseVisitor::default()
     };
     for (position, input) in item.sig.inputs.iter().enumerate() {
-        let FnArg::Typed(typed) = input else {
-            continue;
+        let typed = match input {
+            FnArg::Typed(typed) => typed,
+            FnArg::Receiver(_) => {
+                if let Some((_, label)) = bound.iter().find(|(index, _)| *index == position) {
+                    visitor.bindings.insert("self".to_owned(), label.clone());
+                }
+                continue;
+            }
         };
         match bound.iter().find(|(index, _)| *index == position) {
             Some((_, label)) => {
@@ -258,10 +381,20 @@ fn analyze_function(
         }
     }
     visitor.visit_block(&item.block);
+    // A `Result` returned as the body's value is the caller's to
+    // propagate: `fn rename(..) -> Result<..> { ensure_owner(caller, &b) }`
+    // decides with the caller like `ensure_owner(..)?;` does.
+    if let syn::ReturnType::Type(_, ty) = &item.sig.output
+        && super::handlers::type_name(ty).is_some_and(|name| name.ends_with("Result"))
+        && let Some(syn::Stmt::Expr(tail, None)) = item.block.stmts.last()
+    {
+        visitor.decides(tail);
+    }
     Analysis {
         features: visitor.features,
         checks: visitor.checks,
         flows: visitor.flows,
+        rejects: visitor.rejects,
     }
 }
 
@@ -274,6 +407,8 @@ struct CallerUseVisitor {
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
     /// Functions whose returned value is the caller (see `identity_sources`).
     sources: std::rc::Rc<HashSet<String>>,
+    /// A branch that depends on the caller rejects the request.
+    rejects: bool,
 }
 
 impl CallerUseVisitor {
@@ -409,7 +544,8 @@ impl CallerUseVisitor {
                     .last()
                     .map(|segment| segment.ident.to_string())
                     .unwrap_or_default();
-                self.checks(&callee, handler_target(&call.func), name, call.args.iter());
+                let line = syn::spanned::Spanned::span(&call.func).start().line;
+                self.checks(&callee, handler_target(&call.func), name, line, call.args.iter());
             }
             Expr::MethodCall(call) => {
                 let method = call.method.to_string();
@@ -418,10 +554,15 @@ impl CallerUseVisitor {
                     self.decides(&call.receiver);
                     return;
                 }
+                let target = receiver_path(&call.receiver).map(|receiver| HandlerTarget::Method {
+                    receiver,
+                    method: method.clone(),
+                });
                 self.checks(
                     &method,
-                    None,
+                    target,
                     method.clone(),
+                    call.method.span().start().line,
                     std::iter::once(&*call.receiver).chain(call.args.iter()),
                 );
             }
@@ -440,21 +581,103 @@ impl CallerUseVisitor {
         callee: &str,
         target: Option<HandlerTarget>,
         name: String,
+        line: usize,
         arguments: impl Iterator<Item = &'e Expr>,
     ) {
         if TRANSPARENT_CALLS.contains(&callee) || PROBES.contains(&callee) {
             return;
         }
-        for argument in arguments {
-            if let Some(label) = self.derived(argument) {
-                self.checks.push(CheckCandidate {
-                    target: target.clone(),
-                    name: name.clone(),
-                    feature: format!("checks:{label}:{callee}"),
-                });
-            }
+        let bound: Vec<(usize, String)> = arguments
+            .enumerate()
+            .filter_map(|(position, argument)| self.derived(argument).map(|label| (position, label)))
+            .collect();
+        let mut labels: Vec<&String> = bound.iter().map(|(_, label)| label).collect();
+        labels.dedup();
+        for label in labels {
+            self.checks.push(CheckCandidate {
+                target: target.clone(),
+                bound: bound.clone(),
+                name: name.clone(),
+                feature: format!("checks:{label}:{callee}"),
+                line,
+            });
         }
     }
+
+    /// Whether an expression reads a name bound to the caller.
+    fn mentions_caller(&self, expr: &Expr) -> bool {
+        struct Mentions<'b> {
+            bindings: &'b HashMap<String, String>,
+            found: bool,
+        }
+        impl<'ast> Visit<'ast> for Mentions<'_> {
+            fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+                if node
+                    .path
+                    .get_ident()
+                    .is_some_and(|ident| self.bindings.contains_key(&ident.to_string()))
+                {
+                    self.found = true;
+                }
+            }
+            fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+        }
+        let mut mentions = Mentions {
+            bindings: &self.bindings,
+            found: false,
+        };
+        mentions.visit_expr(expr);
+        mentions.found
+    }
+}
+
+/// Whether code rejects the request: it builds an `Err`, or an
+/// `HttpResponse::Unauthorized()`/`Forbidden()`, or calls `bail!`.
+fn rejects(visit: impl FnOnce(&mut Rejects)) -> bool {
+    let mut found = Rejects(false);
+    visit(&mut found);
+    found.0
+}
+
+pub(crate) struct Rejects(pub(crate) bool);
+
+/// Whether an expression rejects a request anywhere outside closures.
+pub(crate) fn rejects_in(expr: &Expr) -> bool {
+    rejects(|found| found.visit_expr(expr))
+}
+
+pub(crate) fn rejects_in_block(block: &syn::Block) -> bool {
+    rejects(|found| found.visit_block(block))
+}
+
+/// Whether a function body rejects a request anywhere outside closures.
+pub(crate) fn block_rejects(block: &syn::Block) -> bool {
+    rejects(|found| found.visit_block(block))
+}
+
+impl<'ast> Visit<'ast> for Rejects {
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        let segments: Vec<String> = node
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let last = segments.last().map(String::as_str);
+        if last == Some("Err")
+            || matches!(last, Some("ErrorUnauthorized" | "ErrorForbidden"))
+            || (segments.iter().any(|segment| segment == "HttpResponse")
+                && matches!(last, Some("Unauthorized" | "Forbidden")))
+        {
+            self.0 = true;
+        }
+    }
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.segments.last().is_some_and(|segment| segment.ident == "bail") {
+            self.0 = true;
+        }
+    }
+    fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
 }
 
 impl CallerUseVisitor {
@@ -516,6 +739,14 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        // `let Some(user) = caller.user() else { return Err(..) };`
+        if let Some(init) = &node.init
+            && let Some((_, diverge)) = &init.diverge
+            && self.mentions_caller(&init.expr)
+            && rejects(|found| found.visit_expr(diverge))
+        {
+            self.rejects = true;
+        }
         // `let profile_id = auth.profile.map(..)` carries the identity on.
         if let Some(init) = &node.init
             && let Some(label) = self.derived(&init.expr)
@@ -543,6 +774,15 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             for arm in &node.arms {
                 self.bind_success(&arm.pat, &label);
             }
+        }
+        if self.mentions_caller(&node.expr)
+            && rejects(|found| {
+                for arm in &node.arms {
+                    found.visit_expr(&arm.body);
+                }
+            })
+        {
+            self.rejects = true;
         }
         visit::visit_expr_match(self, node);
     }
@@ -625,7 +865,40 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
         self.decides(&node.cond);
+        if self.mentions_caller(&node.cond)
+            && rejects(|found| {
+                found.visit_block(&node.then_branch);
+                if let Some((_, otherwise)) = &node.else_branch {
+                    found.visit_expr(otherwise);
+                }
+            })
+        {
+            self.rejects = true;
+        }
         visit::visit_expr_if(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // `principal.validate()` hands the caller to the method as `self`.
+        if let Some(receiver) = receiver_path(&node.receiver) {
+            let bound: Vec<(usize, String)> = std::iter::once(&*node.receiver)
+                .chain(node.args.iter())
+                .enumerate()
+                .filter_map(|(position, argument)| {
+                    self.derived(argument).map(|label| (position, label))
+                })
+                .collect();
+            if !bound.is_empty() {
+                self.flows.push((
+                    HandlerTarget::Method {
+                        receiver,
+                        method: node.method.to_string(),
+                    },
+                    bound,
+                ));
+            }
+        }
+        visit::visit_expr_method_call(self, node);
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
@@ -801,6 +1074,7 @@ fn identity_sources(index: &HandlerIndex, routes: &[Route]) -> HashSet<String> {
         .enumerate()
         .filter(|(position, (definition, item))| {
             !handlers.contains(position)
+                && definition.owner.is_none()
                 && matches!(item.sig.output, syn::ReturnType::Type(..))
                 && !returns_verdict(&item.sig.output)
                 && item
@@ -851,4 +1125,8 @@ fn names_caller(name: &str) -> bool {
             ]
             .contains(&word)
         })
+}
+
+fn returns_bool(output: &syn::ReturnType) -> bool {
+    matches!(output, syn::ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(path) if path.path.is_ident("bool")))
 }

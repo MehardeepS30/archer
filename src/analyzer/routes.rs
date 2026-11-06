@@ -308,7 +308,7 @@ impl<'a> RouteVisitor<'a> {
         }
         let index = self.index;
         let target = &index.definitions[definition];
-        let item = index.items[definition];
+        let item = &index.items[definition];
         let file = std::mem::replace(&mut self.file, target.file.clone());
         let crate_key = std::mem::replace(&mut self.crate_key, target.crate_key.clone());
         let module = std::mem::replace(&mut self.module, target.module.clone());
@@ -1950,12 +1950,17 @@ pub(crate) enum HandlerTarget {
     },
     /// Closures and other expressions that do not name a function.
     Other,
+    /// A method call in a body, `receiver.method(..)`, with the receiver
+    /// written as a binding and fields (`principal`, `self.auth`). Its type
+    /// is looked up where the call is resolved. Never a route handler.
+    Method { receiver: String, method: String },
 }
 
 impl HandlerTarget {
     pub(crate) fn name(&self) -> Option<String> {
         match self {
             Self::Path { segments, .. } => segments.last().cloned(),
+            Self::Method { method, .. } => Some(method.clone()),
             Self::Other => None,
         }
     }
@@ -1970,6 +1975,7 @@ impl HandlerTarget {
                 if *leading_colon { "::" } else { "" },
                 segments.join("::")
             )),
+            Self::Method { receiver, method } => Some(format!("{receiver}.{method}")),
             Self::Other => None,
         }
     }
