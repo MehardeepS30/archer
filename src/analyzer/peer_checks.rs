@@ -707,8 +707,20 @@ pub(crate) fn skipped_peer_checks(
             && !is_authentication_route(route)
             && !is_well_known_public_route(route)
     }));
+    // A route reported only for protection Archer cannot verify is still
+    // checked for an open scheme: one it names itself outweighs code Archer
+    // cannot follow, and that finding replaces the other.
+    let unverified: HashSet<_> = finding_details
+        .iter()
+        .filter(|finding| is_unverified_only(finding))
+        .map(|finding| {
+            let route = &finding.suspicious_route;
+            (route.method.clone(), route.path.clone(), route.handler.clone())
+        })
+        .collect();
     let reported: HashSet<_> = finding_details
         .iter()
+        .filter(|finding| !is_unverified_only(finding))
         .map(|finding| {
             let route = &finding.suspicious_route;
             (
@@ -820,9 +832,15 @@ pub(crate) fn skipped_peer_checks(
         }
         levels.push((APPLICATION.to_string(), peers.clone(), MIN_APP_POPULATION));
 
+        let only_unverified = unverified.contains(&(
+            route.method.clone(),
+            route.path.clone(),
+            route.handler.clone(),
+        ));
         // The most specific check first: a record the route loads and its
         // peers hold to the caller.
-        if let Some(finding) = unguarded_record(
+        if !only_unverified
+            && let Some(finding) = unguarded_record(
             route,
             own,
             index,
@@ -849,6 +867,9 @@ pub(crate) fn skipped_peer_checks(
             invariants,
         ) {
             finding_details.push(finding);
+            continue;
+        }
+        if only_unverified {
             continue;
         }
         // A route that calls the peers' identity source without the
@@ -953,11 +974,15 @@ pub(crate) fn skipped_peer_checks(
                 .strip_prefix("Option<")
                 .and_then(|rest| rest.strip_suffix('>'))
                 .unwrap_or(label);
+            // An authentication object passed to a wrapper is where the
+            // wrapper gets the caller it hands the handler: the peers pass
+            // one too, so it is not a different means.
             route.authorization.iter().any(|evidence| {
                 !matches!(
                     evidence.kind,
                     AuthEvidenceKind::Delegated | AuthEvidenceKind::Unknown
-                ) && EvidenceTier::of(&evidence.kind) >= EvidenceTier::Identity
+                ) && !super::auth_objects::is_learned(evidence)
+                    && EvidenceTier::of(&evidence.kind) >= EvidenceTier::Identity
                     && !(evidence.kind == AuthEvidenceKind::IdentityExtraction
                         && evidence.mechanism.contains(base))
             })
@@ -1175,4 +1200,25 @@ pub(crate) fn skipped_peer_checks(
                 .collect(),
         });
     }
+    drop_superseded_unverified(finding_details);
+}
+
+/// A finding that says only that the route has protection Archer cannot
+/// verify.
+fn is_unverified_only(finding: &Finding) -> bool {
+    finding.category == FindingCategory::UnverifiedProtection && finding.severity == Severity::Low
+}
+
+/// Drops an unverified-only finding for a route that has another one.
+pub(crate) fn drop_superseded_unverified(finding_details: &mut Vec<Finding>) {
+    let key = |finding: &Finding| {
+        let route = &finding.suspicious_route;
+        (route.method.clone(), route.path.clone(), route.handler.clone())
+    };
+    let other: HashSet<_> = finding_details
+        .iter()
+        .filter(|finding| !is_unverified_only(finding))
+        .map(key)
+        .collect();
+    finding_details.retain(|finding| !is_unverified_only(finding) || !other.contains(&key(finding)));
 }

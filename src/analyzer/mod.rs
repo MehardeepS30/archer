@@ -1,5 +1,6 @@
 //! Repository analysis: file discovery, parsing, and the extraction and inference pipeline.
 
+mod auth_objects;
 mod caller_use;
 mod config;
 mod drift;
@@ -145,6 +146,12 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // registrations can resolve handlers defined in other files.
     // Before the index, whose evidence uses what extractors check.
     extractors::index_extractors(parsed_files.iter().map(|(_, _, syntax)| syntax));
+    auth_objects::index_auth_objects(
+        parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)),
+    );
+    if std::env::var_os("ARCHER_DEBUG_AUTH_OBJECTS").is_some() {
+        auth_objects::dump();
+    }
     let crates = workspace_crates(parsed_files.iter().map(|((crate_key, _), _, _)| crate_key));
     let index = HandlerIndex::build(
         parsed_files
@@ -233,11 +240,13 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     }
 
     // Requirement subjects describe what a privilege check requires; on
-    // identity or unrecognized evidence they would only be noise.
+    // identity or unrecognized evidence they would only be noise. The route
+    // values an authentication object holds the caller to (`scope:team_id`)
+    // are kept for the scope check.
     for route in &mut routes {
         for evidence in &mut route.authorization {
             if EvidenceTier::of(&evidence.kind) != EvidenceTier::Privilege {
-                evidence.requirements.clear();
+                evidence.requirements.retain(|key| key.starts_with("scope:"));
             }
         }
         route.requirement = Requirement::of(route);

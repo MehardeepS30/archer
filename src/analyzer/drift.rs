@@ -514,6 +514,7 @@ pub(crate) fn build_analysis_layers_full(
     writes_below_resource(&candidates, &mut peer_groups, &mut invariants, &mut finding_details);
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    super::auth_objects::unscoped_objects(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     per_route_permissions(routes, &mut finding_details);
     for fallback in fallback_details {
         let route = &fallback.suspicious_route;

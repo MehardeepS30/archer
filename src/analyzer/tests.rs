@@ -5219,3 +5219,56 @@ fn a_presented_secret_compared_with_a_stored_one_is_a_secret_check() {
         EvidenceTier::Resource
     );
 }
+
+#[test]
+fn an_auth_object_passed_by_value_is_read_from_its_own_method() {
+    let report = drift_fixture(
+        "f54",
+        include_str!("../../tests/fixtures/probes/drift/f54_auth_values.rs"),
+    );
+    let route = |path: &str| report.routes.iter().find(|route| route.path == path).unwrap();
+    let kinds = |path: &str| {
+        let mut kinds: Vec<AuthEvidenceKind> =
+            route(path).authorization.iter().map(|evidence| evidence.kind.clone()).collect();
+        kinds.dedup();
+        kinds
+    };
+    // An object that admits anyone is no evidence, not a delegation.
+    assert!(route("/status").authorization.is_empty(), "{:#?}", route("/status").authorization);
+    assert_eq!(kinds("/me"), [AuthEvidenceKind::IdentityExtraction]);
+    // The permission and the team scope are read from the object's method.
+    let boards = &route("/teams/{team_id}/boards").authorization;
+    assert!(boards.iter().any(|evidence| evidence.kind == AuthEvidenceKind::PermissionCheck
+        && evidence.mechanism.contains("`require_permission`")
+        && evidence.mechanism.contains("`board_read`")));
+    assert!(boards.iter().any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck
+        && evidence.mechanism.contains("route's `team_id`")));
+    assert!(!boards.iter().any(|evidence| evidence.kind == AuthEvidenceKind::Delegated));
+    // Both objects a chooser picks from are read; the wrapper has the
+    // checks of what it wraps.
+    let remove = &route("/teams/{team_id}/boards/{board_id}").authorization;
+    assert!(remove.iter().any(|evidence| evidence.kind == AuthEvidenceKind::IdentityExtraction
+        && evidence.mechanism.contains("`Keyed(Member)`")
+        && evidence.mechanism.contains("`either` chooses from")));
+    assert!(remove.iter().any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck));
+    // An object of a type the crate does not define stays a delegation.
+    assert_eq!(kinds("/outside"), [AuthEvidenceKind::Delegated]);
+    // A key compared with the configured one is the operator's.
+    assert!(route("/maintenance/purge").authorization.iter().any(|evidence| {
+        EvidenceTier::of(&evidence.kind) == EvidenceTier::Privilege && evidence.mechanism.contains("`operator_key`")
+    }));
+
+    let findings: Vec<&Finding> = report.finding_details.iter().collect();
+    let labels: Vec<&&Finding> = findings
+        .iter()
+        .filter(|finding| finding.suspicious_route.path == "/teams/{team_id}/labels")
+        .collect();
+    assert_eq!(labels.len(), 1, "{findings:#?}");
+    assert_eq!(labels[0].category, FindingCategory::DifferentAuthorization);
+    assert_eq!(labels[0].severity, Severity::Medium);
+    assert!(labels[0].rationale.contains("Takes `{team_id}` but passes `Grant`"), "{}", labels[0].rationale);
+    assert!(labels[0].rationale.contains("passes `TeamGrant`"), "{}", labels[0].rationale);
+    // Routes whose objects hold the caller to the team are not reported.
+    assert!(!findings.iter().any(|finding| finding.suspicious_route.path.starts_with("/teams/{team_id}/boards")),
+        "{findings:#?}");
+}

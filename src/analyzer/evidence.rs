@@ -284,6 +284,144 @@ struct DelegationVisitor {
     handler: String,
     bindings: HashSet<String>,
     evidence: Vec<AuthEvidence>,
+    /// Arguments read as learned authentication objects, whose parts are
+    /// not delegations of their own.
+    resolved: HashSet<usize>,
+}
+
+/// An authentication object passed at a call site, with what its type was
+/// learned to check (`auth_objects`).
+struct PassedObject {
+    written: String,
+    object: super::auth_objects::AuthObject,
+    /// Values its constant fields name: `permission: Permission::Write`.
+    requirements: Vec<String>,
+    /// Fields it holds the caller to that the route sets from a value it
+    /// has: `profile_id: path.profile_id`.
+    route_scopes: Vec<String>,
+    /// Passed as one of the alternatives a chooser picks from.
+    alternative: Option<String>,
+}
+
+fn written_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn constant_value(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Lit(_) => Some(Vec::new()),
+        Expr::Path(path) if path.path.segments.len() >= 2 => {
+            Some(name_keys(&path.path.segments.last()?.ident.to_string()))
+        }
+        Expr::Reference(inner) => constant_value(&inner.expr),
+        _ => None,
+    }
+}
+
+/// The authentication objects an argument passes, by what their types were
+/// learned to check; `None` when it passes none Archer learned.
+fn passed_objects(expr: &Expr) -> Option<Vec<PassedObject>> {
+    use super::auth_objects::{auth_object, chooses_between};
+    match expr {
+        Expr::Reference(reference) => passed_objects(&reference.expr),
+        Expr::Paren(paren) => passed_objects(&paren.expr),
+        Expr::Group(group) => passed_objects(&group.expr),
+        Expr::Path(path) if path.qself.is_none() => {
+            let object = auth_object(&path.path.segments.last()?.ident.to_string())?;
+            Some(vec![PassedObject {
+                written: written_path(&path.path),
+                object,
+                requirements: Vec::new(),
+                route_scopes: Vec::new(),
+                alternative: None,
+            }])
+        }
+        Expr::Struct(item) => {
+            let object = auth_object(&item.path.segments.last()?.ident.to_string())?;
+            let mut requirements = Vec::new();
+            let mut route_scopes = Vec::new();
+            for field in &item.fields {
+                let Member::Named(name) = &field.member else {
+                    continue;
+                };
+                let name = name.to_string();
+                match constant_value(&field.expr) {
+                    Some(keys) => requirements.extend(keys),
+                    None if object.scopes.contains(&name) => route_scopes.push(name),
+                    None => {}
+                }
+            }
+            Some(vec![PassedObject {
+                written: written_path(&item.path),
+                object,
+                requirements,
+                route_scopes,
+                alternative: None,
+            }])
+        }
+        Expr::Call(call) => {
+            let Expr::Path(func) = &*call.func else {
+                return None;
+            };
+            let name = func.path.segments.last()?.ident.to_string();
+            if chooses_between(&name) {
+                let alternatives: Vec<PassedObject> = call
+                    .args
+                    .iter()
+                    .filter_map(passed_objects)
+                    .flatten()
+                    .map(|passed| PassedObject {
+                        alternative: Some(name.clone()),
+                        ..passed
+                    })
+                    .collect();
+                return (!alternatives.is_empty()).then_some(alternatives);
+            }
+            let object = auth_object(&name)?;
+            if object.wraps
+                && let Some(inner) = call.args.first().and_then(passed_objects)
+            {
+                return Some(
+                    inner
+                        .into_iter()
+                        .map(|passed| PassedObject {
+                            written: format!("{}({})", written_path(&func.path), passed.written),
+                            object: object.wrapping(&passed.object),
+                            ..passed
+                        })
+                        .collect(),
+                );
+            }
+            let mut requirements = Vec::new();
+            let mut route_scopes = Vec::new();
+            for (index, argument) in call.args.iter().enumerate() {
+                if !object.scopes.contains(&index.to_string()) {
+                    continue;
+                }
+                match constant_value(argument) {
+                    Some(keys) => requirements.extend(keys),
+                    None => route_scopes.push(match argument {
+                        Expr::Path(path) if path.path.get_ident().is_some() => {
+                            written_path(&path.path)
+                        }
+                        _ => index.to_string(),
+                    }),
+                }
+            }
+            Some(vec![PassedObject {
+                written: written_path(&func.path),
+                object,
+                requirements,
+                route_scopes,
+                alternative: None,
+            }])
+        }
+        _ => None,
+    }
 }
 
 impl DelegationVisitor {
@@ -293,7 +431,116 @@ impl DelegationVisitor {
             handler: handler.to_owned(),
             bindings,
             evidence: Vec::new(),
+            resolved: HashSet::new(),
         }
+    }
+
+    /// Evidence for authentication objects of learned types an argument
+    /// passes; false when it passes none.
+    fn learned_objects(&mut self, callee: &str, argument: &Expr, line: usize) -> bool {
+        use super::auth_objects::Tier;
+        let Some(passed) = passed_objects(argument) else {
+            return false;
+        };
+        self.resolved.insert(argument as *const Expr as usize);
+        for PassedObject {
+            written,
+            object,
+            mut requirements,
+            route_scopes,
+            alternative,
+        } in passed
+        {
+            requirements.sort();
+            requirements.dedup();
+            let how = match &alternative {
+                Some(chooser) => format!(
+                    "`{callee}` receives `{written}`, one of the objects `{chooser}` chooses from,"
+                ),
+                None => format!("`{callee}` receives `{written}`, which"),
+            };
+            let site = &object.site;
+            // The constants it is built with (`Permission::Write`) are named,
+            // not compared: each operation needs its own permission.
+            let naming = if requirements.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " with {}",
+                    requirements
+                        .iter()
+                        .map(|key| format!("`{key}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let mut push =
+                |kind: AuthEvidenceKind, mechanism: String, requirements: Vec<String>| {
+                    if self
+                        .evidence
+                        .iter()
+                        .any(|existing| existing.mechanism == mechanism)
+                    {
+                        return;
+                    }
+                    self.evidence.push(AuthEvidence {
+                        kind,
+                        mechanism,
+                        symbol: Some(written.clone()),
+                        file: self.file.clone(),
+                        line,
+                        handler: Some(self.handler.clone()),
+                        strength: AuthStrength::Strong,
+                        requirements,
+                        name_based: false,
+                    });
+                };
+            match object.tier {
+                // It admits any request: the route has no check from it.
+                Tier::Open => continue,
+                Tier::Privilege => {
+                    let kind = object
+                        .privileges
+                        .iter()
+                        .filter_map(|name| classify_check_name(name))
+                        .map(|(kind, _)| kind)
+                        .find(|kind| EvidenceTier::of(kind) == EvidenceTier::Privilege)
+                        .unwrap_or(AuthEvidenceKind::PermissionCheck);
+                    let checks = object
+                        .privileges
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    push(
+                        kind,
+                        format!("{how} checks {checks}{naming} ({site})"),
+                        Vec::new(),
+                    );
+                }
+                Tier::Identity | Tier::Scoped => push(
+                    AuthEvidenceKind::IdentityExtraction,
+                    format!("{how} authenticates the caller{naming} ({site})"),
+                    Vec::new(),
+                ),
+            }
+            if !route_scopes.is_empty() {
+                let scopes = route_scopes
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push(
+                    AuthEvidenceKind::OwnershipCheck,
+                    format!("{how} holds the caller to the route's {scopes} ({site})"),
+                    route_scopes
+                        .iter()
+                        .map(|name| format!("scope:{name}"))
+                        .collect(),
+                );
+            }
+        }
+        true
     }
 
     /// The identity binding an expression passes, seen through references
@@ -374,6 +621,9 @@ impl DelegationVisitor {
 
     fn arguments(&mut self, callee: &str, arguments: &Punctuated<Expr, Token![,]>, line: usize) {
         for argument in arguments {
+            if self.binding(argument).is_none() && self.learned_objects(callee, argument, line) {
+                continue;
+            }
             if let Some(binding) = self.binding(argument) {
                 self.record(
                     format!("`{callee}` receives `{binding}`"),
@@ -392,6 +642,12 @@ impl DelegationVisitor {
 }
 
 impl<'ast> Visit<'ast> for DelegationVisitor {
+    fn visit_expr(&mut self, node: &'ast Expr) {
+        if !self.resolved.contains(&(node as *const Expr as usize)) {
+            visit::visit_expr(self, node);
+        }
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
         let line = node.method.span().start().line;
@@ -438,6 +694,9 @@ impl<'ast> Visit<'ast> for DelegationVisitor {
             // a helper.
             let line = node.func.span().start().line;
             for argument in &node.args {
+                if self.binding(argument).is_none() && self.learned_objects(name, argument, line) {
+                    continue;
+                }
                 if self.binding(argument).is_none()
                     && let Some(object) = Self::authentication_object(argument)
                 {
