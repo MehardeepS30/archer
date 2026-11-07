@@ -20,6 +20,7 @@ fn route(method: &str, path: &str, scope_prefix: &str, authorization: &str) -> R
             handler: None,
             strength: AuthStrength::Strong,
             requirements: Vec::new(),
+            name_based: false,
         }]
     } else {
         Vec::new()
@@ -5151,4 +5152,70 @@ fn a_lookup_of_the_callers_relation_to_a_record_is_a_resource_check() {
     };
     assert!(relation("/groups/rename"));
     assert!(!relation("/groups/tag"));
+}
+
+#[test]
+fn a_loaded_record_its_peers_hold_to_the_caller_is_reported() {
+    let report = drift_fixture(
+        "f53",
+        include_str!("../../tests/fixtures/probes/drift/f53_record_checks.rs"),
+    );
+    let findings: Vec<&Finding> = report
+        .finding_details
+        .iter()
+        .filter(|finding| finding.suspicious_route.path.starts_with("/notes"))
+        .collect();
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    let flag = findings[0];
+    assert_eq!(flag.suspicious_route.path, "/notes/{id}/flag");
+    assert_eq!(flag.category, FindingCategory::SkipsPeerCheck);
+    assert_eq!(flag.severity, Severity::Medium);
+    // The peers' own comparisons are named, whatever their fields are called.
+    assert!(flag.rationale.contains("Note::fetch"), "{}", flag.rationale);
+    assert!(flag.rationale.contains("`note.holder`"), "{}", flag.rationale);
+    assert!(flag.rationale.contains("`note.writer`"), "{}", flag.rationale);
+    // Loaded together with the caller: scoped, neither a peer nor reported.
+    assert!(!flag
+        .authorized_peer_routes
+        .iter()
+        .any(|peer| peer.path == "/notes/{id}/pin"));
+    let route = |path: &str| report.routes.iter().find(|route| route.path == path).unwrap();
+    assert!(route("/notes/{id}").authorization.iter().any(|evidence| {
+        evidence.kind == AuthEvidenceKind::OwnershipCheck
+            && evidence.mechanism.contains("the data's `note.holder`")
+            && !evidence.name_based
+    }));
+    // A helper named for ownership is evidence by its name only.
+    assert!(route("/notes/{id}/share")
+        .authorization
+        .iter()
+        .any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck && evidence.name_based));
+}
+
+#[test]
+fn a_presented_secret_compared_with_a_stored_one_is_a_secret_check() {
+    let report = drift_fixture(
+        "f53_secrets",
+        include_str!("../../tests/fixtures/probes/drift/f53_record_checks.rs"),
+    );
+    let secret = |path: &str| {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap()
+            .authorization
+            .iter()
+            .find(|evidence| evidence.kind == AuthEvidenceKind::SecretCheck)
+            .map(|evidence| evidence.name_based)
+    };
+    // By the field's name, flagged as such; by a constant-time comparison,
+    // not; a counter compared with the request is no secret.
+    assert_eq!(secret("/invites/{code}/accept"), Some(true));
+    assert_eq!(secret("/invites/{code}/confirm"), Some(false));
+    assert_eq!(secret("/invites/{code}/count"), None);
+    assert_eq!(
+        EvidenceTier::of(&AuthEvidenceKind::SecretCheck),
+        EvidenceTier::Resource
+    );
 }

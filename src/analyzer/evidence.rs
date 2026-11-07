@@ -133,12 +133,27 @@ pub(crate) fn function_evidence_in(file: &Path, item: &ItemFn, owner: Option<&st
     {
         caller.insert("self".to_owned());
     }
+    for found in secret_checks(file, &handler, &item.block) {
+        if !body_evidence.iter().any(|existing| existing.line == found.line) {
+            body_evidence.push(found);
+        }
+    }
     for found in structural_checks(file, &handler, &item.block, caller) {
         if !body_evidence
             .iter()
             .any(|existing| existing.line == found.line && EvidenceTier::of(&existing.kind) >= EvidenceTier::of(&found.kind))
         {
             body_evidence.push(found);
+        }
+    }
+    // Ownership read from a field or helper name (`owner_id`, `is_member`)
+    // rather than from a rejecting comparison or a scoped query.
+    for found in &mut body_evidence {
+        if found.kind == AuthEvidenceKind::OwnershipCheck
+            && !found.mechanism.starts_with(STRUCTURAL_CHECK)
+            && !found.mechanism.contains("query scoped to the caller")
+        {
+            found.name_based = true;
         }
     }
     evidence.extend(body_evidence.iter().cloned());
@@ -353,6 +368,7 @@ impl DelegationVisitor {
             handler: Some(self.handler.clone()),
             strength: AuthStrength::Weak,
             requirements: Vec::new(),
+            name_based: false,
         });
     }
 
@@ -511,6 +527,7 @@ fn attribute_evidence(
         handler: Some(handler.into()),
         strength,
         requirements,
+        name_based: false,
     })
 }
 
@@ -589,6 +606,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength: AuthStrength::Weak,
                     requirements: Vec::new(),
+                    name_based: false,
                 });
                 return;
             }
@@ -609,6 +627,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength: AuthStrength::Medium,
                     requirements,
+                    name_based: false,
                 });
                 return;
             }
@@ -628,6 +647,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength,
                     requirements: learned.requirements,
+                    name_based: false,
                 });
                 return;
             }
@@ -655,6 +675,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength,
                     requirements,
+                    name_based: false,
                 });
                 return;
             }
@@ -1037,6 +1058,7 @@ impl AuthEvidenceVisitor {
             handler: Some(self.handler.clone()),
             strength,
             requirements: Vec::new(),
+            name_based: false,
         }
     }
 }
@@ -1745,6 +1767,7 @@ pub(crate) fn evidence_for_handler_method(
         handler: Some(handler.into()),
         strength,
         requirements: Vec::new(),
+        name_based: false,
     })
 }
 
@@ -1765,6 +1788,7 @@ pub(crate) fn evidence_for_handler_call(
         handler: Some(handler.into()),
         strength,
         requirements: Vec::new(),
+        name_based: false,
     })
 }
 
@@ -1911,6 +1935,7 @@ fn rejects_unauthenticated(
         handler: Some(handler.into()),
         strength: AuthStrength::Weak,
         requirements: Vec::new(),
+        name_based: false,
     })
 }
 
@@ -1931,6 +1956,7 @@ pub(crate) fn evidence_for_handler_symbol(
             handler: Some(handler.into()),
             strength: AuthStrength::Strong,
             requirements: vec!["admin".into()],
+            name_based: false,
         });
     }
     if name.ends_with("Guard") || name.ends_with("Middleware") {
@@ -1946,6 +1972,7 @@ pub(crate) fn evidence_for_handler_symbol(
             handler: Some(handler.into()),
             strength: AuthStrength::Weak,
             requirements: Vec::new(),
+            name_based: false,
         });
     }
     None
@@ -2992,7 +3019,14 @@ impl StructuralChecks<'_> {
             (AuthEvidenceKind::OwnershipCheck, _) if self.mentions_relation(condition) => {
                 super::model::RELATION_CHECK
             }
-            (AuthEvidenceKind::OwnershipCheck, _) => "a caller value matches the data",
+            (AuthEvidenceKind::OwnershipCheck, _) => {
+                if let Some(data) = self.data_operand(condition) {
+                    let described = format!("a caller value matches the data's `{data}`");
+                    self.push_described(kind, &described, condition, line);
+                    return;
+                }
+                "a caller value matches the data"
+            }
             (_, Expr::Let(_)) => "a caller value is present",
             (_, Expr::MethodCall(call)) if ["is_some", "is_none", "is_ok", "is_err"].iter().any(|probe| call.method == probe) => {
                 "a caller value is present"
@@ -3000,6 +3034,30 @@ impl StructuralChecks<'_> {
             _ => "a caller attribute allows it",
         };
         self.push_described(kind, what, condition, line);
+    }
+
+    /// The operand a caller value is compared with, when it is a field of
+    /// some record (`note.recipient_id` in `user.id != note.recipient_id`).
+    fn data_operand(&self, condition: &Expr) -> Option<String> {
+        match condition {
+            Expr::Paren(inner) => self.data_operand(&inner.expr),
+            Expr::Group(inner) => self.data_operand(&inner.expr),
+            Expr::Unary(unary) => self.data_operand(&unary.expr),
+            Expr::Binary(binary) if matches!(binary.op, BinOp::And(_) | BinOp::Or(_)) => self
+                .data_operand(&binary.left)
+                .or_else(|| self.data_operand(&binary.right)),
+            Expr::Binary(binary) => {
+                let other = match (self.derives(&binary.left), self.derives(&binary.right)) {
+                    (true, false) => &binary.right,
+                    (false, true) => &binary.left,
+                    _ => return None,
+                };
+                matches!(strip_conversions(other), Expr::Field(_) | Expr::MethodCall(_))
+                    .then(|| strip_conversions(other).to_token_stream().to_string().replace(' ', ""))
+                    .filter(|written| written.len() <= 60)
+            }
+            _ => None,
+        }
     }
 
     fn mentions_relation(&self, condition: &Expr) -> bool {
@@ -3028,6 +3086,7 @@ impl StructuralChecks<'_> {
             handler: Some(self.handler.to_owned()),
             strength: AuthStrength::Medium,
             requirements: Vec::new(),
+            name_based: false,
         });
     }
 }
@@ -3095,4 +3154,161 @@ impl<'ast> Visit<'ast> for StructuralChecks<'_> {
 
     fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
     fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+}
+
+/// Mechanism of a secret check (see `secret_checks`).
+pub(crate) const SECRET_CHECK: &str = "rejects the request unless a presented secret matches";
+
+/// Library calls that compare secrets or verify a password against a
+/// stored hash: their meaning is fixed by the library, not by the app.
+pub(crate) const SECRET_COMPARISONS: [&str; 9] = [
+    "ct_eq",
+    "constant_time_eq",
+    "constant_time_compare",
+    "secure_compare",
+    "verify_slices_are_equal",
+    "verify_password",
+    "verify_encoded",
+    "verify_hmac",
+    "verify_signature",
+];
+
+/// Words that name a secret value in a field or binding.
+pub(crate) const SECRET_WORDS: [&str; 10] = [
+    "secret", "token", "signature", "password", "hash", "digest", "apikey", "otp", "nonce", "passcode",
+];
+
+/// Secret checks a function makes: a branch that rejects the request
+/// (`Err(..)`, a 401/403 response, `bail!`) on a library comparison of
+/// secrets (`ct_eq`, `verify_password`), or on an equality between two
+/// non-constant values one of which is named as a secret
+/// (`stored.client_secret != presented`; reported as name-based). These
+/// need no caller: a secret is how a request without an account proves
+/// access to one object (an invitation link, a payment's client secret).
+fn secret_checks(file: &Path, handler: &str, block: &Block) -> Vec<AuthEvidence> {
+    struct Secrets<'f> {
+        file: &'f Path,
+        handler: &'f str,
+        evidence: Vec<AuthEvidence>,
+    }
+    fn last_name(expr: &Expr) -> Option<String> {
+        match strip_conversions(expr) {
+            Expr::Field(field) => match &field.member {
+                Member::Named(name) => Some(name.to_string()),
+                Member::Unnamed(_) => None,
+            },
+            Expr::MethodCall(call) if call.args.is_empty() => Some(call.method.to_string()),
+            Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+            _ => None,
+        }
+    }
+    fn names_secret(expr: &Expr) -> bool {
+        last_name(expr).is_some_and(|name| {
+            let flat = name.to_ascii_lowercase().replace('_', "");
+            SECRET_WORDS.iter().any(|word| flat.contains(word))
+        })
+    }
+    fn constant(expr: &Expr) -> bool {
+        match strip_conversions(expr) {
+            Expr::Lit(_) => true,
+            Expr::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident.to_string().chars().all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())),
+            _ => false,
+        }
+    }
+    /// How the condition compares a secret, if it does: `Some(true)` when
+    /// only the names say so.
+    fn compares(expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Paren(inner) => compares(&inner.expr),
+            Expr::Group(inner) => compares(&inner.expr),
+            Expr::Unary(unary) => compares(&unary.expr),
+            Expr::Try(inner) => compares(&inner.expr),
+            Expr::Await(inner) => compares(&inner.base),
+            Expr::Binary(binary) => match binary.op {
+                BinOp::And(_) | BinOp::Or(_) => match (compares(&binary.left), compares(&binary.right)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (left, right) => left.or(right),
+                },
+                BinOp::Eq(_) | BinOp::Ne(_) => (!constant(&binary.left)
+                    && !constant(&binary.right)
+                    && (names_secret(&binary.left) || names_secret(&binary.right)))
+                .then_some(true),
+                _ => None,
+            },
+            Expr::Call(call) => {
+                let named = matches!(&*call.func, Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| SECRET_COMPARISONS.contains(&segment.ident.to_string().as_str())));
+                if named {
+                    Some(false)
+                } else {
+                    call.args.iter().find_map(compares)
+                }
+            }
+            Expr::MethodCall(call) => {
+                if SECRET_COMPARISONS.contains(&call.method.to_string().as_str()) {
+                    Some(false)
+                } else {
+                    compares(&call.receiver)
+                }
+            }
+            _ => None,
+        }
+    }
+    impl Secrets<'_> {
+        fn push(&mut self, condition: &Expr, by_name: bool, line: usize) {
+            if self.evidence.iter().any(|existing| existing.line == line) {
+                return;
+            }
+            let mut written = condition.to_token_stream().to_string();
+            if written.len() > 60 {
+                written.truncate(written.floor_char_boundary(57));
+                written.push_str("...");
+            }
+            let flag = if by_name { " (name-based)" } else { "" };
+            self.evidence.push(AuthEvidence {
+                kind: AuthEvidenceKind::SecretCheck,
+                mechanism: format!("{SECRET_CHECK} (`{written}`){flag}"),
+                symbol: Some(written),
+                file: self.file.to_path_buf(),
+                line,
+                handler: Some(self.handler.to_owned()),
+                strength: AuthStrength::Medium,
+                requirements: Vec::new(),
+                name_based: by_name,
+            });
+        }
+    }
+    impl<'ast> Visit<'ast> for Secrets<'_> {
+        fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+            let rejects = super::caller_use::rejects_in_block(&node.then_branch)
+                || node
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, otherwise)| super::caller_use::rejects_in(otherwise));
+            if rejects && let Some(by_name) = compares(&node.cond) {
+                self.push(&node.cond, by_name, node.if_token.span.start().line);
+            }
+            visit::visit_expr_if(self, node);
+        }
+        // `verify_password(&given, &stored.hash)?;`
+        fn visit_expr_try(&mut self, node: &'ast ExprTry) {
+            if compares(&node.expr) == Some(false) {
+                self.push(&node.expr, false, node.question_token.span.start().line);
+            }
+            visit::visit_expr_try(self, node);
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+        fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+    }
+    let mut visitor = Secrets {
+        file,
+        handler,
+        evidence: Vec::new(),
+    };
+    visitor.visit_block(block);
+    visitor.evidence
 }

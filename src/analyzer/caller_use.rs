@@ -254,6 +254,20 @@ impl Walker<'_, '_> {
             let (check, resolved) = self.is_check(definition, candidate);
             if check {
                 summary.features.insert(candidate.feature.clone());
+                // A record handed with the caller to a call under `?` is
+                // held to the caller only by a check Archer read; a call it
+                // cannot read (`Flag::open(&pool, user.id, note.key)`)
+                // more often records the two together. In a branch
+                // condition the call decides.
+                let guards = candidate.condition
+                    || candidate.target.as_ref().is_some_and(|target| {
+                        self.index.resolve_callee(definition, target).is_some()
+                    });
+                for key in candidate.records.iter().filter(|_| guards) {
+                    summary
+                        .features
+                        .insert(format!("{GUARDS}{key}:checks it with `{}`", candidate.name));
+                }
                 // A check Archer followed, or library code, makes this
                 // function a check; a guess from a name defined in the scan
                 // does not.
@@ -340,6 +354,12 @@ struct CheckCandidate {
     feature: String,
     /// The line of the call.
     line: usize,
+    /// Records loaded from request data that the call also receives: a
+    /// check of the caller against them (`ensure_member(&group, &user)?`).
+    records: Vec<String>,
+    /// Made in a branch condition (`if !may_edit(&note, &user) { .. }`),
+    /// not as a statement under `?`.
+    condition: bool,
 }
 
 #[derive(Clone, Default)]
@@ -381,6 +401,16 @@ fn analyze_function(
         }
     }
     visitor.visit_block(&item.block);
+    let loaded: BTreeSet<String> = visitor.records.values().cloned().collect();
+    for key in loaded {
+        let guarded = visitor
+            .features
+            .iter()
+            .any(|feature| feature.strip_prefix(GUARDS).is_some_and(|rest| rest.starts_with(&format!("{key}:"))));
+        if guarded || visitor.used_records.contains(&key) {
+            visitor.features.insert(format!("{LOADS}{key}"));
+        }
+    }
     // A `Result` returned as the body's value is the caller's to
     // propagate: `fn rename(..) -> Result<..> { ensure_owner(caller, &b) }`
     // decides with the caller like `ensure_owner(..)?;` does.
@@ -409,10 +439,27 @@ struct CallerUseVisitor {
     sources: std::rc::Rc<HashSet<String>>,
     /// A branch that depends on the caller rejects the request.
     rejects: bool,
+    /// Names bound to data the request supplies: a `Json`, `Path`, `Query`
+    /// or `Form` extractor, or a value read from one. The request itself is
+    /// left out: what is read from it is mostly credentials and headers.
+    requested: HashSet<String>,
+    /// Names bound to a record loaded with request data, with the record's
+    /// key: the loading call (`PrivateNote::read`, `find_note`).
+    records: HashMap<String, String>,
+    /// Record keys whose loaded value the function reads a field of, or
+    /// hands to a check: a loaded record, not a converted string.
+    used_records: HashSet<String>,
+    /// Visiting a branch condition.
+    in_condition: bool,
 }
 
 impl CallerUseVisitor {
     fn bind_parameter(&mut self, pattern: &Pat, ty: &Type) {
+        if request_data_type(ty) {
+            let mut names = HashSet::new();
+            super::routes::pattern_bindings(pattern, &mut names);
+            self.requested.extend(names);
+        }
         if !identity_type(ty) {
             return;
         }
@@ -587,10 +634,18 @@ impl CallerUseVisitor {
         if TRANSPARENT_CALLS.contains(&callee) || PROBES.contains(&callee) {
             return;
         }
+        let arguments: Vec<&Expr> = arguments.collect();
         let bound: Vec<(usize, String)> = arguments
+            .iter()
+            .copied()
             .enumerate()
             .filter_map(|(position, argument)| self.derived(argument).map(|label| (position, label)))
             .collect();
+        let records: Vec<String> = arguments
+            .iter()
+            .filter_map(|argument| self.record_of(argument))
+            .collect();
+        self.used_records.extend(records.iter().cloned());
         let mut labels: Vec<&String> = bound.iter().map(|(_, label)| label).collect();
         labels.dedup();
         for label in labels {
@@ -600,7 +655,89 @@ impl CallerUseVisitor {
                 name: name.clone(),
                 feature: format!("checks:{label}:{callee}"),
                 line,
+                records: records.clone(),
+                condition: self.in_condition,
             });
+        }
+    }
+
+    /// Whether an expression reads a name bound to request data.
+    fn mentions_requested(&self, expr: &Expr) -> bool {
+        mentions_any(expr, |name| self.requested.contains(name))
+    }
+
+    /// The record an expression reads (`note`, `note.owner`, `&note`).
+    fn record_in(&self, expr: &Expr) -> Option<String> {
+        let mut found = None;
+        let _ = mentions_any(expr, |name| {
+            if let Some(key) = self.records.get(name) {
+                found.get_or_insert_with(|| key.clone());
+                true
+            } else {
+                false
+            }
+        });
+        found
+    }
+
+    /// A loaded record passed whole or by a field (`&note`, `note.group_id`).
+    fn record_of(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Reference(inner) => self.record_of(&inner.expr),
+            Expr::Paren(inner) => self.record_of(&inner.expr),
+            Expr::Field(field) => self.record_of(&field.base),
+            Expr::MethodCall(call) if TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) => {
+                self.record_of(&call.receiver)
+            }
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.records.get(&ident.to_string()).cloned()),
+            _ => None,
+        }
+    }
+
+    /// A call that loads a record with request data: `Note::read(&pool,
+    /// data.note_id)`, `repo.find_note(&id)`, through `.await`, `?` and
+    /// error adapters. Also whether it passes the caller, which scopes the
+    /// load to the caller (`find_note(id, user.id)`).
+    fn loader(&self, expr: &Expr) -> Option<(String, bool)> {
+        match expr {
+            Expr::Try(inner) => self.loader(&inner.expr),
+            Expr::Await(inner) => self.loader(&inner.base),
+            Expr::Paren(inner) => self.loader(&inner.expr),
+            Expr::Reference(inner) => self.loader(&inner.expr),
+            Expr::Call(call) => {
+                let Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let key = callee_name(&path.path)?;
+                let last = path.path.segments.last()?.ident.to_string();
+                if TRANSPARENT_CALLS.contains(&last.as_str()) || NOT_LOADERS.contains(&last.as_str()) {
+                    return None;
+                }
+                let requested = call.args.iter().any(|argument| self.mentions_requested(argument));
+                let scoped = call.args.iter().any(|argument| self.derived(argument).is_some());
+                requested.then_some((key, scoped))
+            }
+            Expr::MethodCall(call) => {
+                // `Note::read(..).await.map_err(..)`: the adapter wraps the load.
+                if let Some(found) = self.loader(&call.receiver) {
+                    return Some(found);
+                }
+                let method = call.method.to_string();
+                if TRANSPARENT_CALLS.contains(&method.as_str())
+                    || NOT_LOADERS.contains(&method.as_str())
+                    || self.mentions_requested(&call.receiver)
+                    || self.derived(&call.receiver).is_some()
+                {
+                    return None;
+                }
+                let requested = call.args.iter().any(|argument| self.mentions_requested(argument));
+                let scoped = call.args.iter().any(|argument| self.derived(argument).is_some());
+                requested.then_some((method, scoped))
+            }
+            _ => None,
         }
     }
 
@@ -747,6 +884,27 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         {
             self.rejects = true;
         }
+        // `let note = Note::read(&pool, data.note_id).await?`: a record
+        // loaded with request data. Loaded with the caller too
+        // (`find_note(id, user.id)`), it is scoped to the caller already.
+        if let Some(init) = &node.init
+            && self.derived(&init.expr).is_none()
+        {
+            let mut names = HashSet::new();
+            super::routes::pattern_bindings(&node.pat, &mut names);
+            names.retain(|name| !name.starts_with('_'));
+            if let Some((key, scoped)) = self.loader(&init.expr) {
+                if scoped {
+                    self.features.insert(format!("{GUARDS}{key}:loaded with the caller"));
+                }
+                for name in names {
+                    self.records.insert(name, key.clone());
+                }
+            } else if self.mentions_requested(&init.expr) {
+                // `let id = path.into_inner();`, `let note_id = data.note_id;`
+                self.requested.extend(names);
+            }
+        }
         // `let profile_id = auth.profile.map(..)` carries the identity on.
         if let Some(init) = &node.init
             && let Some(label) = self.derived(&init.expr)
@@ -795,6 +953,12 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        if let Expr::Path(base) = &*node.base
+            && let Some(ident) = base.path.get_ident()
+            && let Some(key) = self.records.get(&ident.to_string())
+        {
+            self.used_records.insert(key.clone());
+        }
         if let Some((label, field)) = self.first_field(&Expr::Field(node.clone())) {
             self.features.insert(format!("reads:{label}:{field}"));
         }
@@ -802,6 +966,18 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        // `constant_time_eq(invite.stored.as_bytes(), given.as_bytes())`
+        if let Expr::Path(path) = &*node.func
+            && path.path.segments.last().is_some_and(|segment| {
+                super::evidence::SECRET_COMPARISONS.contains(&segment.ident.to_string().as_str())
+            })
+            && node.args.iter().any(|argument| self.mentions_requested(argument))
+            && let Some(key) = node.args.iter().find_map(|argument| self.record_in(argument))
+        {
+            let name = path.path.segments.last().map(|segment| segment.ident.to_string()).unwrap_or_default();
+            self.features.insert(format!("{GUARDS}{key}:compares it with a secret the request presents (`{name}`)"));
+            self.used_records.insert(key);
+        }
         // A call that yields the caller, made with no requirement beyond
         // the request (`authorize_session(&req, None, None)`). One that
         // names a requirement (`Some(&origin), Some(Maintainer)`) is a check
@@ -864,7 +1040,9 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.in_condition = true;
         self.decides(&node.cond);
+        self.in_condition = false;
         if self.mentions_caller(&node.cond)
             && rejects(|found| {
                 found.visit_block(&node.then_branch);
@@ -879,6 +1057,14 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // `note.readers.contains(&user.id)`: the caller in a loaded record.
+        if self.derived(&node.receiver).is_none()
+            && node.args.iter().any(|argument| self.derived(argument).is_some())
+            && let Some(key) = self.record_of(&node.receiver)
+        {
+            let written = short_written(&Expr::MethodCall(node.clone()));
+            self.features.insert(format!("{GUARDS}{key}:checks `{written}`"));
+        }
         // `principal.validate()` hands the caller to the method as `self`.
         if let Some(receiver) = receiver_path(&node.receiver) {
             let bound: Vec<(usize, String)> = std::iter::once(&*node.receiver)
@@ -906,7 +1092,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             let left = self.derived(&node.left);
             let right = self.derived(&node.right);
             let literal = |expr: &Expr| matches!(expr, Expr::Lit(_));
-            match (left, right) {
+            match (&left, &right) {
                 (Some(label), None) if !literal(&node.right) && !is_variant(&node.right) => {
                     self.features.insert(format!("compares:{label}"));
                 }
@@ -914,6 +1100,32 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                     self.features.insert(format!("compares:{label}"));
                 }
                 _ => {}
+            }
+            // `note.recipient_id != user.person.id`: a loaded record held to
+            // the caller, whatever its field is called.
+            let record_side = match (&left, &right) {
+                (Some(_), None) => Some(&*node.right),
+                (None, Some(_)) => Some(&*node.left),
+                _ => None,
+            };
+            if let Some(side) = record_side
+                && let Some(key) = self.record_in(side)
+            {
+                let written = short_written(side);
+                self.features.insert(format!("{GUARDS}{key}:compares `{written}` with the caller"));
+            }
+            // `invite.join_secret != query.secret`: the stored secret of a
+            // loaded record matched with one the request presents.
+            if left.is_none() && right.is_none() {
+                for (stored, presented) in [(&*node.left, &*node.right), (&*node.right, &*node.left)] {
+                    if names_secret(stored)
+                        && self.mentions_requested(presented)
+                        && let Some(key) = self.record_of(stored)
+                    {
+                        let written = short_written(stored);
+                        self.features.insert(format!("{GUARDS}{key}:compares `{written}` with a secret the request presents"));
+                    }
+                }
             }
         }
         visit::visit_expr_binary(self, node);
@@ -1129,4 +1341,89 @@ fn names_caller(name: &str) -> bool {
 
 fn returns_bool(output: &syn::ReturnType) -> bool {
     matches!(output, syn::ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(path) if path.path.is_ident("bool")))
+}
+
+/// Feature prefix: the route loads a record with request data, keyed by the
+/// loading call. Not compared by `peer_checks`' consensus on caller use; see
+/// `peer_checks::unguarded_record`.
+pub(crate) const LOADS: &str = "loads:";
+/// Feature prefix: the route holds a loaded record to the caller, as
+/// `guards:<key>:<how>`.
+pub(crate) const GUARDS: &str = "guards:";
+
+/// Calls that parse, convert or build a value rather than load a record.
+const NOT_LOADERS: [&str; 24] = [
+    "from", "new", "parse", "parse_str", "try_from", "from_str", "format", "trim", "len",
+    "to_lowercase", "to_uppercase", "split", "join", "push", "insert", "contains", "get",
+    "iter", "collect", "as_str", "Json", "Err", "Box", "Arc",
+];
+
+/// Extractor types that carry data the request supplies: ids and fields
+/// the client chose.
+fn request_data_type(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => request_data_type(&reference.elem),
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            [
+                "Json", "Path", "Query", "Form", "QsQuery", "QsForm",
+            ]
+            .contains(&segment.ident.to_string().as_str())
+        }),
+        _ => false,
+    }
+}
+
+/// Whether an expression reads a name the predicate accepts; stops at the
+/// first one. Closures are left out: they run elsewhere.
+fn mentions_any(expr: &Expr, mut accept: impl FnMut(&str) -> bool) -> bool {
+    struct Mentions<'p> {
+        accept: &'p mut dyn FnMut(&str) -> bool,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Mentions<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if !self.found
+                && let Some(ident) = node.path.get_ident()
+                && (self.accept)(&ident.to_string())
+            {
+                self.found = true;
+            }
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+    }
+    let mut mentions = Mentions {
+        accept: &mut accept,
+        found: false,
+    };
+    mentions.visit_expr(expr);
+    mentions.found
+}
+
+/// An expression as written, without spaces, cut to 60 characters.
+fn short_written(expr: &Expr) -> String {
+    let mut written = quote::ToTokens::to_token_stream(expr)
+        .to_string()
+        .replace(' ', "");
+    if written.len() > 60 {
+        written.truncate(written.floor_char_boundary(57));
+        written.push_str("...");
+    }
+    written
+}
+
+/// Whether a record field is named as a secret (`join_secret`, `token_hash`).
+fn names_secret(expr: &Expr) -> bool {
+    let name = match expr {
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(name) => name.to_string(),
+            syn::Member::Unnamed(_) => return false,
+        },
+        Expr::Reference(inner) => return names_secret(&inner.expr),
+        Expr::MethodCall(call) if TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) || call.method == "as_bytes" || call.method == "as_str" => {
+            return names_secret(&call.receiver);
+        }
+        _ => return false,
+    };
+    let flat = name.to_ascii_lowercase().replace('_', "");
+    super::evidence::SECRET_WORDS.iter().any(|word| flat.contains(word))
 }

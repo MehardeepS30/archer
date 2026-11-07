@@ -11,6 +11,10 @@ pub enum AuthEvidenceKind {
     AuthorizationMiddleware,
     IdentityExtraction,
     OwnershipCheck,
+    /// The request presents a secret (a token, signature or password) that
+    /// the code compares with a stored one: access to that object without
+    /// an account.
+    SecretCheck,
     ManualAuthorizationCheck,
     /// A guard or middleware that Archer cannot classify. It may protect the
     /// route, so a route carrying one is never reported as unprotected, only
@@ -40,6 +44,7 @@ impl std::fmt::Display for AuthEvidenceKind {
             Self::AuthorizationMiddleware => "authorization middleware",
             Self::IdentityExtraction => "identity extraction (not authorization)",
             Self::OwnershipCheck => "ownership check",
+            Self::SecretCheck => "secret check",
             Self::ManualAuthorizationCheck => "manual authorization check",
             Self::Unknown => "unrecognized guard or middleware",
             Self::Delegated => "identity passed to code Archer does not analyze",
@@ -71,6 +76,11 @@ pub struct AuthEvidence {
     /// `user.role == Role::Admin`. Empty when no subject can be read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<String>,
+    /// Recognized only by an identifier's name (a field called `owner_id`,
+    /// a helper called `is_member`), not by what the code does with it.
+    /// Shown so the user can weigh it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_based: bool,
 }
 
 impl AuthEvidence {
@@ -82,6 +92,7 @@ impl AuthEvidence {
                 | AuthEvidenceKind::AuthorizationGuard
                 | AuthEvidenceKind::AuthorizationMiddleware
                 | AuthEvidenceKind::OwnershipCheck
+                | AuthEvidenceKind::SecretCheck
                 | AuthEvidenceKind::ManualAuthorizationCheck
         )
     }
@@ -476,7 +487,7 @@ impl EvidenceTier {
             | AuthEvidenceKind::AuthorizationGuard
             | AuthEvidenceKind::AuthorizationMiddleware
             | AuthEvidenceKind::ManualAuthorizationCheck => Self::Privilege,
-            AuthEvidenceKind::OwnershipCheck => Self::Resource,
+            AuthEvidenceKind::OwnershipCheck | AuthEvidenceKind::SecretCheck => Self::Resource,
             AuthEvidenceKind::IdentityExtraction => Self::Identity,
             AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated => Self::None,
         }

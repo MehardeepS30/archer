@@ -1416,6 +1416,7 @@ pub(crate) fn configuration_call_evidence(
                 handler: handler.map(str::to_owned),
                 strength,
                 requirements,
+                name_based: false,
             });
         }
         return;
@@ -1435,6 +1436,7 @@ pub(crate) fn configuration_call_evidence(
                     handler: handler.map(str::to_owned),
                     strength: AuthStrength::Weak,
                     requirements: Vec::new(),
+                    name_based: false,
                 });
                 continue;
             }
@@ -1486,6 +1488,7 @@ pub(crate) fn configuration_call_evidence(
                     handler: handler.map(str::to_owned),
                     strength: AuthStrength::Weak,
                     requirements,
+                    name_based: false,
                 });
                 continue;
             }
@@ -1531,6 +1534,7 @@ pub(crate) fn configuration_call_evidence(
                     handler: handler.map(str::to_owned),
                     strength: AuthStrength::Weak,
                     requirements,
+                    name_based: false,
                 });
             }
             continue;
@@ -1575,6 +1579,7 @@ pub(crate) fn configuration_call_evidence(
             handler: handler.map(str::to_owned),
             strength,
             requirements,
+            name_based: false,
         });
     }
 }

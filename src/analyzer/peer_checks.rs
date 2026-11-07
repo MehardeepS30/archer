@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    caller_use::{SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
+    caller_use::{GUARDS, LOADS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
     drift::{
         is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
         placement, route_identity, unique_routes,
@@ -62,6 +62,10 @@ struct Features {
     requires: BTreeMap<String, String>,
     /// Where each compared check is made (see `caller_use::SITE`).
     sites: BTreeMap<String, String>,
+    /// Records the route loads with request data, by loading call.
+    loads: BTreeSet<String>,
+    /// How the route holds each loaded record to the caller.
+    guards: BTreeMap<String, Vec<String>>,
 }
 
 impl Features {
@@ -81,8 +85,18 @@ fn features(route: &Route) -> Features {
     let mut calls = BTreeSet::new();
     let mut requires = BTreeMap::new();
     let mut sites = BTreeMap::new();
+    let mut loads = BTreeSet::new();
+    let mut guards: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for feature in &route.caller_use {
-        if let Some(site) = feature.strip_prefix(SITE) {
+        if let Some(key) = feature.strip_prefix(LOADS) {
+            loads.insert(key.to_string());
+        } else if let Some(rest) = feature.strip_prefix(GUARDS) {
+            // The key can hold `::` (`Note::read`); the way it is guarded
+            // follows the first `:` after it.
+            if let Some((key, how)) = split_guard(rest) {
+                guards.entry(key.to_string()).or_default().push(how.to_string());
+            }
+        } else if let Some(site) = feature.strip_prefix(SITE) {
             if let Some((feature, chain)) = site.split_once(SITE_SEPARATOR) {
                 sites.insert(feature.to_string(), chain.to_string());
             }
@@ -112,7 +126,184 @@ fn features(route: &Route) -> Features {
         calls,
         requires,
         sites,
+        loads,
+        guards,
     }
+}
+
+/// Rank of a caller-use feature, most specific first: an object-level
+/// comparison, a check call, the caller taken, a decision on the caller's
+/// own value, a field read.
+fn specificity(feature: &str) -> u8 {
+    if feature.starts_with("compares:") {
+        0
+    } else if feature.starts_with("checks:") {
+        1
+    } else if feature.starts_with("takes:") {
+        2
+    } else if feature.starts_with("acts:") {
+        3
+    } else {
+        4
+    }
+}
+
+/// How a peer guards a record it loads together with the caller.
+const SCOPED_LOAD: &str = "loaded with the caller";
+
+/// `Note::read:compares ..` → (`Note::read`, `compares ..`).
+fn split_guard(rest: &str) -> Option<(&str, &str)> {
+    let mut start = 0;
+    while let Some(offset) = rest[start..].find(':') {
+        let at = start + offset;
+        if rest[at + 1..].starts_with(':') {
+            start = at + 2;
+            continue;
+        }
+        return Some((&rest[..at], &rest[at + 1..]));
+    }
+    None
+}
+
+/// The object-level check: the route loads a record with data from the
+/// request (`Note::read(&pool, data.note_id)`), and does not hold it to the
+/// caller, where the peers of its method class that load the same record
+/// do: they compare one of its fields with the caller, pass it with the
+/// caller to a check, or load it with the caller. Peers are found by the
+/// record, not by path, so a route is compared with every route that
+/// touches the same data.
+///
+/// A peer that loads it together with the caller (`find_note(id, user.id)`)
+/// may scope the query or only shape the view, so it is left out. A guard
+/// seen as a comparison of a record field with the caller is direct
+/// evidence; a check function that receives both is a policy that only
+/// some routes follow (moderators' actions beside a user's own follow), so
+/// alone it must be unanimous. At least 3 peers, 75% of them guarding with
+/// a comparison among them, or all of them guarding; or 2 that both do. A
+/// finding backed by a comparison with 3 or more peers is Medium, else Low.
+#[allow(clippy::too_many_arguments)]
+fn unguarded_record(
+    route: &Route,
+    own: &Features,
+    index: usize,
+    featured: &[Features],
+    eligible: &[&Route],
+    class: MethodClass,
+    classes: &[MethodClass],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    let scoped = |features: &Features, key: &str| {
+        features.guards.get(key).is_some_and(|ways| ways.iter().any(|how| how == SCOPED_LOAD))
+    };
+    let direct = |features: &Features, key: &str| {
+        features.guards.get(key).is_some_and(|ways| {
+            ways.iter().any(|how| how.starts_with("compares ") || how.starts_with("checks `"))
+        })
+    };
+    for key in &own.loads {
+        if own.guards.contains_key(key) {
+            continue;
+        }
+        let population: Vec<usize> = (0..eligible.len())
+            .filter(|&other| {
+                other != index
+                    && classes[other] == class
+                    && featured[other].loads.contains(key)
+                    && !scoped(&featured[other], key)
+                    && route_identity(eligible[other]) != route_identity(route)
+                    && eligible[other].origin.definition != route.origin.definition
+            })
+            .collect();
+        let having: Vec<usize> = population
+            .iter()
+            .copied()
+            .filter(|&other| featured[other].guards.contains_key(key))
+            .collect();
+        let compared = having
+            .iter()
+            .filter(|&&other| direct(&featured[other], key))
+            .count();
+        let share = having.len() as f64 / population.len().max(1) as f64;
+        let enough = (population.len() >= MIN_POPULATION
+            && ((share + 1e-9 >= CONSENSUS && compared > 0) || having.len() == population.len()))
+            || (population.len() == 2 && having.len() == 2);
+        if !enough {
+            continue;
+        }
+        // A route with a role or permission check where the peers that
+        // guard the record have none follows a different policy (an
+        // administrator may act on any record).
+        if route.best_tier() == EvidenceTier::Privilege
+            && having
+                .iter()
+                .any(|&other| eligible[other].best_tier() != EvidenceTier::Privilege)
+        {
+            continue;
+        }
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut group_routes: Vec<RouteReference> = vec![route.into()];
+        group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!("{class} routes that load the record `{key}` with request data"),
+            prefix: format!("record `{key}`"),
+            level: GroupLevel::Linked,
+            method_class: class,
+            routes: group_routes,
+        });
+        let feature = format!("{GUARDS}{key}");
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!(
+                "{class} routes that load `{key}` with request data hold it to the caller."
+            ),
+            total_routes: population.len() + 1,
+            routes_with_authorization: having.len(),
+            routes_without_authorization: population.len() - having.len() + 1,
+            evidence_patterns: vec![feature.clone()],
+            strength: AuthStrength::Medium,
+            expected_tier: Some(EvidenceTier::Resource),
+            dominant_requirement: Some(feature),
+        };
+        invariants.push(invariant.clone());
+        let examples: Vec<String> = having
+            .iter()
+            .take(NAMED)
+            .map(|&other| {
+                let ways = &featured[other].guards[key];
+                let how = ways
+                    .iter()
+                    .find(|how| how.starts_with("compares "))
+                    .or_else(|| ways.first())
+                    .cloned()
+                    .unwrap_or_default();
+                format!("{} {} {how}", eligible[other].method, eligible[other].path)
+            })
+            .collect();
+        return Some(Finding {
+            peer_group_id: id,
+            category: FindingCategory::SkipsPeerCheck,
+            severity: if population.len() >= MIN_POPULATION && compared > 0 {
+                Severity::Medium
+            } else {
+                Severity::Low
+            },
+            rationale: format!(
+                "Loads `{key}` with data from the request but never holds the result to the caller (or to a secret the request presents). {} of {} {class} routes that load it do: {}. Dismiss if the difference is intended.",
+                having.len(),
+                population.len(),
+                examples.join("; ")
+            ),
+            invariant,
+            suspicious_route: route.into(),
+            suspicious_route_tier: route.best_tier(),
+            expected_tier: EvidenceTier::Resource,
+            suspicious_route_evidence: route.authorization.clone(),
+            authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+        });
+    }
+    None
 }
 
 /// A requirement argument that names a fixed requirement, a variant,
@@ -529,6 +720,7 @@ pub(crate) fn skipped_peer_checks(
         .collect();
     let placed: Vec<_> = eligible.iter().map(|route| placement(route)).collect();
     let featured: Vec<Features> = eligible.iter().map(|route| features(route)).collect();
+    let classes: Vec<MethodClass> = placed.iter().map(|place| place.class).collect();
 
     for (index, route) in eligible.iter().enumerate() {
         if reported.contains(&(
@@ -628,6 +820,22 @@ pub(crate) fn skipped_peer_checks(
         }
         levels.push((APPLICATION.to_string(), peers.clone(), MIN_APP_POPULATION));
 
+        // The most specific check first: a record the route loads and its
+        // peers hold to the caller.
+        if let Some(finding) = unguarded_record(
+            route,
+            own,
+            index,
+            &featured,
+            &eligible,
+            place.class,
+            &classes,
+            peer_groups,
+            invariants,
+        ) {
+            finding_details.push(finding);
+            continue;
+        }
         // A route whose only auth schemes admit anyone (`NoAuth`) where its
         // peers pass a credential scheme to the same wrapper.
         if let Some(finding) = open_scheme(
@@ -834,7 +1042,9 @@ pub(crate) fn skipped_peer_checks(
         if skipped.is_empty() {
             continue;
         }
-        // Strongest consensus first, then the most specific feature.
+        // Strongest consensus first, then the most specific kind of check
+        // (a comparison with data before a call, before taking the caller,
+        // before a field read), then the most peers.
         skipped.sort_by(
             |(a_feature, (_, a_total, a_having)), (b_feature, (_, b_total, b_having))| {
                 let a_share = a_having.len() as f64 / *a_total as f64;
@@ -842,6 +1052,7 @@ pub(crate) fn skipped_peer_checks(
                 b_share
                     .partial_cmp(&a_share)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(specificity(a_feature).cmp(&specificity(b_feature)))
                     .then(b_having.len().cmp(&a_having.len()))
                     .then(a_feature.cmp(b_feature))
             },
