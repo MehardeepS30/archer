@@ -468,6 +468,24 @@ fn is_catch_all(path: &str) -> bool {
         })
 }
 
+/// Peers take the caller as `Option<X>`, so they serve anonymous callers
+/// too; a route whose extractor requires `X` (bound to `_` or not) rejects
+/// them, which is stricter than its peers, not a skipped check.
+fn requires_what_peers_allow(route: &Route, label: &str) -> bool {
+    let Some(base) = label
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    route.authorization.iter().any(|evidence| {
+        evidence.kind == AuthEvidenceKind::IdentityExtraction
+            && !evidence.mechanism.contains("Option<")
+            && evidence.mechanism == base
+            && evidence.symbol.as_deref().is_none_or(|symbol| !symbol.contains("Option<"))
+    })
+}
+
 fn describe(feature: &str) -> String {
     if let Some(callee) = feature.strip_prefix("checks:") {
         format!("check the caller with `{callee}`")
@@ -555,6 +573,27 @@ pub(crate) fn skipped_peer_checks(
             .filter(|&other| placed[other].resource == place.resource)
             .collect();
         levels.push((place.resource.clone(), resource, MIN_POPULATION));
+        // Sibling resources (`/account/block/instance` beside
+        // `/account/block/person`): each path prefix between the resource
+        // and its namespace, narrowest first. A namespace can be too broad
+        // to agree on a check that every route beside this one makes.
+        let mut parent = place.resource.as_str();
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            if above.len() <= place.namespace.len() || !above.starts_with(&place.namespace) {
+                break;
+            }
+            let siblings: Vec<usize> = peers
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    let resource = &placed[other].resource;
+                    placed[other].namespace == place.namespace
+                        && (resource == above || resource.starts_with(&format!("{above}/")))
+                })
+                .collect();
+            levels.push((above.to_string(), siblings, MIN_POPULATION));
+            parent = above;
+        }
         let namespace: Vec<usize> = peers
             .iter()
             .copied()
@@ -715,21 +754,55 @@ pub(crate) fn skipped_peer_checks(
                         && evidence.mechanism.contains(base))
             })
         };
-        let makes_checks = own.uses.iter().any(|feature| {
-            feature.starts_with("checks:")
-                || feature.starts_with("compares:")
-                || feature.starts_with("acts:")
-        });
+        let own_checks: Vec<&String> = own
+            .uses
+            .iter()
+            .filter(|feature| {
+                feature.starts_with("checks:")
+                    || feature.starts_with("compares:")
+                    || feature.starts_with("acts:")
+            })
+            .collect();
+        let makes_variant = |feature: &str| {
+            let Some(callee) = feature.strip_prefix("checks:") else {
+                return false;
+            };
+            own_checks.iter().any(|check| {
+                check.strip_prefix("checks:").is_some_and(|own_callee| {
+                    own_callee != callee
+                        && (own_callee.starts_with(callee) || callee.starts_with(own_callee))
+                })
+            })
+        };
+        // Its own checks are a different policy unless every peer in its
+        // resource, sibling resources or namespace makes the skipped check,
+        // and most of them make each of the route's checks too: then the
+        // route does what they all do minus one check. Where only most
+        // peers make it, the ones that do not show the check is optional.
+        let own_policy = |scope: &str, total: usize, having: &[usize]| {
+            let narrow = scope == place.namespace || scope.starts_with(&format!("{}/", place.namespace));
+            !own_checks.is_empty()
+                && (!narrow
+                    || having.len() < total
+                    || own_checks.iter().any(|check| {
+                        2 * having
+                            .iter()
+                            .filter(|&&other| featured[other].uses.contains(*check))
+                            .count()
+                            < having.len()
+                    }))
+        };
         let mut skipped: Vec<(String, (String, usize, Vec<usize>))> = decided
             .into_iter()
             .filter(
-                |(feature, (_, _, having))| match feature.strip_prefix("takes:") {
+                |(feature, (scope, total, having))| match feature.strip_prefix("takes:") {
                     // A route that names a scheme none of those peers use
                     // (`AdminApiAuth`, `NoAuth`) authenticates differently on
                     // purpose; its scheme yields no caller to take.
                     Some(label) => {
                         own.takes.is_empty()
                             && !own_identity(label)
+                            && !requires_what_peers_allow(route, label)
                             && label != UNKNOWN_TYPE
                             && !own.schemes.iter().any(|scheme| {
                                 having
@@ -741,7 +814,20 @@ pub(crate) fn skipped_peer_checks(
                     // not all of its peers' checks, is a different policy more
                     // often than a forgotten one; a route that makes none has
                     // ignored the caller.
-                    None => !own.uses.contains(feature) && !makes_checks,
+                    // A reading of a field is too weak to set aside the
+                    // route's own checks; a call to a variant of the check
+                    // (`validate_x_or_init` for `validate_x`) makes it.
+                    None => {
+                        !own.uses.contains(feature)
+                            && (own_checks.is_empty()
+                                || (!own_policy(scope, *total, having)
+                                    && feature.starts_with("checks:")
+                                    // Calling a method of the caller
+                                    // (`acts:`) alone says too little of
+                                    // what the route checks.
+                                    && own_checks.iter().any(|check| !check.starts_with("acts:"))
+                                    && !makes_variant(feature)))
+                    }
                 },
             )
             .collect();

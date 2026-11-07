@@ -2815,6 +2815,7 @@ fn structural_checks(
         file,
         handler,
         caller,
+        relation: HashSet::new(),
         evidence: Vec::new(),
     };
     visitor.visit_block(block);
@@ -2826,6 +2827,10 @@ struct StructuralChecks<'f> {
     handler: &'f str,
     /// Names holding the caller or a value computed from it.
     caller: HashSet<String>,
+    /// Names holding the result of a lookup of the caller's relation to
+    /// some data: a call given both a caller value and another value
+    /// (`let is_member = lookup(pool, group_id, user.id).is_ok()`).
+    relation: HashSet<String>,
     evidence: Vec<AuthEvidence>,
 }
 
@@ -2870,8 +2875,68 @@ impl StructuralChecks<'_> {
         }
     }
 
+    /// Whether an expression looks up the caller's relation to other data:
+    /// a call, through `.await`, `?` and result probes, given a caller
+    /// value and a non-constant value that is not the caller
+    /// (`lookup(pool, group_id, user.id).await.is_ok()`).
+    fn relation_lookup(&self, expr: &Expr) -> bool {
+        let arguments: Vec<&Expr> = match expr {
+            Expr::Await(inner) => return self.relation_lookup(&inner.base),
+            Expr::Try(inner) => return self.relation_lookup(&inner.expr),
+            Expr::Paren(inner) => return self.relation_lookup(&inner.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
+                return self.relation_lookup(&unary.expr);
+            }
+            Expr::MethodCall(call)
+                if ["is_ok", "is_some", "is_err", "is_none", "unwrap_or", "unwrap_or_default"]
+                    .contains(&call.method.to_string().as_str()) =>
+            {
+                return self.relation_lookup(&call.receiver);
+            }
+            Expr::Call(call) => call.args.iter().collect(),
+            Expr::MethodCall(call) if !self.derives(&call.receiver) => call.args.iter().collect(),
+            _ => return false,
+        };
+        let caller = arguments.iter().any(|argument| self.derives(argument));
+        let other = arguments.iter().any(|argument| {
+            !self.derives(argument) && !Self::constant(argument) && Self::record_key(argument)
+        });
+        caller && other
+    }
+
+    /// Whether a value names a record by its key (`community_id`,
+    /// `data.post_id`, `path.uuid`, `&slug`): what a relation lookup takes
+    /// besides the caller. A settings object or a pool is not one.
+    fn record_key(expr: &Expr) -> bool {
+        let last = expr
+            .to_token_stream()
+            .into_iter()
+            .filter_map(|token| match token {
+                proc_macro2::TokenTree::Ident(ident) => Some(ident.to_string().to_lowercase()),
+                _ => None,
+            })
+            .filter(|name| !["clone", "into", "as_ref", "to_owned", "to_string", "into_inner", "unwrap"].contains(&name.as_str()))
+            .last();
+        last.is_some_and(|name| {
+            name == "id"
+                || name.ends_with("_id")
+                || name.ends_with("_ids")
+                || ["uuid", "slug", "key"].contains(&name.as_str())
+                || name.ends_with("_uuid")
+                || name.ends_with("_slug")
+        })
+    }
+
     /// The kind of check a rejecting branch's condition makes.
     fn classify(&self, condition: &Expr) -> Option<AuthEvidenceKind> {
+        if self.relation_lookup(condition) {
+            return Some(AuthEvidenceKind::OwnershipCheck);
+        }
+        if let Expr::Path(path) = condition
+            && path.path.get_ident().is_some_and(|ident| self.relation.contains(&ident.to_string()))
+        {
+            return Some(AuthEvidenceKind::OwnershipCheck);
+        }
         let strongest = |left: Option<AuthEvidenceKind>, right: Option<AuthEvidenceKind>| match (left, right) {
             (Some(left), Some(right)) => Some(if EvidenceTier::of(&right) > EvidenceTier::of(&left) { right } else { left }),
             (left, right) => left.or(right),
@@ -2924,6 +2989,9 @@ impl StructuralChecks<'_> {
 
     fn push(&mut self, kind: AuthEvidenceKind, condition: &Expr, line: usize) {
         let what = match (&kind, condition) {
+            (AuthEvidenceKind::OwnershipCheck, _) if self.mentions_relation(condition) => {
+                super::model::RELATION_CHECK
+            }
             (AuthEvidenceKind::OwnershipCheck, _) => "a caller value matches the data",
             (_, Expr::Let(_)) => "a caller value is present",
             (_, Expr::MethodCall(call)) if ["is_some", "is_none", "is_ok", "is_err"].iter().any(|probe| call.method == probe) => {
@@ -2932,6 +3000,14 @@ impl StructuralChecks<'_> {
             _ => "a caller attribute allows it",
         };
         self.push_described(kind, what, condition, line);
+    }
+
+    fn mentions_relation(&self, condition: &Expr) -> bool {
+        self.relation_lookup(condition)
+            || condition
+                .to_token_stream()
+                .into_iter()
+                .any(|token| matches!(token, proc_macro2::TokenTree::Ident(ident) if self.relation.contains(&ident.to_string())))
     }
 
     fn push_described(&mut self, kind: AuthEvidenceKind, what: &str, condition: &Expr, line: usize) {
@@ -2970,6 +3046,15 @@ impl<'ast> Visit<'ast> for StructuralChecks<'_> {
                 let mut names = HashSet::new();
                 pattern_bindings(&node.pat, &mut names);
                 self.caller.extend(names);
+            } else if self.relation_lookup(&init.expr) {
+                let mut names = HashSet::new();
+                pattern_bindings(&node.pat, &mut names);
+                if let Some((_, diverge)) = &init.diverge
+                    && super::caller_use::rejects_in(diverge)
+                {
+                    self.push(AuthEvidenceKind::OwnershipCheck, &init.expr, node.let_token.span.start().line);
+                }
+                self.relation.extend(names);
             }
         }
         visit::visit_local(self, node);

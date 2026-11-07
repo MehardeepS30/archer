@@ -158,10 +158,16 @@ pub struct Requirement {
     pub roles_any_of: bool,
     /// The handler compares a record's owner with the caller.
     pub ownership: bool,
+    /// The handler checks the caller's relation to a record (member,
+    /// moderator): an object-level role, not ownership.
+    pub relation: bool,
     /// Some protection could not be evaluated. It never meets a peer's
     /// requirement; it only turns a shortfall into "review manually".
     pub unverified: bool,
 }
+
+/// Mechanism text of a check on the caller's relation to a record.
+pub const RELATION_CHECK: &str = "the caller's relation to the data allows it";
 
 impl Requirement {
     pub fn of(route: &Route) -> Self {
@@ -183,10 +189,14 @@ impl Requirement {
             authenticated: tier >= EvidenceTier::Identity,
             roles,
             roles_any_of,
-            ownership: route
-                .authorization
-                .iter()
-                .any(|evidence| evidence.kind == AuthEvidenceKind::OwnershipCheck),
+            ownership: route.authorization.iter().any(|evidence| {
+                evidence.kind == AuthEvidenceKind::OwnershipCheck
+                    && !evidence.mechanism.contains(RELATION_CHECK)
+            }),
+            relation: route.authorization.iter().any(|evidence| {
+                evidence.kind == AuthEvidenceKind::OwnershipCheck
+                    && evidence.mechanism.contains(RELATION_CHECK)
+            }),
             unverified: !route.unverified.is_empty()
                 || route.authorization.iter().any(|evidence| {
                     matches!(evidence.kind, AuthEvidenceKind::Unknown | AuthEvidenceKind::Delegated)

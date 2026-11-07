@@ -875,7 +875,7 @@ fn stronger_fields(route: &Requirement, stronger: &Requirement, same_handler: bo
     if same_handler && !stronger.roles.is_empty() && route.roles.is_empty() && !route.ownership {
         fields.push("a role");
     }
-    if stronger.ownership && !route.ownership && route.roles.is_empty() {
+    if stronger.ownership && !route.ownership && route.roles.is_empty() && !route.relation {
         fields.push("an ownership check");
     }
     fields
@@ -1907,7 +1907,7 @@ fn static_segments(path: &str) -> Vec<String> {
 /// segments before it are generic or about accounts. `/admin/settings/auth`
 /// and `/admin/users/{id}/token` manage something and are analysed.
 pub(crate) fn is_authentication_route(route: &Route) -> bool {
-    const ENDPOINTS: [&str; 21] = [
+    const ENDPOINTS: [&str; 22] = [
         "device",
         "revoke",
         "certs",
@@ -1927,6 +1927,7 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
         "reset",
         "forgot",
         "verify",
+        "verification",
         "confirm",
         "password",
     ];
@@ -2038,6 +2039,21 @@ pub(crate) fn is_well_known_public_route(route: &Route) -> bool {
     };
     // `health_check`, `health-check` and `healthcheck` are one name.
     let squash = |name: &str| name.replace(['_', '-'], "");
+    // A liveness probe (`/api/v4/image/health`, `/storage/ping`) reports
+    // whether a part of the app is up, whatever part it names, unless it
+    // sits under an admin area; other names (`/users/status`) are public
+    // only at the top.
+    const PROBES: [&str; 11] = [
+        "health", "healthz", "healthcheck", "ready", "readyz", "readiness", "live", "livez",
+        "liveness", "ping", "alive",
+    ];
+    const PRIVILEGED: [&str; 6] = ["admin", "admins", "internal", "manage", "management", "ops"];
+    if route.method == "GET"
+        && PROBES.iter().any(|probe| squash(probe) == squash(last))
+        && !before.iter().any(|segment| PRIVILEGED.contains(&segment.to_lowercase().as_str()))
+    {
+        return true;
+    }
     PUBLIC.iter().any(|public| squash(public) == squash(last))
         && before.iter().all(|segment| is_generic_segment(segment))
 }

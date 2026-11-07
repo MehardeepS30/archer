@@ -4796,6 +4796,19 @@ fn well_known_names_ignore_separators() {
     assert!(is_well_known_public_route(&route("GET", "/health_check", "", "NONE")));
     assert!(is_well_known_public_route(&route("GET", "/api/health-check", "/api", "NONE")));
     assert!(!is_well_known_public_route(&route("GET", "/admin/health_check", "/admin", "NONE")));
+    assert!(is_well_known_public_route(&route("GET", "/api/v2/media/health", "/api/v2/media", "NONE")));
+    assert!(!is_well_known_public_route(&route("GET", "/api/v2/media/status", "/api/v2/media", "NONE")));
+    assert!(!is_well_known_public_route(&route("POST", "/api/v2/media/ping", "/api/v2/media", "NONE")));
+}
+
+#[test]
+fn account_verification_flows_are_authentication_endpoints() {
+    assert!(is_authentication_route(&route(
+        "POST",
+        "/api/account/auth/resend_verification_email",
+        "/api/account/auth",
+        "NONE"
+    )));
 }
 
 #[test]
@@ -5087,4 +5100,55 @@ async fn d(form: web::Json<Submission>) -> Result<HttpResponse, Fault> {
     assert_eq!(structural("/c"), vec!["ensure_active -> user . suspended".to_string()]);
     // A user record read from the request body is not the caller.
     assert!(structural("/d").is_empty(), "{:?}", structural("/d"));
+}
+
+#[test]
+fn a_required_caller_is_not_a_skipped_optional_caller() {
+    let report = drift_fixture(
+        "f50",
+        include_str!("../../tests/fixtures/probes/drift/f50_required_caller_over_optional.rs"),
+    );
+    let skipped: Vec<_> = reported(&report)
+        .into_iter()
+        .filter(|(category, _, _)| *category == FindingCategory::SkipsPeerCheck)
+        .map(|(_, method, path)| format!("{method} {path}"))
+        .collect();
+    assert_eq!(skipped, ["GET /board/stats"]);
+}
+
+#[test]
+fn a_route_making_all_but_one_of_its_siblings_checks_is_reported() {
+    let report = drift_fixture(
+        "f51",
+        include_str!("../../tests/fixtures/probes/drift/f51_sibling_skips_one_check.rs"),
+    );
+    let skipped: Vec<_> = reported(&report)
+        .into_iter()
+        .filter(|(category, _, _)| *category == FindingCategory::SkipsPeerCheck)
+        .map(|(_, method, path)| format!("{method} {path}"))
+        .collect();
+    assert_eq!(skipped, ["POST /profile/mute/region/members"]);
+}
+
+#[test]
+fn a_lookup_of_the_callers_relation_to_a_record_is_a_resource_check() {
+    let report = drift_fixture(
+        "f52",
+        include_str!("../../tests/fixtures/probes/drift/f52_relation_lookup.rs"),
+    );
+    let relation = |path: &str| {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .unwrap()
+            .authorization
+            .iter()
+            .any(|evidence| {
+                evidence.kind == AuthEvidenceKind::OwnershipCheck
+                    && evidence.mechanism.contains(super::model::RELATION_CHECK)
+            })
+    };
+    assert!(relation("/groups/rename"));
+    assert!(!relation("/groups/tag"));
 }
