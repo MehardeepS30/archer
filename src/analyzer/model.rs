@@ -188,13 +188,19 @@ impl Requirement {
             .into_iter()
             .map(str::to_owned)
             .collect();
+        // One check that admits several roles is an allow-list: a guard's
+        // or middleware's role list, or a role check whose roles are the
+        // arms it lets through, the variants it matches or the ones at or
+        // above a rank. Several permissions in one check can be required
+        // together, so only roles count.
         let roles_any_of = roles.len() > 1
             && route.authorization.iter().any(|evidence| {
                 evidence.requirements.len() > 1
-                    && evidence
-                        .symbol
-                        .as_deref()
-                        .is_some_and(|symbol| symbol.starts_with(".wrap") || symbol.starts_with(".guard"))
+                    && (evidence.kind == AuthEvidenceKind::RoleCheck
+                        || evidence
+                            .symbol
+                            .as_deref()
+                            .is_some_and(|symbol| symbol.starts_with(".wrap") || symbol.starts_with(".guard")))
             });
         Self {
             authenticated: tier >= EvidenceTier::Identity,

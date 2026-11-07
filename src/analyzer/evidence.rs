@@ -1398,13 +1398,18 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         };
         self.with_use(condition, |visitor| visitor.visit_expr(&node.expr));
         if enforcing && let Some(kind) = authorization_operand(&node.expr) {
-            let mut requirements: Vec<String> = node
+            let admitting: Vec<&syn::Arm> = node
                 .arms
                 .iter()
                 .zip(&rejecting)
                 .filter(|(_, rejects)| !**rejects)
-                .flat_map(|(arm, _)| pattern_keys(&arm.pat))
+                .map(|(arm, _)| arm)
                 .collect();
+            let mut requirements: Vec<String> =
+                admitting.iter().flat_map(|arm| pattern_keys(&arm.pat)).collect();
+            if requirements.is_empty() {
+                requirements = admitting.iter().flat_map(|arm| pattern_variant_keys(&arm.pat)).collect();
+            }
             requirements.sort();
             requirements.dedup();
             let written = node.expr.to_token_stream().to_string().replace(' ', "");
@@ -1593,6 +1598,18 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
         if matches!(node.op, BinOp::Eq(_) | BinOp::Ne(_)) {
             self.record_comparison([&*node.left, &*node.right]);
+        } else if matches!(node.op, BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_))
+            && let Some((admitted, operand)) = super::roles::ordering_admits(node)
+            && let Some(kind) = authorization_operand(operand)
+        {
+            // `user.role >= Role::Editor`: the roles of an ordered type it
+            // admits.
+            let written = operand.to_token_stream().to_string().replace(' ', "");
+            let mut evidence = self.evidence(kind, written, operand.span().start().line, AuthStrength::Medium);
+            let mut admitted = admitted;
+            admitted.sort();
+            evidence.requirements = admitted;
+            self.record(evidence, false);
         }
         visit::visit_expr_binary(self, node);
     }
@@ -1666,7 +1683,7 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
 
 /// Macros whose leading argument is a condition that rejects when false.
 /// `debug_assert!` is left out: it does not run in release builds.
-const ENFORCING_MACROS: [&str; 6] = [
+pub(crate) const ENFORCING_MACROS: [&str; 6] = [
     "ensure",
     "assert",
     "assert_eq",
@@ -1719,6 +1736,15 @@ impl AuthEvidenceVisitor {
                 .iter()
                 .flat_map(|operand| keys_in_expr(operand))
                 .collect();
+            // Compared with a role, a variant names a role whatever its type
+            // is called (`member.rank == Rank::Chief`).
+            if requirements.is_empty() {
+                requirements = operands
+                    .iter()
+                    .filter(|other| !std::ptr::eq(**other, operand))
+                    .flat_map(|other| variant_keys(other))
+                    .collect();
+            }
             requirements.sort();
             requirements.dedup();
             evidence.requirements = requirements;
@@ -2691,6 +2717,47 @@ fn variant_key(path: &syn::Path) -> Option<String> {
     }
     let variant = segments.last()?.ident.to_string();
     normalize_key(&camel_case_words(&variant).join("_"))
+}
+
+/// Enum variants an expression names (`Rank::Chief`, `Rank::A | Rank::B`),
+/// whatever the type is called: used where the other side is a role.
+fn variant_keys(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Path(path) if path.path.segments.len() >= 2 => any_variant_key(&path.path).into_iter().collect(),
+        Expr::Reference(inner) => variant_keys(&inner.expr),
+        Expr::Paren(inner) => variant_keys(&inner.expr),
+        Expr::Binary(binary) if matches!(binary.op, BinOp::BitOr(_)) => {
+            let mut keys = variant_keys(&binary.left);
+            keys.extend(variant_keys(&binary.right));
+            keys
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn any_variant_key(path: &syn::Path) -> Option<String> {
+    let variant = path.segments.last()?.ident.to_string();
+    variant
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+        .then(|| normalize_key(&camel_case_words(&variant).join("_")))
+        .flatten()
+}
+
+/// `pattern_keys` for a match on a role, whatever the variants' type is
+/// called.
+fn pattern_variant_keys(pat: &Pat) -> Vec<String> {
+    match pat {
+        Pat::Path(path) if path.path.segments.len() >= 2 => any_variant_key(&path.path).into_iter().collect(),
+        Pat::TupleStruct(tuple) if tuple.path.segments.len() >= 2 => any_variant_key(&tuple.path).into_iter().collect(),
+        Pat::Struct(item) if item.path.segments.len() >= 2 => any_variant_key(&item.path).into_iter().collect(),
+        Pat::Or(or) => or.cases.iter().flat_map(pattern_variant_keys).collect(),
+        Pat::Paren(paren) => pattern_variant_keys(&paren.pat),
+        Pat::Reference(reference) => pattern_variant_keys(&reference.pat),
+        Pat::Ident(ident) => ident.subpat.as_ref().map(|(_, sub)| pattern_variant_keys(sub)).unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// Role or permission variants named by a match arm's pattern.

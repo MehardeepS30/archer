@@ -473,12 +473,11 @@ pub(crate) fn build_analysis_layers_full(
             };
             let mut reported = finding(route, category, expected, group, key, id, options);
             if category == FindingCategory::WeakerAuthorization {
-                let extra: Vec<String> = requirement
-                    .roles
-                    .iter()
-                    .filter(|role| !group.dominant_roles.contains(role))
-                    .map(|role| format!("`{role}`"))
-                    .collect();
+                let mut extra: Vec<String> = refused_roles(route, &requirement, group, options);
+                if extra.is_empty() {
+                    extra = requirement.roles.iter().filter(|role| !group.dominant_roles.contains(role)).cloned().collect();
+                }
+                let extra: Vec<String> = extra.iter().map(|role| format!("`{role}`")).collect();
                 reported.rationale = format!(
                     "Admits any of {} where its {} peers under {} admit only {}; it also lets in {}.",
                     requirement.roles.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", "),
@@ -486,6 +485,23 @@ pub(crate) fn build_analysis_layers_full(
                     key.prefix,
                     group.dominant_roles.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", "),
                     extra.join(", "),
+                );
+            } else if category == FindingCategory::DifferentAuthorization
+                && is_allow_list(route, &requirement)
+                && peers_allow_lists(route, group)
+            {
+                // Two allow-lists, neither containing the other: some callers
+                // each admits the other refuses. No direction, so Low.
+                let list = |roles: &[String]| roles.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", ");
+                let extra: Vec<String> = refused_roles(route, &requirement, group, options);
+                reported.severity = Severity::Low;
+                reported.rationale = format!(
+                    "Admits {} where its {} peers under {} admit {}: it lets in {} they refuse, and refuses some they admit. Neither allow-list contains the other; check which is intended.",
+                    list(&requirement.roles),
+                    key.class,
+                    key.prefix,
+                    list(&group.dominant_roles),
+                    list(&extra),
                 );
             }
             let reported = at_level(reported, key, &tried, switched);
@@ -515,6 +531,7 @@ pub(crate) fn build_analysis_layers_full(
     let linked = same_resource_weaker(routes, &mut peer_groups, &mut invariants, &mut finding_details, options);
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     super::auth_objects::unscoped_objects(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    super::roles::delete_admits_more(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     per_route_permissions(routes, &mut finding_details);
     for fallback in fallback_details {
         let route = &fallback.suspicious_route;
@@ -1414,6 +1431,55 @@ fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &Analysi
 /// role the peers lead with is different. A route that requires more than
 /// its peers, or allows a subset of their allow-list, is stricter and is
 /// not reported.
+/// A route admits callers by role from a set: role checks only (a named
+/// permission is held, not chosen from a set), one role or several any of
+/// which passes.
+pub(crate) fn is_allow_list(route: &Route, requirement: &Requirement) -> bool {
+    !requirement.roles.is_empty()
+        && (requirement.roles_any_of || requirement.roles.len() == 1)
+        && route.authorization.iter().any(|evidence| evidence.kind == AuthEvidenceKind::RoleCheck)
+        && !route.authorization.iter().any(|evidence| evidence.kind == AuthEvidenceKind::PermissionCheck)
+}
+
+/// Most of the peers that name roles admit from allow-lists.
+fn peers_allow_lists(route: &Route, group: &GroupStats) -> bool {
+    let naming: Vec<(&Route, Requirement)> = group
+        .peers
+        .iter()
+        .filter(|peer| route_identity(peer) != route_identity(route) && peer.best_tier() == EvidenceTier::Privilege)
+        .map(|peer| (*peer, Requirement::of(peer)))
+        .filter(|(_, requirement)| !requirement.roles.is_empty())
+        .collect();
+    let lists = naming.iter().filter(|(peer, requirement)| is_allow_list(peer, requirement)).count();
+    !naming.is_empty() && lists * 2 > naming.len()
+}
+
+/// The roles a route's allow-list admits that most of its peers' allow-lists
+/// (those that name roles) refuse.
+pub(crate) fn refused_roles(
+    route: &Route,
+    requirement: &Requirement,
+    group: &GroupStats,
+    options: &AnalysisOptions,
+) -> Vec<String> {
+    let naming: Vec<Requirement> = group
+        .peers
+        .iter()
+        .filter(|peer| route_identity(peer) != route_identity(route) && peer.best_tier() == EvidenceTier::Privilege)
+        .map(|peer| Requirement::of(peer))
+        .filter(|peer| !peer.roles.is_empty() && !peer.unverified)
+        .collect();
+    requirement
+        .roles
+        .iter()
+        .filter(|role| {
+            let refusing = naming.iter().filter(|peer| !peer.roles.contains(role)).count();
+            is_dominant_weight(refusing as f64, naming.len() as f64, options)
+        })
+        .cloned()
+        .collect()
+}
+
 fn role_mismatch(
     route: &Route,
     requirement: &Requirement,
@@ -1431,6 +1497,21 @@ fn role_mismatch(
         .roles
         .iter()
         .any(|role| !group.dominant_roles.contains(role));
+    // Both sides are sets of admitted roles: a route admitting only roles
+    // the peers admit is as strict or stricter, and is not reported.
+    if is_allow_list(route, requirement) && peers_allow_lists(route, group) {
+        // A role it admits is extra when most peers that name roles refuse
+        // it; only those make it weaker. Admitting none and refusing a role
+        // most admit is stricter; doing both has no direction.
+        if refused_roles(route, requirement, group, options).is_empty() {
+            return None;
+        }
+        return Some(if missing {
+            FindingCategory::DifferentAuthorization
+        } else {
+            FindingCategory::WeakerAuthorization
+        });
+    }
     if requirement.roles_any_of && extra && !missing {
         // Supported by other routes alone: peers that name roles and admit
         // none of the extra ones.

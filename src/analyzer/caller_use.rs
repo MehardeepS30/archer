@@ -856,6 +856,25 @@ fn callee_name(path: &syn::Path) -> Option<String> {
 }
 
 impl<'ast> Visit<'ast> for CallerUseVisitor {
+    // `matches!(caller.role, ..)` and `ensure!(caller.active)` read the
+    // caller like any expression; other macros' tokens stay opaque.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let Some(name) = node.path.segments.last().map(|segment| segment.ident.to_string()) else {
+            return;
+        };
+        if name != "matches" && !super::evidence::ENFORCING_MACROS.contains(&name.as_str()) {
+            return;
+        }
+        let scrutinee = node.parse_body_with(|input: syn::parse::ParseStream| {
+            let expr: Expr = input.parse()?;
+            let _: proc_macro2::TokenStream = input.parse()?;
+            Ok(expr)
+        });
+        if let Ok(expr) = scrutinee {
+            self.visit_expr(&expr);
+        }
+    }
+
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
         for input in &node.inputs {
             match input {

@@ -5272,3 +5272,52 @@ fn an_auth_object_passed_by_value_is_read_from_its_own_method() {
     assert!(!findings.iter().any(|finding| finding.suspicious_route.path.starts_with("/teams/{team_id}/boards")),
         "{findings:#?}");
 }
+
+#[test]
+fn ordered_roles_are_compared_as_allow_lists() {
+    let report = drift_fixture(
+        "f55",
+        include_str!("../../tests/fixtures/probes/drift/f55_role_order.rs"),
+    );
+    let roles = |method: &str, path: &str| {
+        let route = report.routes.iter().find(|route| route.method == method && route.path == path).unwrap();
+        Requirement::of(route).roles
+    };
+    // `<`, `>`, `>=`, `<=` on a derived order and `matches!` give the
+    // admitted set, whichever side the constant is on.
+    assert_eq!(roles("POST", "/shelves"), ["chief", "editor"]);
+    assert_eq!(roles("PUT", "/shelves/{shelf_id}"), ["chief", "editor"]);
+    assert_eq!(roles("PATCH", "/shelves/{shelf_id}/title"), ["chief", "editor"]);
+    assert_eq!(roles("DELETE", "/shelves/{shelf_id}"), ["chief", "editor", "reader"]);
+    assert_eq!(roles("POST", "/shelves/{shelf_id}/lock"), ["chief"]);
+    assert_eq!(roles("DELETE", "/cards/{card_id}"), ["chief", "editor"]);
+    let findings = &report.finding_details;
+    let at = |method: &str, path: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding.suspicious_route.method == method && finding.suspicious_route.path == path)
+            .collect::<Vec<_>>()
+    };
+    // A superset is weaker and names the extra role.
+    let shelf = at("DELETE", "/shelves/{shelf_id}");
+    assert_eq!(shelf.len(), 1, "{findings:#?}");
+    assert_eq!(shelf[0].category, FindingCategory::WeakerAuthorization);
+    assert!(shelf[0].rationale.contains("lets `reader`"), "{}", shelf[0].rationale);
+    // A subset is stricter, not drift; nor is reading the role in `matches!`
+    // a skipped check.
+    assert!(at("POST", "/shelves/{shelf_id}/lock").is_empty(), "{findings:#?}");
+    assert!(at("PATCH", "/shelves/{shelf_id}/title").is_empty(), "{findings:#?}");
+    // Neither containing the other: Different, at Low.
+    let pin = at("POST", "/notes/{note_id}/pin");
+    assert_eq!(pin.len(), 1, "{findings:#?}");
+    assert_eq!(pin[0].category, FindingCategory::DifferentAuthorization);
+    assert_eq!(pin[0].severity, Severity::Low);
+    assert!(pin[0].rationale.contains("lets in `reader`"), "{}", pin[0].rationale);
+    // One update is enough support for a delete that admits more.
+    let card = at("DELETE", "/cards/{card_id}");
+    assert_eq!(card.len(), 1, "{findings:#?}");
+    assert_eq!(card[0].category, FindingCategory::WeakerAuthorization);
+    assert_eq!(card[0].severity, Severity::Medium);
+    assert!(card[0].rationale.contains("lets `editor` remove"), "{}", card[0].rationale);
+    assert!(findings.len() == 3, "{findings:#?}");
+}
