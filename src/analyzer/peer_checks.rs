@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    caller_use::{BINDS, GUARDS, LOADS, MENTIONS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
+    caller_use::{BINDS, GRANTS, GUARDS, LOADS, MENTIONS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
     drift::{
         is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
         placement, route_identity, unique_routes,
@@ -71,6 +71,8 @@ struct Features {
     binds: BTreeSet<String>,
     /// Body or query fields it reads, as `body:p`.
     mentions: BTreeSet<String>,
+    /// Constants its auth objects are built with (`caller_use::GRANTS`).
+    grants: BTreeSet<String>,
 }
 
 impl Features {
@@ -94,8 +96,11 @@ fn features(route: &Route) -> Features {
     let mut guards: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut binds = BTreeSet::new();
     let mut mentions = BTreeSet::new();
+    let mut grants = BTreeSet::new();
     for feature in &route.caller_use {
-        if let Some(tag) = feature.strip_prefix(BINDS) {
+        if let Some(value) = feature.strip_prefix(GRANTS) {
+            grants.insert(value.to_string());
+        } else if let Some(tag) = feature.strip_prefix(BINDS) {
             binds.insert(tag.to_string());
         } else if let Some(tag) = feature.strip_prefix(MENTIONS) {
             mentions.insert(tag.to_string());
@@ -141,6 +146,7 @@ fn features(route: &Route) -> Features {
         guards,
         binds,
         mentions,
+        grants,
     }
 }
 
@@ -780,6 +786,9 @@ pub(crate) fn skipped_peer_checks(
     let featured: Vec<Features> = eligible.iter().map(|route| features(route)).collect();
     let classes: Vec<MethodClass> = placed.iter().map(|place| place.class).collect();
 
+    // Routes for the grant check, which runs last: the reasons above are
+    // more specific.
+    let mut granted: Vec<usize> = Vec::new();
     for (index, route) in eligible.iter().enumerate() {
         if reported.contains(&(
             route.method.clone(),
@@ -915,6 +924,7 @@ pub(crate) fn skipped_peer_checks(
                 finding_details.push(finding);
                 continue;
             }
+            granted.push(index);
         }
         // A route whose only auth schemes admit anyone (`NoAuth`) where its
         // peers pass a credential scheme to the same wrapper.
@@ -1282,6 +1292,18 @@ pub(crate) fn skipped_peer_checks(
                 .map(|&other| eligible[other].into())
                 .collect(),
         });
+    }
+    for index in granted {
+        let route = eligible[index];
+        if finding_details
+            .iter()
+            .any(|finding| finding.suspicious_route.method == route.method && finding.suspicious_route.path == route.path)
+        {
+            continue;
+        }
+        if let Some(finding) = same_grant(route, &featured[index], index, &featured, &eligible, peer_groups, invariants) {
+            finding_details.push(finding);
+        }
     }
     drop_superseded_unverified(finding_details);
 }
@@ -1824,6 +1846,168 @@ fn mechanism_guard(
                         .iter()
                         .find_map(|(key, ways)| ways.first().map(|how| format!("`{key}`: {how}")))
                         .unwrap_or_default(),
+                    file: eligible[other].file.clone(),
+                    line: eligible[other].line,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+    })
+}
+
+/// The grant, the caller field `(label, field)`, the peers reading it and
+/// the population size.
+type GrantSupport = (String, (String, String), Vec<usize>, usize);
+
+/// The caller's fields a route reads, by identity label: `team` for
+/// `reads:AccountUser:team`.
+fn caller_reads(features: &Features) -> BTreeSet<(&str, &str)> {
+    features
+        .uses
+        .iter()
+        .filter_map(|feature| feature.strip_prefix("reads:")?.split_once(':'))
+        .filter(|(label, _)| *label != UNKNOWN_TYPE)
+        .collect()
+}
+
+/// The grant invariant: routes that build their auth object with the same
+/// constant (`Grant::NotesRead`) are granted the same
+/// operation, and read the same part of the caller to scope it. Among at
+/// least 3 other routes with that grant, of any method, at least 75% read
+/// the caller's field `f`; a route with the grant and the same caller type
+/// that never reads `f` is reported. Only fields named like an entity of
+/// the application's own templates count (`team` beside `{team_id}`).
+/// Peers come from the same API version root (`/v2/..` apart from
+/// unversioned routes), whose callers can differ in shape. It runs after
+/// the other checks, for routes none of them reported.
+/// Medium with at least 5 such peers,
+/// unless the route names a scheme none of them name; otherwise Low.
+#[allow(clippy::too_many_arguments)]
+fn same_grant(
+    route: &Route,
+    own: &Features,
+    index: usize,
+    featured: &[Features],
+    eligible: &[&Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    if !super::caller_use::rule_on("R5") || own.grants.is_empty() {
+        return None;
+    }
+    let mine = caller_reads(own);
+    // A field that names an entity of the application's own templates
+    // (`team` beside `{team_id}`): the part of the caller that scopes.
+    let entities: BTreeSet<String> = eligible
+        .iter()
+        .flat_map(|other| path_parameters(&other.path))
+        .collect();
+    let scopes = |field: &str| {
+        entities.contains(field) || entities.contains(&format!("{field}_id")) || entities.contains(&format!("{field}Id"))
+    };
+    let labels: BTreeSet<&str> = own.takes.iter().map(String::as_str).chain(mine.iter().map(|(label, _)| *label)).collect();
+    let mut best: Option<GrantSupport> = None;
+    let version = placement(route).version;
+    for grant in &own.grants {
+        let population: Vec<usize> = (0..eligible.len())
+            .filter(|&other| {
+                other != index
+                    && placement(eligible[other]).version == version
+                    && route_identity(eligible[other]) != route_identity(route)
+                    && eligible[other].origin.definition != route.origin.definition
+                    && featured[other].grants.contains(grant)
+            })
+            .collect();
+        if population.len() < MIN_POPULATION {
+            continue;
+        }
+        let reads: Vec<BTreeSet<(&str, &str)>> = population.iter().map(|&other| caller_reads(&featured[other])).collect();
+        let mut counted: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        for found in &reads {
+            for read in found {
+                *counted.entry(*read).or_default() += 1;
+            }
+        }
+        for (read, count) in counted {
+            if mine.contains(&read)
+                || !labels.contains(read.0)
+                || !scopes(read.1)
+                || (count as f64) / (population.len() as f64) + 1e-9 < CONSENSUS
+            {
+                continue;
+            }
+            let having: Vec<usize> = population
+                .iter()
+                .zip(&reads)
+                .filter(|(_, found)| found.contains(&read))
+                .map(|(&other, _)| other)
+                .collect();
+            if best.as_ref().is_none_or(|(_, _, theirs, _)| having.len() > theirs.len()) {
+                best = Some((grant.clone(), (read.0.to_string(), read.1.to_string()), having, population.len()));
+            }
+        }
+    }
+    let (grant, (label, field), having, total) = best?;
+    let severity = if having.len() >= 5 && !other_scheme(own, &having, featured) {
+        Severity::Medium
+    } else {
+        Severity::Low
+    };
+    let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+    let mut group_routes: Vec<RouteReference> = vec![route.into()];
+    group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+    peer_groups.push(PeerGroup {
+        id: id.clone(),
+        description: format!("routes whose auth object is built with `{grant}`"),
+        prefix: format!("grant `{grant}`"),
+        level: GroupLevel::Linked,
+        method_class: MethodClass::of(&route.method),
+        routes: group_routes,
+    });
+    let feature = format!("reads:{label}:{field}");
+    let invariant = AuthorizationInvariant {
+        peer_group_id: id.clone(),
+        description: format!("Routes granted `{grant}` read the caller's `{field}`."),
+        total_routes: total + 1,
+        routes_with_authorization: having.len(),
+        routes_without_authorization: total + 1 - having.len(),
+        evidence_patterns: vec![feature.clone()],
+        strength: AuthStrength::Medium,
+        expected_tier: Some(EvidenceTier::Resource),
+        dominant_requirement: Some(feature),
+    };
+    invariants.push(invariant.clone());
+    let listed: Vec<String> = having
+        .iter()
+        .take(NAMED)
+        .map(|&other| format!("{} {}", eligible[other].method, eligible[other].path))
+        .collect();
+    Some(Finding {
+        peer_group_id: id,
+        category: FindingCategory::SkipsPeerCheck,
+        severity,
+        rationale: format!(
+            "Builds its auth object with `{grant}` but never reads the caller's `{field}`, where {} of {total} routes granted `{grant}` do ({}); routes granted the same operation usually scope it by the same part of the caller. Dismiss if the difference is intended.",
+            having.len(),
+            listed.join(", ")
+        ),
+        invariant,
+        suspicious_route: route.into(),
+        suspicious_route_tier: route.best_tier(),
+        expected_tier: EvidenceTier::Resource,
+        suspicious_route_evidence: route.authorization.clone(),
+        evidence: FindingEvidence {
+            check: format!("reads the caller's `{field}`"),
+            supporting: having.len(),
+            compared: total,
+            peers: having
+                .iter()
+                .take(super::explain::PEERS_SHOWN)
+                .map(|&other| PeerCheck {
+                    method: eligible[other].method.clone(),
+                    path: eligible[other].path.clone(),
+                    check: format!("reads `{label}.{field}`"),
                     file: eligible[other].file.clone(),
                     line: eligible[other].line,
                 })

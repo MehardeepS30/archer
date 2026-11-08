@@ -5451,3 +5451,23 @@ fn a_symbolic_scope_is_static_and_a_leading_one_stays_a_mount_prefix() {
     assert_eq!(super::routes::settle_symbolic_scope("/<scope:cfg.base>/a"), "/<unresolved:cfg.base>/a");
     assert_eq!(super::routes::settle_symbolic_scope("/api/<scope:x>/a"), "/api/<scope:x>/a");
 }
+
+#[test]
+fn a_route_granted_what_its_peers_are_that_skips_their_caller_scope_is_reported() {
+    let report = drift_fixture(
+        "f61",
+        include_str!("../../tests/fixtures/probes/drift/f61_grant_scopes.rs"),
+    );
+    let findings: Vec<(&str, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.severity))
+        .collect();
+    // Another grant and another API version are not compared.
+    assert_eq!(findings, [("/notes/all", Severity::Medium)], "{findings:?}");
+    let all = &report.finding_details[0];
+    assert_eq!(all.category, FindingCategory::SkipsPeerCheck);
+    assert!(all.rationale.contains("`Grant::NotesRead`"), "{}", all.rationale);
+    assert!(all.rationale.contains("the caller's `team`"), "{}", all.rationale);
+    assert_eq!(all.evidence.supporting, 5);
+}

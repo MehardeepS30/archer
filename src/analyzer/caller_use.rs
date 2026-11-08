@@ -161,6 +161,10 @@ pub(crate) fn caller_use<'f>(
         .collect()
 }
 
+/// Feature prefix: a constant the route builds an authentication object
+/// with, as `grants:Type::Variant`. Compared by `peer_checks::same_grant`.
+pub(crate) const GRANTS: &str = "grants:";
+
 /// Not a feature: where a route's check `feature` is made, written
 /// `site:feature\u{1f}chain`. `peer_checks` cites it in findings.
 pub(crate) const SITE: &str = "site:";
@@ -473,6 +477,7 @@ impl Walker<'_, '_> {
                     .filter(|feature| {
                         !feature.starts_with("takes:")
                             && !feature.starts_with("scheme:")
+                            && !feature.starts_with(GRANTS)
                             && !feature.starts_with("auths:")
                     })
                     .map(|feature| {
@@ -1144,6 +1149,25 @@ impl<'ast> Visit<'ast> for Rejects {
 }
 
 impl CallerUseVisitor {
+    /// The constants an authentication object is built with:
+    /// `DeskAuth { grant: Grant::NotesRead, .. }` grants
+    /// `Grant::NotesRead` (see `GRANTS`).
+    fn grants(&mut self, node: &syn::ExprStruct) {
+        if !rule_on("R5") || !self.features.contains(&format!("scheme:{}", node.path.segments.last().map(|segment| segment.ident.to_string()).unwrap_or_default())) {
+            return;
+        }
+        for field in &node.fields {
+            if let Expr::Path(path) = &field.expr
+                && path.qself.is_none()
+                && let [.., owner, value] = path.path.segments.iter().collect::<Vec<_>>().as_slice()
+                && value.ident.to_string().starts_with(|character: char| character.is_ascii_uppercase())
+                && owner.ident.to_string().starts_with(|character: char| character.is_ascii_uppercase())
+            {
+                self.features.insert(format!("{GRANTS}{}::{}", owner.ident, value.ident));
+            }
+        }
+    }
+
     /// A unit or struct value named for authentication: `AdminApiAuth`,
     /// `NoAuth`, `JWTAuthProfileFromRoute`.
     fn scheme(&mut self, path: &syn::Path) {
@@ -1569,6 +1593,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
         self.scheme(&node.path);
+        self.grants(node);
         visit::visit_expr_struct(self, node);
     }
 

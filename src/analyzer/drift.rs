@@ -2125,7 +2125,13 @@ fn authenticates_structurally(route: &Route) -> bool {
         .resource_keys
         .iter()
         .chain(route.caller_use.iter().filter(|feature| {
-            !feature.starts_with("scheme:") && !feature.starts_with(super::caller_use::SITE)
+            // Bookkeeping, not behaviour: where a check is made, and what
+            // the request carries and the auth object is built with.
+            !feature.starts_with("scheme:")
+                && !feature.starts_with(super::caller_use::SITE)
+                && !feature.starts_with(super::caller_use::BINDS)
+                && !feature.starts_with(super::caller_use::MENTIONS)
+                && !feature.starts_with(super::caller_use::GRANTS)
         }))
         .map(|text| text.to_ascii_lowercase())
         .collect();

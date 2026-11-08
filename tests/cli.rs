@@ -78,6 +78,7 @@ fn each_missed_drift_rule_has_a_switch() {
         ("tests/fixtures/probes/drift/f58_path_bindings.rs", "ARCHER_P10_R2", "GET /people/{who}/notes"),
         ("tests/fixtures/probes/drift/f59_scheme_guards.rs", "ARCHER_P10_R3", "POST /coupons/{code}/apply"),
         ("tests/fixtures/probes/drift/f60_symbolic_scope.rs", "ARCHER_P10_R4", "/items/{id}/restock"),
+        ("tests/fixtures/probes/drift/f61_grant_scopes.rs", "ARCHER_P10_R5", "GET /notes/all"),
     ];
     for (fixture, switch, route) in cases {
         let on = findings_with(fixture, &[]);
