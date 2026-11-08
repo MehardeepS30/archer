@@ -300,6 +300,7 @@ fn unguarded_record(
             suspicious_route_tier: route.best_tier(),
             expected_tier: EvidenceTier::Resource,
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
         });
     }
@@ -466,6 +467,7 @@ fn open_scheme(
             suspicious_route_tier: route.best_tier(),
             expected_tier: route.best_tier(),
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
         });
     }
@@ -624,6 +626,7 @@ fn missing_requirement(
                 suspicious_route_tier: route.best_tier(),
                 expected_tier: route.best_tier(),
                 suspicious_route_evidence: route.authorization.clone(),
+                evidence: Default::default(),
                 authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
             });
         }
@@ -1194,6 +1197,27 @@ pub(crate) fn skipped_peer_checks(
             suspicious_route_tier: route.best_tier(),
             expected_tier: route.best_tier(),
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: FindingEvidence {
+                check: format!("{} routes under {top_scope} {}", place.class, describe(top_feature)),
+                supporting: top_having.len(),
+                compared: *top_total,
+                peers: top_having
+                    .iter()
+                    .take(super::explain::PEERS_SHOWN)
+                    .map(|&other| PeerCheck {
+                        method: eligible[other].method.clone(),
+                        path: eligible[other].path.clone(),
+                        check: featured[other]
+                            .sites
+                            .get(top_feature)
+                            .cloned()
+                            .unwrap_or_else(|| describe(top_feature)),
+                        file: eligible[other].file.clone(),
+                        line: eligible[other].line,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
             authorized_peer_routes: top_having
                 .iter()
                 .map(|&other| eligible[other].into())

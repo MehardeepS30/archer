@@ -831,6 +831,7 @@ pub(crate) fn unscoped_objects(
             suspicious_route_tier: route.best_tier(),
             expected_tier: route.best_tier(),
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: scoped.iter().map(|&other| routes[other].into()).collect(),
         });
     }

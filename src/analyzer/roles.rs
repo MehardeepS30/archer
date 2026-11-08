@@ -276,6 +276,7 @@ pub(crate) fn delete_admits_more(
             suspicious_route_tier: route.best_tier(),
             expected_tier: EvidenceTier::Privilege,
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: updates.iter().map(|(other, _)| routes[*other].into()).collect(),
         });
     }

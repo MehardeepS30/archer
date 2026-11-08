@@ -189,6 +189,22 @@ This does **not** automatically establish that the endpoint is exploitable. Auth
 | `WeakerAuthorization` | Ownership only; peers check a privilege | medium |
 | `DifferentAuthorization` | Same tier, but not the requirement a dominant share of peers checks (`viewer` where peers require `admin`) | medium |
 | `UnverifiedProtection` | Falls short, but has an unrecognized guard or middleware, or a handler that could not be analyzed, that its peers do not share | low |
+| `SkipsPeerCheck` | Peers make a check with the caller (a call, a comparison with a loaded record, a scheme) that this route does not | medium; low as below |
+| `SameResourceWeakerProtection` | Routes serving the same data require more of the caller | medium |
+| `InconsistentRegistration` | The same handler is registered elsewhere with protection this route lacks | medium |
+
+**Severity.** The category sets a starting severity by the gap: a missing caller or a missing privilege is high, a missing scope or a different or weaker requirement is medium. It is then lowered by how little the comparison supports it:
+
+| Condition | Effect |
+|---|---|
+| Compared only at a fallback level (API version root or whole application) | low, unless the route is a write and at least 80% and at least 5 of the compared writes make the check: then at most medium. Reads are often public by design; an unprotected write among protected ones rarely is. |
+| The route's class is inferred from what its handler does (a GET that writes) | at most medium |
+| Two allow-lists of roles, neither containing the other | low |
+| Per-operation permissions (one mechanism naming many permissions, few routes each) | low |
+| Protection Archer cannot evaluate that the peers do not share (a component only this route has, the caller handed to unanalyzed code, an unanalyzed handler) | `UnverifiedProtection`, low. What the peers share is listed as a note instead and changes nothing. |
+| `SkipsPeerCheck`: consensus of the whole application, only field reads, an own identity source, or an unshared unknown component | low |
+
+**Evidence.** Every finding carries `evidence`: the check the peers make, how many of the compared peers make it, up to five of them with file and line, what the route has instead, notes on protection Archer did not evaluate, and a `[[dismiss]]` rule that can be pasted into `archer.toml` once the difference is found intended (fill in its `reason`). The text report prints the same, and the JSON report also lists every peer in `authorized_peer_routes`.
 
 **Requirements** are normalized subjects read from names (`require_admin`, `AdminUser`, `AdminGuard` all give `admin`), literals (`#[has_roles("ROLE_ADMIN")]`, `has_role(&u, "admin")`), variants (`Role::Admin`), and type parameters (`RequireRole<Admin>`). Routes with per-route permissions (`reports:sales`, `reports:stock`) have no dominant requirement and are never reported as different.
 

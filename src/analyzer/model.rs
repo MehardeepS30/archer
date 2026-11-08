@@ -387,6 +387,42 @@ pub struct Finding {
     pub suspicious_route_evidence: Vec<AuthEvidence>,
     /// Peers that reach `expected_tier`, with their evidence.
     pub authorized_peer_routes: Vec<RouteReference>,
+    /// What the finding rests on, for a reviewer to check: see
+    /// [`FindingEvidence`].
+    pub evidence: FindingEvidence,
+}
+
+/// The case for a finding, stated so it can be checked by hand: the check
+/// the peers make, where some of them make it, what this route has
+/// instead, and how to record the finding as reviewed.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct FindingEvidence {
+    /// The check the peers make, as a call, comparison or component.
+    pub check: String,
+    /// How many of the compared peers make it, and how many were compared.
+    pub supporting: usize,
+    pub compared: usize,
+    /// Up to five peers that make it, each with where.
+    pub peers: Vec<PeerCheck>,
+    /// The route's own evidence, or that it has none Archer recognizes.
+    pub instead: Vec<String>,
+    /// Protection on the route that Archer cannot evaluate and that did not
+    /// lower the severity, because it cannot be the missing check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// A rule to paste into `archer.toml` once the difference is reviewed
+    /// and found intended.
+    pub dismiss: String,
+}
+
+/// One peer that makes the check, and where.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PeerCheck {
+    pub method: String,
+    pub path: String,
+    pub check: String,
+    pub file: PathBuf,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

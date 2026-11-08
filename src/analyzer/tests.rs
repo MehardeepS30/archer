@@ -5321,3 +5321,35 @@ fn ordered_roles_are_compared_as_allow_lists() {
     assert!(card[0].rationale.contains("lets `editor` remove"), "{}", card[0].rationale);
     assert!(findings.len() == 3, "{findings:#?}");
 }
+
+#[test]
+fn whole_app_support_raises_only_writes_and_findings_state_their_case() {
+    let source = include_str!("../../tests/fixtures/probes/drift/f56_severity_evidence.rs");
+    let report = drift_fixture("f56", source);
+    let at = |method: &str, path: &str| {
+        report
+            .finding_details
+            .iter()
+            .find(|finding| finding.suspicious_route.method == method && finding.suspicious_route.path == path)
+            .unwrap_or_else(|| panic!("no finding for {method} {path}: {:#?}", report.finding_details))
+    };
+    // Compared with the whole application only: a write that 6 of 6 writes
+    // outdo is Medium, a read stays Low.
+    let flush = at("POST", "/flush");
+    assert_eq!(flush.severity, Severity::Medium);
+    assert_eq!(at("GET", "/peek").severity, Severity::Low);
+    // The case: the check, at most five peers with where, what the route
+    // has instead, and a rule that dismisses it.
+    let evidence = &flush.evidence;
+    assert!(evidence.check.contains("`Staff`"), "{evidence:#?}");
+    assert_eq!((evidence.supporting, evidence.compared), (6, 6));
+    assert_eq!(evidence.peers.len(), 5);
+    assert!(evidence.peers.iter().all(|peer| peer.method == "POST" && peer.line > 0));
+    assert_eq!(evidence.instead, ["no authorization evidence Archer recognizes"]);
+    assert!(report.findings.iter().any(|text| text.contains("If intended, add to archer.toml:")));
+    // The rule, pasted as printed, dismisses exactly that finding.
+    let dismissed = TempRepo::new("f56-dismissed", &[("main.rs", source), ("archer.toml", &evidence.dismiss)]).analyze();
+    assert_eq!(dismissed.dismissed.len(), 1);
+    assert_eq!(dismissed.dismissed[0].finding.suspicious_route.path, "/flush");
+    assert!(dismissed.finding_details.iter().any(|finding| finding.suspicious_route.path == "/peek"));
+}

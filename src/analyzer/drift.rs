@@ -451,7 +451,7 @@ pub(crate) fn build_analysis_layers_full(
         }
         let tier = route.best_tier();
         let category = if tier < expected {
-            if unverified_beyond_peers(route, basis, options) {
+            if unverified_beyond_peers(route, basis, expected) {
                 FindingCategory::UnverifiedProtection
             } else {
                 match (expected, tier) {
@@ -697,6 +697,7 @@ fn writes_below_resource(
             suspicious_route_tier: tier,
             expected_tier: expected,
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: peers.iter().map(|peer| (*peer).into()).collect(),
         });
     }
@@ -873,6 +874,7 @@ fn inconsistent_registrations(
                 suspicious_route_tier: route.best_tier(),
                 expected_tier: stronger.best_tier(),
                 suspicious_route_evidence: route.authorization.clone(),
+                evidence: Default::default(),
                 authorized_peer_routes: vec![stronger.into()],
             });
         }
@@ -1062,6 +1064,7 @@ fn same_resource_weaker(
             suspicious_route_tier: route.best_tier(),
             expected_tier: expected,
             suspicious_route_evidence: route.authorization.clone(),
+            evidence: Default::default(),
             authorized_peer_routes: stronger.iter().map(|(other, _)| (*other).into()).collect(),
         });
     }
@@ -1413,7 +1416,12 @@ fn capitalized(text: &str) -> String {
 /// Whether the route carries something Archer cannot judge that its peers
 /// do not share: its own unrecognized guard or middleware, or a handler that
 /// could not be analyzed.
-fn unverified_beyond_peers(route: &Route, group: &GroupStats, _options: &AnalysisOptions) -> bool {
+/// Protection on the route that Archer cannot evaluate, which the peers do
+/// not share and so could be the check the route lacks: an unanalyzed
+/// handler, the caller handed to unanalyzed code, or a guard or middleware
+/// only this route has. Only that lowers a finding to unverified; what the
+/// peers share is listed as a note on the finding.
+fn unverified_beyond_peers(route: &Route, group: &GroupStats, _expected: EvidenceTier) -> bool {
     !route.unverified.is_empty()
         || route.authorization.iter().any(|evidence| {
             match evidence.kind {
@@ -1690,6 +1698,7 @@ fn finding(
         suspicious_route_tier: tier,
         expected_tier: expected,
         suspicious_route_evidence: route.authorization.clone(),
+        evidence: Default::default(),
         authorized_peer_routes: group
             .peers
             .iter()
@@ -1717,7 +1726,19 @@ fn at_level(mut finding: Finding, key: &GroupKey, tried: &str, switched: bool) -
         finding.severity = Severity::Medium;
     }
     if key.level.is_fallback() {
-        finding.severity = Severity::Low;
+        // A whole-application group pools routes never meant to be alike,
+        // so it supports little: Low, unless the route is a write and
+        // nearly all writes of the application make the check. Reads are
+        // often public by design; an unprotected write among protected
+        // ones rarely is.
+        let compared = finding.invariant.total_routes.saturating_sub(1);
+        let supporting = finding.authorized_peer_routes.len();
+        let strong = super::explain::strong_support(supporting, compared);
+        finding.severity = if strong && MethodClass::of(&finding.suspicious_route.method) == MethodClass::Write {
+            finding.severity.min(Severity::Medium)
+        } else {
+            Severity::Low
+        };
         finding.rationale.push_str(&format!(
             " Compared at the {} level ({}), since no narrower group had peers that agree.",
             key.level.label(),
@@ -1798,21 +1819,60 @@ pub fn format_finding(finding: &Finding) -> String {
         finding.expected_tier,
         finding.rationale
     );
-    format!(
-        "{}  Suspicious route: {} {} ({}:{})\n\
+    let evidence = &finding.evidence;
+    if evidence.check.is_empty() {
+        return format!(
+            "{}  Suspicious route: {} {} ({}:{})\n\
   Inferred invariant: {}\n\
   Peer evidence ({} route(s)):\n{}\n\
   Suspicious route evidence: {}.",
+            category,
+            route.method,
+            route.path,
+            route.file.display(),
+            route.line,
+            finding.invariant.description,
+            finding.authorized_peer_routes.len(),
+            peer_lines,
+            format_evidence(&finding.suspicious_route_evidence)
+        );
+    }
+    // The case, short: up to five peers that make the check stand for the
+    // rest, which the JSON report lists in full.
+    let mut text = format!(
+        "{}  Suspicious route: {} {} ({}:{})\n  Inferred invariant: {}",
         category,
         route.method,
         route.path,
         route.file.display(),
         route.line,
         finding.invariant.description,
-        finding.authorized_peer_routes.len(),
-        peer_lines,
-        format_evidence(&finding.suspicious_route_evidence)
-    )
+    );
+    {
+        text.push_str(&format!(
+            "\n  The check: {} ({} of {} compared peers make it)",
+            evidence.check, evidence.supporting, evidence.compared
+        ));
+        for peer in &evidence.peers {
+            text.push_str(&format!(
+                "\n    - {} {}: {} ({}:{})",
+                peer.method,
+                peer.path,
+                peer.check,
+                peer.file.display(),
+                peer.line
+            ));
+        }
+        text.push_str(&format!("\n  This route has instead: {}", evidence.instead.join("; ")));
+        for note in &evidence.notes {
+            text.push_str(&format!("\n  Note: {note}"));
+        }
+        text.push_str("\n  If intended, add to archer.toml:");
+        for line in evidence.dismiss.lines() {
+            text.push_str(&format!("\n    {line}"));
+        }
+    }
+    text
 }
 
 pub(crate) fn format_evidence(authorization: &[AuthEvidence]) -> String {

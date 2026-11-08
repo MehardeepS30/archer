@@ -30,3 +30,18 @@ fn fail_on_findings_exits_one_only_when_drift_is_found() {
 fn runtime_errors_exit_two() {
     assert_eq!(archer(&["tests/fixtures/does-not-exist"]), 2);
 }
+
+#[test]
+fn findings_carry_their_evidence_in_both_outputs() {
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_archer")).args(args).output().expect("archer runs");
+        String::from_utf8(output.stdout).expect("utf-8 output")
+    };
+    let json = run(&["--json", DRIFT]);
+    for field in ["\"evidence\"", "\"check\"", "\"peers\"", "\"instead\"", "\"dismiss\"", "[[dismiss]]"] {
+        assert!(json.contains(field), "{field} missing from the JSON report");
+    }
+    let text = run(&[DRIFT]);
+    assert!(text.contains("The check:"), "{text}");
+    assert!(text.contains("If intended, add to archer.toml:"), "{text}");
+}

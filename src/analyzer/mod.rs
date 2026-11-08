@@ -5,6 +5,7 @@ mod caller_use;
 mod config;
 mod drift;
 mod evidence;
+mod explain;
 mod extractors;
 mod handlers;
 mod macros;
@@ -291,8 +292,9 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         })
         .cloned()
         .collect();
-    let (peer_groups, invariants, finding_details, _, mut unjudged) =
+    let (peer_groups, invariants, mut finding_details, _, mut unjudged) =
         build_analysis_layers_full(&judged_routes, options);
+    explain::explain(&mut finding_details);
     unjudged.extend(declared_public);
     let mut dismissed = Vec::new();
     let finding_details: Vec<Finding> = finding_details
