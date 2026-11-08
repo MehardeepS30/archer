@@ -5353,3 +5353,101 @@ fn whole_app_support_raises_only_writes_and_findings_state_their_case() {
     assert_eq!(dismissed.dismissed[0].finding.suspicious_route.path, "/flush");
     assert!(dismissed.finding_details.iter().any(|finding| finding.suspicious_route.path == "/peek"));
 }
+
+#[test]
+fn a_record_loaded_inside_a_wrapper_closure_is_held_to_the_caller() {
+    let report = drift_fixture(
+        "f57",
+        include_str!("../../tests/fixtures/probes/drift/f57_wrapper_closures.rs"),
+    );
+    let findings: Vec<(&str, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.severity))
+        .collect();
+    // The body reaches the service through the wrapper's closure; the
+    // service that compares nothing is the one reported. A load scoped to
+    // the caller and a conversion of the id are neither peers nor flagged.
+    assert_eq!(findings, [("/boxes/stamp", Severity::Medium)], "{findings:?}");
+    let stamp = &report.finding_details[0];
+    assert_eq!(stamp.category, FindingCategory::SkipsPeerCheck);
+    assert_eq!(stamp.authorized_peer_routes.len(), 3);
+    assert!(stamp.rationale.contains("compares `found.keeper` with the caller"), "{}", stamp.rationale);
+}
+
+#[test]
+fn a_path_parameter_its_peers_hold_to_the_caller_is_reported() {
+    let report = drift_fixture(
+        "f58",
+        include_str!("../../tests/fixtures/probes/drift/f58_path_bindings.rs"),
+    );
+    let finding = |method: &str, path: &str| {
+        report
+            .finding_details
+            .iter()
+            .find(|finding| finding.suspicious_route.method == method && finding.suspicious_route.path == path)
+    };
+    // Under the owner route that binds `{who}`: Low, and the text says so.
+    for path in ["/people/{who}/notes", "/people/{who}/badges"] {
+        let found = finding("GET", path).unwrap_or_else(|| panic!("{path} not reported"));
+        assert_eq!((found.category, found.severity), (FindingCategory::SkipsPeerCheck, Severity::Low));
+        assert!(found.rationale.contains("the route that names `{who}` holds it to the caller"), "{}", found.rationale);
+    }
+    // The same parameter from the body, against the routes that bind it.
+    let moved = finding("POST", "/shelves/move").expect("move reported");
+    assert_eq!(moved.severity, Severity::Low);
+    assert!(moved.rationale.contains("Reads `shelf` from the request body"), "{}", moved.rationale);
+    // The one method on the template that skips is reported.
+    assert!(finding("DELETE", "/shelves/{shelf}").is_some());
+    // Nobody binds `{poster}`; `purge` checks a role the binders lack.
+    assert!(finding("GET", "/people/{who}").is_none());
+    assert!(finding("POST", "/shelves/{shelf}/purge").is_none());
+    assert!(!report.finding_details.iter().any(|finding| finding.suspicious_route.path.starts_with("/posters")));
+}
+
+#[test]
+fn a_secret_the_scheme_peers_compare_is_reported_where_skipped() {
+    let report = drift_fixture(
+        "f59",
+        include_str!("../../tests/fixtures/probes/drift/f59_scheme_guards.rs"),
+    );
+    let findings: Vec<(&str, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.severity))
+        .collect();
+    // Different records, one scheme: three compare a presented secret, so
+    // the fourth is reported, at Low with three peers. Session routes that
+    // compare nothing are not.
+    assert_eq!(findings, [("/coupons/{code}/apply", Severity::Low)], "{findings:?}");
+    let coupon = &report.finding_details[0];
+    assert!(coupon.rationale.contains("Admits `LinkAuth`"), "{}", coupon.rationale);
+    assert!(coupon.rationale.contains("a secret the request presents"), "{}", coupon.rationale);
+}
+
+#[test]
+fn routes_under_an_unresolved_scope_prefix_still_group() {
+    let report = drift_fixture(
+        "f60",
+        include_str!("../../tests/fixtures/probes/drift/f60_symbolic_scope.rs"),
+    );
+    let findings: Vec<(&str, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.severity))
+        .collect();
+    assert_eq!(
+        findings,
+        [("/api/<scope:cfg.shop_prefix>/items/{id}/restock", Severity::High)],
+        "{findings:?}"
+    );
+    assert!(report.unjudged.is_empty(), "{:?}", report.unjudged);
+}
+
+#[test]
+fn a_symbolic_scope_is_static_and_a_leading_one_stays_a_mount_prefix() {
+    assert!(!super::drift::is_dynamic_segment("<scope:cfg.prefix>"));
+    assert!(super::drift::is_dynamic_segment("<unresolved:cfg.prefix>"));
+    assert_eq!(super::routes::settle_symbolic_scope("/<scope:cfg.base>/a"), "/<unresolved:cfg.base>/a");
+    assert_eq!(super::routes::settle_symbolic_scope("/api/<scope:x>/a"), "/api/<scope:x>/a");
+}

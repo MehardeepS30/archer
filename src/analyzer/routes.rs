@@ -1776,7 +1776,7 @@ impl RouteVisitor<'_> {
                     break match call.args.first() {
                         Some(arg) => self
                             .path_argument(arg)
-                            .map(|(path, _)| path)
+                            .map(|(path, _)| symbolic_scope(path))
                             .unwrap_or_default(),
                         None => String::new(),
                     };
@@ -1849,6 +1849,30 @@ impl RouteVisitor<'_> {
             }
             _ => None,
         }
+    }
+}
+
+/// The mark of a scope prefix Archer could not resolve, kept by the source
+/// text of its expression (`web::scope(&cfg.prefix)`) so the routes under
+/// it still form a group.
+pub(crate) const SYMBOLIC_SCOPE: &str = "<scope:";
+
+/// An unresolved `web::scope(..)` prefix as a symbolic segment, unless
+/// ARCHER_P10_R4=0.
+fn symbolic_scope(path: String) -> String {
+    match path.strip_prefix("<unresolved:") {
+        Some(text) if super::caller_use::rule_on("R4") => format!("{SYMBOLIC_SCOPE}{text}"),
+        _ => path,
+    }
+}
+
+/// A symbolic scope that leads the whole path is the application's runtime
+/// mount prefix, which every route shares: it reads as unresolved, as
+/// before.
+pub(crate) fn settle_symbolic_scope(path: &str) -> String {
+    match path.strip_prefix("/").and_then(|rest| rest.strip_prefix(SYMBOLIC_SCOPE)) {
+        Some(rest) => format!("/<unresolved:{rest}"),
+        None => path.to_owned(),
     }
 }
 

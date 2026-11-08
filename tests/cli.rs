@@ -45,3 +45,44 @@ fn findings_carry_their_evidence_in_both_outputs() {
     assert!(text.contains("The check:"), "{text}");
     assert!(text.contains("If intended, add to archer.toml:"), "{text}");
 }
+
+/// Findings of a fixture, `severity method path`, with the given P10 rule
+/// switches set.
+fn findings_with(fixture: &str, switches: &[(&str, &str)]) -> Vec<String> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_archer"));
+    command.args(["--json", fixture]);
+    for (name, value) in switches {
+        command.env(name, value);
+    }
+    let output = command.output().expect("archer runs");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    report["finding_details"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|finding| {
+            format!(
+                "{} {} {}",
+                finding["severity"].as_str().unwrap_or_default(),
+                finding["suspicious_route"]["method"].as_str().unwrap_or_default(),
+                finding["suspicious_route"]["path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn each_missed_drift_rule_has_a_switch() {
+    let cases = [
+        ("tests/fixtures/probes/drift/f57_wrapper_closures.rs", "ARCHER_P10_R1", "POST /boxes/stamp"),
+        ("tests/fixtures/probes/drift/f58_path_bindings.rs", "ARCHER_P10_R2", "GET /people/{who}/notes"),
+        ("tests/fixtures/probes/drift/f59_scheme_guards.rs", "ARCHER_P10_R3", "POST /coupons/{code}/apply"),
+        ("tests/fixtures/probes/drift/f60_symbolic_scope.rs", "ARCHER_P10_R4", "/items/{id}/restock"),
+    ];
+    for (fixture, switch, route) in cases {
+        let on = findings_with(fixture, &[]);
+        let off = findings_with(fixture, &[(switch, "0")]);
+        assert!(on.iter().any(|finding| finding.contains(route)), "{switch} on: {on:?}");
+        assert!(!off.iter().any(|finding| finding.contains(route)), "{switch} off: {off:?}");
+    }
+}

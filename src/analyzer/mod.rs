@@ -239,6 +239,8 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
     for route in &mut routes {
+        route.path = routes::settle_symbolic_scope(&route.path);
+        route.scope_prefix = routes::settle_symbolic_scope(&route.scope_prefix);
         middleware::settle_path_rules(route);
     }
 

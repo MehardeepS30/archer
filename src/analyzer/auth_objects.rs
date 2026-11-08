@@ -710,10 +710,20 @@ pub(crate) fn unscoped_objects(
                 .collect()
         })
         .collect();
+    // A parameter-binding finding (`peer_checks::unbound_parameter`) gives
+    // way to this one, which names the object passed instead.
+    let binding = |finding: &Finding| {
+        finding
+            .invariant
+            .dominant_requirement
+            .as_deref()
+            .is_some_and(|requirement| requirement.starts_with(super::caller_use::BINDS))
+    };
     let reported: std::collections::HashSet<_> = finding_details
         .iter()
         .filter(|finding| {
             !(finding.category == FindingCategory::UnverifiedProtection && finding.severity == Severity::Low)
+                && !binding(finding)
         })
         .map(|finding| {
             (
@@ -817,6 +827,11 @@ pub(crate) fn unscoped_objects(
                 format!(" (e.g. {} {} passes `{object}`)", peer.method, peer.path)
             })
             .unwrap_or_default();
+        finding_details.retain(|finding| {
+            !(binding(finding)
+                && finding.suspicious_route.method == route.method
+                && finding.suspicious_route.path == route.path)
+        });
         finding_details.push(Finding {
             peer_group_id: id,
             category: FindingCategory::DifferentAuthorization,

@@ -30,7 +30,13 @@
 //!   passing `arg` (not `None`) as argument `i`
 //!   (`authorize_session(&req, Some(&origin), Some(Maintainer))`);
 //! - `compares:T`: it compares a value derived from the parameter with a
-//!   value that is not (a record's owner field, an id from the path).
+//!   value that is not (a record's owner field, an id from the path);
+//! - `binds:K:p`: it holds request value `p` to the caller, where `K` is
+//!   `path` (a `Path` extractor's parameter) or `body` (a `Json`, `Query`
+//!   or `Form` field): a comparison of the two, a check given both, or a
+//!   load scoped by both. `p` is the name the request gives the value, so
+//!   it can be matched with the route template's parameter;
+//! - `mentions:body:p`: it reads field `p` of the body, query or form.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::{
@@ -113,6 +119,7 @@ pub(crate) fn caller_use<'f>(
         previous: HashMap::new(),
         in_progress: HashSet::new(),
         cycle: false,
+        shapes_of: HashMap::new(),
     };
     let roots: Vec<usize> = {
         let mut seen = HashSet::new();
@@ -197,6 +204,8 @@ struct Walker<'i, 'a> {
     previous: HashMap<SummaryKey, Summary>,
     in_progress: HashSet<SummaryKey>,
     cycle: bool,
+    /// How each function that takes a closure hands it its parameters.
+    shapes_of: HashMap<usize, Option<WrapperShape>>,
 }
 
 impl Walker<'_, '_> {
@@ -205,9 +214,127 @@ impl Walker<'_, '_> {
         if let Some(found) = self.analyzed.get(&key) {
             return found.clone();
         }
-        let analysis = analyze_function(&self.index.items[definition], bound, &self.sources);
+        let mut analysis =
+            analyze_function(&self.index.items[definition], bound, &self.sources, &HashMap::new());
+        // Closures handed to a wrapper that passes them the request data:
+        // bind those inputs and read the function again.
+        let mut inputs: HashMap<ClosureKey, Vec<(usize, Option<Origin>)>> = HashMap::new();
+        for call in analysis.wrapper_calls.clone() {
+            let Some(wrapper) = self.index.resolve_callee(definition, &call.target) else {
+                continue;
+            };
+            let Some(shape) = self.wrapper_shape(wrapper, 0) else {
+                continue;
+            };
+            let Some((_, closure)) = call.closures.iter().find(|(position, _)| *position == shape.closure) else {
+                continue;
+            };
+            for (argument, input) in &shape.passes {
+                if let Some((_, origin)) = call.requested.iter().find(|(position, _)| position == argument) {
+                    inputs.entry(*closure).or_default().push((*input, origin.clone()));
+                }
+            }
+        }
+        if !inputs.is_empty() {
+            analysis = analyze_function(&self.index.items[definition], bound, &self.sources, &inputs);
+        }
         self.analyzed.insert(key, analysis.clone());
         analysis
+    }
+
+    /// How a function that takes a closure parameter (`func: F` with
+    /// `F: Fn(..)`, or `impl Fn(..)`) calls it: which of its parameters
+    /// reach which closure input, directly or through functions it hands
+    /// the closure on to, up to three deep.
+    fn wrapper_shape(&mut self, definition: usize, depth: usize) -> Option<WrapperShape> {
+        if let Some(found) = self.shapes_of.get(&definition) {
+            return found.clone();
+        }
+        if depth > 3 {
+            return None;
+        }
+        self.shapes_of.insert(definition, None);
+        let item = self.index.items[definition].clone();
+        let callable = callable_generics(&item.sig);
+        let names: Vec<Option<String>> = item
+            .sig
+            .inputs
+            .iter()
+            .map(|input| match input {
+                FnArg::Typed(typed) => match &*typed.pat {
+                    Pat::Ident(ident) => Some(ident.ident.to_string()),
+                    _ => None,
+                },
+                FnArg::Receiver(_) => None,
+            })
+            .collect();
+        let closure = item.sig.inputs.iter().position(|input| {
+            matches!(input, FnArg::Typed(typed) if is_callable(&typed.ty, &callable))
+        })?;
+        let function = names[closure].clone()?;
+        struct Calls<'n> {
+            function: &'n str,
+            direct: Vec<Vec<Expr>>,
+            handed: Vec<(HandlerTarget, usize, Vec<Expr>)>,
+        }
+        impl<'ast> Visit<'ast> for Calls<'_> {
+            fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+                let arguments: Vec<Expr> = node.args.iter().cloned().collect();
+                if matches!(&*node.func, Expr::Path(path) if path.path.is_ident(self.function)) {
+                    self.direct.push(arguments);
+                } else if let Some(position) = node.args.iter().position(|argument| {
+                    matches!(strip_transparent(argument), Expr::Path(path) if path.path.is_ident(self.function))
+                }) && let Some(target) = handler_target(&node.func)
+                {
+                    self.handed.push((target, position, arguments));
+                }
+                visit::visit_expr_call(self, node);
+            }
+        }
+        let mut calls = Calls {
+            function: &function,
+            direct: Vec::new(),
+            handed: Vec::new(),
+        };
+        calls.visit_block(&item.block);
+        let reaches = |argument: &Expr| -> Vec<usize> {
+            names
+                .iter()
+                .enumerate()
+                .filter(|(position, name)| {
+                    *position != closure
+                        && name.as_ref().is_some_and(|name| mentions_any(argument, |found| found == name))
+                })
+                .map(|(position, _)| position)
+                .collect()
+        };
+        let mut passes: Vec<(usize, usize)> = Vec::new();
+        for arguments in &calls.direct {
+            for (input, argument) in arguments.iter().enumerate() {
+                passes.extend(reaches(argument).into_iter().map(|own| (own, input)));
+            }
+        }
+        for (target, position, arguments) in &calls.handed {
+            let Some(inner) = self.index.resolve_callee(definition, target) else {
+                continue;
+            };
+            let Some(shape) = self.wrapper_shape(inner, depth + 1) else {
+                continue;
+            };
+            if shape.closure != *position {
+                continue;
+            }
+            for (theirs, input) in &shape.passes {
+                if let Some(argument) = arguments.get(*theirs) {
+                    passes.extend(reaches(argument).into_iter().map(|own| (own, *input)));
+                }
+            }
+        }
+        passes.sort();
+        passes.dedup();
+        let shape = (!passes.is_empty()).then_some(WrapperShape { closure, passes });
+        self.shapes_of.insert(definition, shape.clone());
+        shape
     }
 
     /// Whether a deciding call is a check, and whether it makes the calling
@@ -268,6 +395,13 @@ impl Walker<'_, '_> {
                         .features
                         .insert(format!("{GUARDS}{key}:checks it with `{}`", candidate.name));
                 }
+                // A check given the caller and a request value holds the
+                // value to the caller.
+                if resolved || candidate.condition {
+                    for tag in candidate.requested.iter().filter(|tag| tag.starts_with("path:")) {
+                        summary.features.insert(format!("{BINDS}{tag}"));
+                    }
+                }
                 // A check Archer followed, or library code, makes this
                 // function a check; a guess from a name defined in the scan
                 // does not.
@@ -320,6 +454,15 @@ impl Walker<'_, '_> {
                     .entry(feature.clone())
                     .or_insert_with(|| format!("{name} -> {site}"));
             }
+            // A record handed to a helper together with the caller is
+            // checked by that helper, whatever it does inside: a policy
+            // some routes follow, as when the handler calls a check
+            // function with both (see `peer_checks::unguarded_record`).
+            let handed: HashSet<&str> = bound
+                .iter()
+                .filter_map(|(_, label)| label.strip_prefix(RECORD_LABEL))
+                .collect();
+            let caller_too = bound.iter().any(|(_, label)| !label.starts_with('\u{1}'));
             // A helper's parameters are values handed to it, not
             // extractors: only what it reads, checks, and compares is the
             // handler's doing.
@@ -332,7 +475,16 @@ impl Walker<'_, '_> {
                             && !feature.starts_with("scheme:")
                             && !feature.starts_with("auths:")
                     })
-                    .cloned(),
+                    .map(|feature| {
+                        match feature.strip_prefix(GUARDS).and_then(super::peer_checks::split_guard) {
+                            Some((key, how))
+                                if handed.contains(key) && caller_too && how != "loaded with the caller" =>
+                            {
+                                format!("{GUARDS}{key}:checks it with `{name}`")
+                            }
+                            _ => feature.clone(),
+                        }
+                    }),
             );
         }
         self.in_progress.remove(&key);
@@ -360,6 +512,9 @@ struct CheckCandidate {
     /// Made in a branch condition (`if !may_edit(&note, &user) { .. }`),
     /// not as a statement under `?`.
     condition: bool,
+    /// Named request values the call also receives, as `K:p`: a check of
+    /// the caller against them binds them (`ensure_self(&user, &id)?`).
+    requested: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -370,6 +525,56 @@ struct Analysis {
     /// such argument's position and identity label.
     flows: Vec<(HandlerTarget, Vec<(usize, String)>)>,
     rejects: bool,
+    /// Calls that pass request data and a closure (see `WrapperShape`).
+    wrapper_calls: Vec<WrapperCall>,
+}
+
+/// A call such as `wrap(flow, &req, payload, |state, auth, req| ..)`,
+/// whose closure the called function may hand the request data to.
+#[derive(Clone)]
+struct WrapperCall {
+    target: HandlerTarget,
+    /// Closure arguments, by position, with where each closure starts.
+    closures: Vec<(usize, ClosureKey)>,
+    /// Arguments that are request data, by position, with their origin.
+    requested: Vec<(usize, Option<Origin>)>,
+}
+
+/// Where a closure starts in the source: stable across visits of the same
+/// syntax tree.
+type ClosureKey = (usize, usize);
+
+/// Where request data comes from (`path` or `body`) and the name the
+/// request gives it; empty for a whole extractor, whose fields have names.
+type Origin = (&'static str, String);
+
+/// How a function that takes a closure calls it: which of its own
+/// parameters reach which closure parameter, directly
+/// (`func(state, auth, payload)`) or through another such function it
+/// hands the closure to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WrapperShape {
+    closure: usize,
+    passes: Vec<(usize, usize)>,
+}
+
+/// Whether a rule of the missed-drift round is on: `ARCHER_P10_<name>=0`
+/// turns it off, for measuring what each one adds.
+pub(crate) fn rule_on(name: &str) -> bool {
+    std::env::var(format!("ARCHER_P10_{name}")).map_or(true, |value| value != "0")
+}
+
+/// A callee parameter bound to request data, as `\u{1}request:K:p`, or to
+/// a loaded record, as `\u{1}record:key`, beside the caller's identity
+/// positions.
+const REQUEST_LABEL: &str = "\u{1}request:";
+const RECORD_LABEL: &str = "\u{1}record:";
+
+fn request_label(origin: &Option<Origin>) -> String {
+    match origin {
+        Some((kind, name)) => format!("{REQUEST_LABEL}{kind}:{name}"),
+        None => format!("{REQUEST_LABEL}body:"),
+    }
 }
 
 /// One function's features, with `bound` naming parameters (by position)
@@ -378,22 +583,39 @@ fn analyze_function(
     item: &ItemFn,
     bound: &[(usize, String)],
     sources: &std::rc::Rc<HashSet<String>>,
+    closure_inputs: &HashMap<ClosureKey, Vec<(usize, Option<Origin>)>>,
 ) -> Analysis {
     let mut visitor = CallerUseVisitor {
         sources: sources.clone(),
+        closure_inputs: closure_inputs.clone(),
         ..CallerUseVisitor::default()
     };
     for (position, input) in item.sig.inputs.iter().enumerate() {
         let typed = match input {
             FnArg::Typed(typed) => typed,
             FnArg::Receiver(_) => {
-                if let Some((_, label)) = bound.iter().find(|(index, _)| *index == position) {
+                if let Some((_, label)) = bound
+                    .iter()
+                    .find(|(index, label)| *index == position && !label.starts_with('\u{1}'))
+                {
                     visitor.bindings.insert("self".to_owned(), label.clone());
                 }
                 continue;
             }
         };
         match bound.iter().find(|(index, _)| *index == position) {
+            Some((_, label)) if label.starts_with(REQUEST_LABEL) => {
+                let (kind, name) = label[REQUEST_LABEL.len()..].split_once(':').unwrap_or(("body", ""));
+                let kind = if kind == "path" { "path" } else { "body" };
+                visitor.bind_request(&typed.pat, Some((kind, name.to_string())));
+            }
+            Some((_, label)) if label.starts_with(RECORD_LABEL) => {
+                let mut names = HashSet::new();
+                super::routes::pattern_bindings(&typed.pat, &mut names);
+                for name in names.into_iter().filter(|name| !name.starts_with('_')) {
+                    visitor.records.insert(name, label[RECORD_LABEL.len()..].to_string());
+                }
+            }
             Some((_, label)) => {
                 visitor.bind_names(&typed.pat, label);
             }
@@ -425,6 +647,7 @@ fn analyze_function(
         checks: visitor.checks,
         flows: visitor.flows,
         rejects: visitor.rejects,
+        wrapper_calls: visitor.wrapper_calls,
     }
 }
 
@@ -451,14 +674,17 @@ struct CallerUseVisitor {
     used_records: HashSet<String>,
     /// Visiting a branch condition.
     in_condition: bool,
+    /// Where each request-data name comes from (see `Origin`).
+    origins: HashMap<String, Origin>,
+    /// Closure inputs to bind as request data: what a wrapper hands them.
+    closure_inputs: HashMap<ClosureKey, Vec<(usize, Option<Origin>)>>,
+    wrapper_calls: Vec<WrapperCall>,
 }
 
 impl CallerUseVisitor {
     fn bind_parameter(&mut self, pattern: &Pat, ty: &Type) {
-        if request_data_type(ty) {
-            let mut names = HashSet::new();
-            super::routes::pattern_bindings(pattern, &mut names);
-            self.requested.extend(names);
+        if let Some(kind) = request_kind(ty) {
+            self.bind_request(pattern, Some((kind, String::new())));
         }
         if !identity_type(ty) {
             return;
@@ -467,6 +693,100 @@ impl CallerUseVisitor {
         if self.bind_names(pattern, &label) {
             self.features.insert(format!("takes:{label}"));
         }
+    }
+
+    /// Binds a pattern's names to request data. A plain name holds the
+    /// whole value, and keeps the origin's name (empty for an extractor);
+    /// a destructuring pattern names each part (`Path((team, id))`).
+    fn bind_request(&mut self, pattern: &Pat, origin: Option<Origin>) {
+        let mut names = HashSet::new();
+        super::routes::pattern_bindings(pattern, &mut names);
+        let whole = matches!(pattern, Pat::Ident(_)) || matches!(pattern, Pat::Type(typed) if matches!(&*typed.pat, Pat::Ident(_)));
+        for name in names {
+            if name.starts_with('_') {
+                continue;
+            }
+            if let Some((kind, given)) = &origin {
+                let given = if whole { given.clone() } else { name.clone() };
+                self.origins.insert(name.clone(), (kind, given));
+            }
+            self.requested.insert(name);
+        }
+    }
+
+    /// A path value handed to a call that may act on it (`find(&pool, id)`),
+    /// not one that only builds a value (`Page::new(.., id)`): the route
+    /// uses its path (`mentions:path:p`, `p` empty for a whole value).
+    fn path_passed<'e>(&mut self, callee: &str, arguments: impl Iterator<Item = &'e Expr>) {
+        if NOT_LOADERS.contains(&callee) {
+            return;
+        }
+        for argument in arguments {
+            for (kind, name) in self.request_names(argument) {
+                if kind == "path" {
+                    self.features.insert(format!("{MENTIONS}path:{name}"));
+                }
+            }
+        }
+    }
+
+    /// The origin of a request value an expression reads: `connector_id`,
+    /// `path.into_inner()`, `data.note_id` (the field names it).
+    fn origin_of(&self, expr: &Expr) -> Option<Origin> {
+        origin_in(&self.origins, expr)
+    }
+
+    /// The named request values an expression reads, outside closures.
+    fn request_names(&self, expr: &Expr) -> Vec<Origin> {
+        struct Names<'o> {
+            origins: &'o HashMap<String, Origin>,
+            found: Vec<Origin>,
+        }
+        impl<'ast> Visit<'ast> for Names<'_> {
+            fn visit_expr(&mut self, node: &'ast Expr) {
+                // A whole path value has no name of its own: it is the
+                // template's one parameter, if it has one.
+                if matches!(node, Expr::Path(_) | Expr::Field(_) | Expr::MethodCall(_))
+                    && let Some(origin) = origin_in(self.origins, node)
+                    && (!origin.1.is_empty() || origin.0 == "path")
+                {
+                    self.found.push(origin);
+                    return;
+                }
+                visit::visit_expr(self, node);
+            }
+            fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+        }
+        let mut names = Names {
+            origins: &self.origins,
+            found: Vec::new(),
+        };
+        names.visit_expr(expr);
+        names.found.sort();
+        names.found.dedup();
+        names.found
+    }
+
+    /// Call arguments that are not the caller, as callee bindings: a loaded
+    /// record (`\u{1}record:key`) or request data (`\u{1}request:K:p`).
+    fn data_bound<'e>(&self, arguments: impl Iterator<Item = &'e Expr>, bound: &[(usize, String)]) -> Vec<(usize, String)> {
+        if !rule_on("R1") {
+            return Vec::new();
+        }
+        arguments
+            .enumerate()
+            .filter(|(position, _)| bound.iter().all(|(taken, _)| taken != position))
+            .filter_map(|(position, argument)| {
+                if let Some(key) = self.record_of(argument) {
+                    return Some((position, format!("{RECORD_LABEL}{key}")));
+                }
+                let whole = strip_transparent(argument);
+                if matches!(whole, Expr::Path(_) | Expr::Field(_)) && self.mentions_requested(whole) {
+                    return Some((position, request_label(&self.origin_of(whole))));
+                }
+                None
+            })
+            .collect()
     }
 
     /// `Ok(session)` or `Some(user)` matched against an identity value binds
@@ -646,6 +966,11 @@ impl CallerUseVisitor {
             .filter_map(|argument| self.record_of(argument))
             .collect();
         self.used_records.extend(records.iter().cloned());
+        let requested: Vec<String> = arguments
+            .iter()
+            .flat_map(|argument| self.request_names(argument))
+            .map(|(kind, name)| format!("{kind}:{name}"))
+            .collect();
         let mut labels: Vec<&String> = bound.iter().map(|(_, label)| label).collect();
         labels.dedup();
         for label in labels {
@@ -656,6 +981,7 @@ impl CallerUseVisitor {
                 feature: format!("checks:{label}:{callee}"),
                 line,
                 records: records.clone(),
+                requested: requested.clone(),
                 condition: self.in_condition,
             });
         }
@@ -876,6 +1202,14 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
+        // Inputs a wrapper hands request data to.
+        if let Some(inputs) = self.closure_inputs.get(&closure_key(node)).cloned() {
+            for (position, origin) in inputs {
+                if let Some(input) = node.inputs.iter().nth(position) {
+                    self.bind_request(input, origin.or(Some(("body", String::new()))));
+                }
+            }
+        }
         for input in &node.inputs {
             match input {
                 Pat::Type(typed) => self.bind_parameter(&typed.pat, &typed.ty),
@@ -915,13 +1249,20 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             if let Some((key, scoped)) = self.loader(&init.expr) {
                 if scoped {
                     self.features.insert(format!("{GUARDS}{key}:loaded with the caller"));
+                    for (kind, name) in self.request_names(&init.expr).into_iter().filter(|(kind, _)| *kind == "path") {
+                        self.features.insert(format!("{BINDS}{kind}:{name}"));
+                    }
                 }
                 for name in names {
                     self.records.insert(name, key.clone());
                 }
             } else if self.mentions_requested(&init.expr) {
                 // `let id = path.into_inner();`, `let note_id = data.note_id;`
-                self.requested.extend(names);
+                let origin = self.origin_of(&init.expr);
+                match origin {
+                    Some(origin) => self.bind_request(&node.pat, Some(origin)),
+                    None => self.requested.extend(names),
+                }
             }
         }
         // `let profile_id = auth.profile.map(..)` carries the identity on.
@@ -981,10 +1322,20 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         if let Some((label, field)) = self.first_field(&Expr::Field(node.clone())) {
             self.features.insert(format!("reads:{label}:{field}"));
         }
+        if let Some(("body", name)) = self.origin_of(&Expr::Field(node.clone())).as_ref().map(|(kind, name)| (*kind, name.as_str()))
+            && !name.is_empty()
+        {
+            self.features.insert(format!("{MENTIONS}body:{name}"));
+        }
         visit::visit_expr_field(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Expr::Path(path) = &*node.func
+            && let Some(last) = path.path.segments.last()
+        {
+            self.path_passed(&last.ident.to_string(), node.args.iter());
+        }
         // `constant_time_eq(invite.stored.as_bytes(), given.as_bytes())`
         if let Expr::Path(path) = &*node.func
             && path.path.segments.last().is_some_and(|segment| {
@@ -1043,10 +1394,45 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                 self.derived(argument).map(|label| (position, label))
             })
             .collect();
+        let mut bound = bound;
+        let data = self.data_bound(node.args.iter(), &bound);
+        bound.extend(data);
         if !bound.is_empty()
             && let Some(target) = handler_target(&node.func)
         {
             self.flows.push((target, bound));
+        }
+        // `wrap(.., payload, |state, auth, req| ..)`: the wrapper may hand
+        // the payload to the closure; the walker reads how.
+        if rule_on("R1")
+            && let Some(target) = handler_target(&node.func)
+        {
+            let closures: Vec<(usize, ClosureKey)> = node
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(position, argument)| match argument {
+                    Expr::Closure(closure) => Some((position, closure_key(closure))),
+                    _ => None,
+                })
+                .collect();
+            let requested: Vec<(usize, Option<Origin>)> = node
+                .args
+                .iter()
+                .enumerate()
+                .filter(|(_, argument)| {
+                    let whole = strip_transparent(argument);
+                    matches!(whole, Expr::Path(_) | Expr::Field(_)) && self.mentions_requested(whole)
+                })
+                .map(|(position, argument)| (position, self.origin_of(strip_transparent(argument))))
+                .collect();
+            if !closures.is_empty() && !requested.is_empty() {
+                self.wrapper_calls.push(WrapperCall {
+                    target,
+                    closures,
+                    requested,
+                });
+            }
         }
         visit::visit_expr_call(self, node);
     }
@@ -1076,6 +1462,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.path_passed(&node.method.to_string(), node.args.iter());
         // `note.readers.contains(&user.id)`: the caller in a loaded record.
         if self.derived(&node.receiver).is_none()
             && node.args.iter().any(|argument| self.derived(argument).is_some())
@@ -1086,13 +1473,21 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         }
         // `principal.validate()` hands the caller to the method as `self`.
         if let Some(receiver) = receiver_path(&node.receiver) {
-            let bound: Vec<(usize, String)> = std::iter::once(&*node.receiver)
+            let mut bound: Vec<(usize, String)> = std::iter::once(&*node.receiver)
                 .chain(node.args.iter())
                 .enumerate()
                 .filter_map(|(position, argument)| {
                     self.derived(argument).map(|label| (position, label))
                 })
                 .collect();
+            // Request data and records as arguments; a receiver that is
+            // request data is converted, not handed over.
+            let data: Vec<(usize, String)> = self
+                .data_bound(std::iter::once(&*node.receiver).chain(node.args.iter()), &bound)
+                .into_iter()
+                .filter(|(position, _)| *position > 0)
+                .collect();
+            bound.extend(data);
             if !bound.is_empty() {
                 self.flows.push((
                     HandlerTarget::Method {
@@ -1119,6 +1514,17 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                     self.features.insert(format!("compares:{label}"));
                 }
                 _ => {}
+            }
+            // `auth.user_id != principal`: a request value held to the caller.
+            let request_side = match (&left, &right) {
+                (Some(_), None) => Some(&*node.right),
+                (None, Some(_)) => Some(&*node.left),
+                _ => None,
+            };
+            if let Some(side) = request_side {
+                for (kind, name) in self.request_names(side) {
+                    self.features.insert(format!("{BINDS}{kind}:{name}"));
+                }
             }
             // `note.recipient_id != user.person.id`: a loaded record held to
             // the caller, whatever its field is called.
@@ -1152,6 +1558,12 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         self.scheme(&node.path);
+        if let Some(ident) = node.path.get_ident()
+            && let Some(("body", name)) = self.origins.get(&ident.to_string()).map(|(kind, name)| (*kind, name.as_str()))
+            && !name.is_empty()
+        {
+            self.features.insert(format!("{MENTIONS}body:{name}"));
+        }
         visit::visit_expr_path(self, node);
     }
 
@@ -1362,6 +1774,101 @@ fn returns_bool(output: &syn::ReturnType) -> bool {
     matches!(output, syn::ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(path) if path.path.is_ident("bool")))
 }
 
+/// Type parameters bounded by a closure trait (`F: Fn(..) -> R`), in the
+/// generics or a `where` clause.
+fn callable_generics(signature: &syn::Signature) -> HashSet<String> {
+    let callable_bound = |bound: &syn::TypeParamBound| {
+        matches!(bound, syn::TypeParamBound::Trait(found) if found.path.segments.last().is_some_and(|segment| {
+            segment.ident == "Fn" || segment.ident == "FnMut" || segment.ident == "FnOnce"
+        }))
+    };
+    let mut names = HashSet::new();
+    for parameter in &signature.generics.params {
+        if let syn::GenericParam::Type(ty) = parameter
+            && ty.bounds.iter().any(callable_bound)
+        {
+            names.insert(ty.ident.to_string());
+        }
+    }
+    if let Some(clause) = &signature.generics.where_clause {
+        for predicate in &clause.predicates {
+            if let syn::WherePredicate::Type(found) = predicate
+                && found.bounds.iter().any(callable_bound)
+                && let Type::Path(path) = &found.bounded_ty
+                && let Some(ident) = path.path.get_ident()
+            {
+                names.insert(ident.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// A parameter type that is a closure: a callable type parameter, or
+/// `impl Fn(..)`.
+fn is_callable(ty: &Type, callable: &HashSet<String>) -> bool {
+    match ty {
+        Type::Path(path) => path.path.get_ident().is_some_and(|ident| callable.contains(&ident.to_string())),
+        Type::ImplTrait(bounds) => bounds.bounds.iter().any(|bound| {
+            matches!(bound, syn::TypeParamBound::Trait(found) if found.path.segments.last().is_some_and(|segment| {
+                segment.ident == "Fn" || segment.ident == "FnMut" || segment.ident == "FnOnce"
+            }))
+        }),
+        Type::Reference(reference) => is_callable(&reference.elem, callable),
+        _ => false,
+    }
+}
+
+/// Feature prefix: the route holds a named request value to the caller,
+/// as `binds:K:p` (see the module documentation).
+pub(crate) const BINDS: &str = "binds:";
+/// Feature prefix: the route reads a named field of its body or query.
+pub(crate) const MENTIONS: &str = "mentions:";
+
+/// Where a closure starts, as its key across visits.
+fn closure_key(closure: &ExprClosure) -> ClosureKey {
+    let start = syn::spanned::Spanned::span(closure).start();
+    (start.line, start.column)
+}
+
+/// An expression without references, parentheses and converting calls.
+fn strip_transparent(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Reference(inner) => strip_transparent(&inner.expr),
+        Expr::Paren(inner) => strip_transparent(&inner.expr),
+        Expr::Group(inner) => strip_transparent(&inner.expr),
+        Expr::MethodCall(call)
+            if call.args.is_empty()
+                && (TRANSPARENT_CALLS.contains(&call.method.to_string().as_str())
+                    || call.method == "as_str"
+                    || call.method == "as_bytes") =>
+        {
+            strip_transparent(&call.receiver)
+        }
+        _ => expr,
+    }
+}
+
+fn origin_in(origins: &HashMap<String, Origin>, expr: &Expr) -> Option<Origin> {
+    match strip_transparent(expr) {
+        Expr::Path(path) if path.qself.is_none() => origins.get(&path.path.get_ident()?.to_string()).cloned(),
+        Expr::Field(field) => {
+            let (kind, given) = origin_in(origins, &field.base)?;
+            match &field.member {
+                syn::Member::Named(name) => Some((kind, name.to_string())),
+                syn::Member::Unnamed(_) => Some((kind, given)),
+            }
+        }
+        Expr::Unary(unary) => origin_in(origins, &unary.expr),
+        // `path.into_inner()`, `id.clone()`: the same value, unwrapped or
+        // copied.
+        Expr::MethodCall(call) if call.args.is_empty() && rule_on("R2") => origin_in(origins, &call.receiver),
+        Expr::Try(inner) => origin_in(origins, &inner.expr),
+        Expr::Await(inner) => origin_in(origins, &inner.base),
+        _ => None,
+    }
+}
+
 /// Feature prefix: the route loads a record with request data, keyed by the
 /// loading call. Not compared by `peer_checks`' consensus on caller use; see
 /// `peer_checks::unguarded_record`.
@@ -1378,17 +1885,19 @@ const NOT_LOADERS: [&str; 24] = [
 ];
 
 /// Extractor types that carry data the request supplies: ids and fields
-/// the client chose.
-fn request_data_type(ty: &Type) -> bool {
+/// the client chose, from the path or from the body, query or form.
+fn request_kind(ty: &Type) -> Option<&'static str> {
     match ty {
-        Type::Reference(reference) => request_data_type(&reference.elem),
-        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-            [
-                "Json", "Path", "Query", "Form", "QsQuery", "QsForm",
-            ]
-            .contains(&segment.ident.to_string().as_str())
-        }),
-        _ => false,
+        Type::Reference(reference) => request_kind(&reference.elem),
+        Type::Path(path) => {
+            let name = path.path.segments.last()?.ident.to_string();
+            match name.as_str() {
+                "Path" => Some("path"),
+                "Json" | "Query" | "Form" | "QsQuery" | "QsForm" => Some("body"),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

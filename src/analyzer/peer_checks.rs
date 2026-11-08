@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    caller_use::{GUARDS, LOADS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
+    caller_use::{BINDS, GUARDS, LOADS, MENTIONS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
     drift::{
         is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
         placement, route_identity, unique_routes,
@@ -66,6 +66,11 @@ struct Features {
     loads: BTreeSet<String>,
     /// How the route holds each loaded record to the caller.
     guards: BTreeMap<String, Vec<String>>,
+    /// Request values it holds to the caller, as `K:p` (see
+    /// `caller_use::BINDS`).
+    binds: BTreeSet<String>,
+    /// Body or query fields it reads, as `body:p`.
+    mentions: BTreeSet<String>,
 }
 
 impl Features {
@@ -87,8 +92,14 @@ fn features(route: &Route) -> Features {
     let mut sites = BTreeMap::new();
     let mut loads = BTreeSet::new();
     let mut guards: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut binds = BTreeSet::new();
+    let mut mentions = BTreeSet::new();
     for feature in &route.caller_use {
-        if let Some(key) = feature.strip_prefix(LOADS) {
+        if let Some(tag) = feature.strip_prefix(BINDS) {
+            binds.insert(tag.to_string());
+        } else if let Some(tag) = feature.strip_prefix(MENTIONS) {
+            mentions.insert(tag.to_string());
+        } else if let Some(key) = feature.strip_prefix(LOADS) {
             loads.insert(key.to_string());
         } else if let Some(rest) = feature.strip_prefix(GUARDS) {
             // The key can hold `::` (`Note::read`); the way it is guarded
@@ -128,6 +139,8 @@ fn features(route: &Route) -> Features {
         sites,
         loads,
         guards,
+        binds,
+        mentions,
     }
 }
 
@@ -152,7 +165,7 @@ fn specificity(feature: &str) -> u8 {
 const SCOPED_LOAD: &str = "loaded with the caller";
 
 /// `Note::read:compares ..` → (`Note::read`, `compares ..`).
-fn split_guard(rest: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_guard(rest: &str) -> Option<(&str, &str)> {
     let mut start = 0;
     while let Some(offset) = rest[start..].find(':') {
         let at = start + offset;
@@ -205,32 +218,50 @@ fn unguarded_record(
         if own.guards.contains_key(key) {
             continue;
         }
-        let population: Vec<usize> = (0..eligible.len())
-            .filter(|&other| {
-                other != index
-                    && classes[other] == class
-                    && featured[other].loads.contains(key)
-                    && !scoped(&featured[other], key)
-                    && route_identity(eligible[other]) != route_identity(route)
-                    && eligible[other].origin.definition != route.origin.definition
-            })
-            .collect();
-        let having: Vec<usize> = population
-            .iter()
-            .copied()
-            .filter(|&other| featured[other].guards.contains_key(key))
-            .collect();
-        let compared = having
-            .iter()
-            .filter(|&&other| direct(&featured[other], key))
-            .count();
-        let share = having.len() as f64 / population.len().max(1) as f64;
-        let enough = (population.len() >= MIN_POPULATION
-            && ((share + 1e-9 >= CONSENSUS && compared > 0) || having.len() == population.len()))
-            || (population.len() == 2 && having.len() == 2);
-        if !enough {
+        let support = |any_class: bool| {
+            let population: Vec<usize> = (0..eligible.len())
+                .filter(|&other| {
+                    other != index
+                        && (any_class || classes[other] == class)
+                        && featured[other].loads.contains(key)
+                        && !scoped(&featured[other], key)
+                        && route_identity(eligible[other]) != route_identity(route)
+                        && eligible[other].origin.definition != route.origin.definition
+                })
+                .collect::<Vec<usize>>();
+            let having: Vec<usize> = population
+                .iter()
+                .copied()
+                .filter(|&other| featured[other].guards.contains_key(key))
+                .collect();
+            let compared = having
+                .iter()
+                .filter(|&&other| direct(&featured[other], key))
+                .count();
+            let share = having.len() as f64 / population.len().max(1) as f64;
+            let enough = (population.len() >= MIN_POPULATION
+                && ((share + 1e-9 >= CONSENSUS && compared > 0) || having.len() == population.len()))
+                || (population.len() == 2 && having.len() == 2);
+            (population, having, compared, enough)
+        };
+        // Too few routes of its own method class load the record: the routes
+        // of any class that load it are a lead, at Low.
+        let (population, having, compared, enough) = support(false);
+        let (population, having, compared, across) = if !enough
+            && population.len() < MIN_POPULATION
+            && super::caller_use::rule_on("R1")
+        {
+            let (population, having, compared, enough) = support(true);
+            if !enough {
+                continue;
+            }
+            (population, having, compared, true)
+        } else if enough {
+            (population, having, compared, false)
+        } else {
             continue;
-        }
+        };
+        let peers_named = if across { "routes of any method".to_owned() } else { format!("{class} routes") };
         // A route with a role or permission check where the peers that
         // guard the record have none follows a different policy (an
         // administrator may act on any record).
@@ -246,7 +277,7 @@ fn unguarded_record(
         group_routes.extend(having.iter().map(|&other| eligible[other].into()));
         peer_groups.push(PeerGroup {
             id: id.clone(),
-            description: format!("{class} routes that load the record `{key}` with request data"),
+            description: format!("{peers_named} that load the record `{key}` with request data"),
             prefix: format!("record `{key}`"),
             level: GroupLevel::Linked,
             method_class: class,
@@ -256,7 +287,7 @@ fn unguarded_record(
         let invariant = AuthorizationInvariant {
             peer_group_id: id.clone(),
             description: format!(
-                "{class} routes that load `{key}` with request data hold it to the caller."
+                "{peers_named} that load `{key}` with request data hold it to the caller."
             ),
             total_routes: population.len() + 1,
             routes_with_authorization: having.len(),
@@ -281,19 +312,31 @@ fn unguarded_record(
                 format!("{} {} {how}", eligible[other].method, eligible[other].path)
             })
             .collect();
+        // A route that names an authentication scheme none of the guarding
+        // peers name (an operator key beside user sessions) follows another
+        // policy more often than it forgets one.
+        let other_scheme = !own.schemes.is_empty()
+            && having
+                .iter()
+                .all(|&other| featured[other].schemes.is_disjoint(&own.schemes));
         return Some(Finding {
             peer_group_id: id,
             category: FindingCategory::SkipsPeerCheck,
-            severity: if population.len() >= MIN_POPULATION && compared > 0 {
+            severity: if population.len() >= MIN_POPULATION && compared > 0 && !other_scheme && !across {
                 Severity::Medium
             } else {
                 Severity::Low
             },
             rationale: format!(
-                "Loads `{key}` with data from the request but never holds the result to the caller (or to a secret the request presents). {} of {} {class} routes that load it do: {}. Dismiss if the difference is intended.",
+                "Loads `{key}` with data from the request but never holds the result to the caller (or to a secret the request presents). {} of {} {peers_named} that load it do: {}.{} Dismiss if the difference is intended.",
                 having.len(),
                 population.len(),
-                examples.join("; ")
+                examples.join("; "),
+                if across {
+                    format!(" Fewer than {MIN_POPULATION} {class} routes load it, so routes of every method are compared and the finding is capped at Low.")
+                } else {
+                    String::new()
+                }
             ),
             invariant,
             suspicious_route: route.into(),
@@ -857,6 +900,22 @@ pub(crate) fn skipped_peer_checks(
             finding_details.push(finding);
             continue;
         }
+        // A path parameter its peers hold to the caller, then a guard kind
+        // the routes admitting its scheme make on what they load.
+        if !only_unverified {
+            if let Some(finding) =
+                unbound_parameter(route, own, index, &featured, &eligible, peer_groups, invariants)
+            {
+                finding_details.push(finding);
+                continue;
+            }
+            if let Some(finding) =
+                mechanism_guard(route, own, index, &featured, &eligible, peer_groups, invariants)
+            {
+                finding_details.push(finding);
+                continue;
+            }
+        }
         // A route whose only auth schemes admit anyone (`NoAuth`) where its
         // peers pass a credential scheme to the same wrapper.
         if let Some(finding) = open_scheme(
@@ -1245,4 +1304,532 @@ pub(crate) fn drop_superseded_unverified(finding_details: &mut Vec<Finding>) {
         .map(key)
         .collect();
     finding_details.retain(|finding| !is_unverified_only(finding) || !other.contains(&key(finding)));
+}
+
+/// A path template's segments, with each parameter written `{}` and its
+/// name alongside: `/u/{user}/c/{cal}` → (`["u", "{}", "c", "{}"]`,
+/// `[None, Some("user"), None, Some("cal")]`).
+fn template(path: &str) -> (Vec<String>, Vec<Option<String>>) {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| match segment.strip_prefix('{').and_then(|inner| inner.strip_suffix('}')) {
+            Some(inner) => ("{}".to_string(), Some(inner.split(':').next().unwrap_or(inner).to_string())),
+            None => (segment.to_string(), None),
+        })
+        .unzip()
+}
+
+/// Whether a route holds the request value `name` to the caller: it binds
+/// it in its code, or passes an authentication object scoped to it.
+fn binds(route: &Route, features: &Features, kind: &str, name: &str) -> bool {
+    features.binds.contains(&format!("{kind}:{name}"))
+        // The whole path value, on a template with that one parameter.
+        || (kind == "path"
+            && features.binds.contains("path:")
+            && matches!(template(&route.path).1.iter().flatten().collect::<Vec<_>>().as_slice(), [only] if *only == name))
+        || route
+            .authorization
+            .iter()
+            .any(|evidence| evidence.requirements.iter().any(|key| key == &format!("scope:{name}")))
+}
+
+/// The path-parameter binding check (`caller_use::BINDS`): routes that
+/// take a parameter at the same place in the same template hold it to the
+/// caller (`auth.user_id != principal`), and this route does not. Peers of
+/// any method count, since binding a principal or tenant does not depend
+/// on the method. In order:
+/// - at least 3 routes share the template prefix up to the parameter and
+///   at least 75% of them bind it: Medium;
+/// - every other route on the exact template binds it, 2 or more: Medium;
+/// - one other route on the exact template binds it: Low;
+/// - the route whose template ends at the parameter (`/x/{p}`) binds it and
+///   this route under it does not: Low, however many routes under it skip.
+///   When several methods share that template, more than half of them must
+///   bind it.
+///
+/// Low instead of Medium when the route checks a role or permission (the
+/// binding may be how callers without it get in) or names a scheme none of
+/// the binders name.
+///
+/// Not reported: a route with a role or permission check where the binding
+/// routes have none, a route that loads with the caller, and a route that
+/// never passes its path to a call, or one whose middleware names the
+/// parameter. A
+/// route that passes an authentication object gives
+/// way to `auth_objects::unscoped_objects`, which names that object.
+#[allow(clippy::too_many_arguments)]
+fn unbound_parameter(
+    route: &Route,
+    own: &Features,
+    index: usize,
+    featured: &[Features],
+    eligible: &[&Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    if !super::caller_use::rule_on("R2") {
+        return None;
+    }
+    if own.guards.values().flatten().any(|how| how == SCOPED_LOAD) {
+        return None;
+    }
+    // A handler that never hands its path parameters to a call acts on
+    // nothing they name (a page that only shows the id in a form).
+    let reads_path = own.mentions.iter().any(|mention| mention.starts_with("path:"));
+    let (shape, names) = template(&route.path);
+    let templates: Vec<(Vec<String>, Vec<Option<String>>)> = eligible.iter().map(|other| template(&other.path)).collect();
+    for (position, name) in names.iter().enumerate() {
+        let Some(name) = name else {
+            continue;
+        };
+        if binds(route, own, "path", name) || !reads_path || middleware_names(route, name) {
+            continue;
+        }
+        let prefix = &shape[..=position];
+        let population: Vec<usize> = (0..eligible.len())
+            .filter(|&other| {
+                other != index
+                    && route_identity(eligible[other]) != route_identity(route)
+                    && eligible[other].origin.definition != route.origin.definition
+                    && templates[other].0.len() > position
+                    && templates[other].0[..=position] == *prefix
+            })
+            .collect();
+        let binding = |other: usize| {
+            templates[other].1[position]
+                .as_ref()
+                .is_some_and(|theirs| binds(eligible[other], &featured[other], "path", theirs))
+        };
+        let having: Vec<usize> = population.iter().copied().filter(|&other| binding(other)).collect();
+        if having.is_empty() {
+            continue;
+        }
+        if route.best_tier() == EvidenceTier::Privilege
+            && having.iter().all(|&other| eligible[other].best_tier() != EvidenceTier::Privilege)
+        {
+            continue;
+        }
+        let same: Vec<usize> = population.iter().copied().filter(|&other| templates[other].0 == shape).collect();
+        let same_binding = same.iter().filter(|&&other| binding(other)).count();
+        let owners: Vec<usize> = having
+            .iter()
+            .copied()
+            .filter(|&other| templates[other].0.len() == position + 1)
+            .collect();
+        // The owner template must bind it on most of its methods, or which
+        // route is "the owner" is a matter of which handler the walker could
+        // follow.
+        let owner_routes = population
+            .iter()
+            .filter(|&&other| templates[other].0.len() == position + 1)
+            .count();
+        let owners: Vec<usize> = if 2 * owners.len() > owner_routes { owners } else { Vec::new() };
+        let share = having.len() as f64 / population.len() as f64;
+        let (severity, why) = if population.len() >= MIN_POPULATION && share + 1e-9 >= CONSENSUS {
+            (
+                Severity::Medium,
+                format!("{} of {} routes that take `{{{name}}}` at this place hold it to the caller", having.len(), population.len()),
+            )
+        } else if same.len() >= 2 && same_binding == same.len() {
+            (Severity::Medium, format!("every other route on this template ({}) holds `{{{name}}}` to the caller", same.len()))
+        } else if same_binding >= 1 && 2 * same_binding >= same.len() {
+            (Severity::Low, format!("{same_binding} of {} other routes on this template hold `{{{name}}}` to the caller", same.len()))
+        } else if !owners.is_empty() && shape.len() > position + 1 {
+            let under = population
+                .iter()
+                .filter(|&&other| templates[other].0.len() > position + 1 && !binding(other))
+                .count()
+                + 1;
+            (
+                Severity::Low,
+                format!("the route that names `{{{name}}}` holds it to the caller; {under} route(s) under it do not"),
+            )
+        } else {
+            continue;
+        };
+        let having: Vec<usize> = if severity == Severity::Low && !owners.is_empty() && same_binding == 0 {
+            owners
+        } else {
+            having
+        };
+        // A role or permission check beside binders that also check one: the
+        // binding may be the way in for callers without the role.
+        let elevated = route.best_tier() == EvidenceTier::Privilege;
+        let severity = if other_scheme(own, &having, featured) || elevated { Severity::Low } else { severity };
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut group_routes: Vec<RouteReference> = vec![route.into()];
+        group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+        let at = format!("/{}", prefix.join("/"));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!("routes that take a path parameter at {at}"),
+            prefix: at.clone(),
+            level: GroupLevel::Linked,
+            method_class: MethodClass::of(&route.method),
+            routes: group_routes,
+        });
+        let feature = format!("{BINDS}path:{name}");
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!("Routes that take the parameter at {at} hold it to the caller."),
+            total_routes: population.len() + 1,
+            routes_with_authorization: having.len(),
+            routes_without_authorization: population.len() + 1 - having.len(),
+            evidence_patterns: vec![feature.clone()],
+            strength: AuthStrength::Medium,
+            expected_tier: Some(EvidenceTier::Resource),
+            dominant_requirement: Some(feature),
+        };
+        invariants.push(invariant.clone());
+        let listed: Vec<String> = having
+            .iter()
+            .take(NAMED)
+            .map(|&other| format!("{} {}", eligible[other].method, eligible[other].path))
+            .collect();
+        return Some(Finding {
+            peer_group_id: id,
+            category: FindingCategory::SkipsPeerCheck,
+            severity,
+            rationale: format!(
+                "Takes `{{{name}}}` from the path but never holds it to the caller, where {why} ({}). Dismiss if the difference is intended.",
+                listed.join(", ")
+            ),
+            invariant,
+            suspicious_route: route.into(),
+            suspicious_route_tier: route.best_tier(),
+            expected_tier: EvidenceTier::Resource,
+            suspicious_route_evidence: route.authorization.clone(),
+            evidence: FindingEvidence {
+                check: format!("holds the path parameter at {at} to the caller"),
+                supporting: having.len(),
+                compared: population.len(),
+                peers: having
+                    .iter()
+                    .take(super::explain::PEERS_SHOWN)
+                    .map(|&other| PeerCheck {
+                        method: eligible[other].method.clone(),
+                        path: eligible[other].path.clone(),
+                        check: format!(
+                            "holds `{{{}}}` to the caller",
+                            templates[other].1[position].as_deref().unwrap_or(name)
+                        ),
+                        file: eligible[other].file.clone(),
+                        line: eligible[other].line,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+        });
+    }
+    // The same binding through the body or query: routes of the namespace
+    // hold path parameter `{p}` to the caller, and this route reads a body
+    // or query field `p` it never holds to the caller.
+    let place = placement(route);
+    for mention in &own.mentions {
+        let Some(name) = mention.strip_prefix("body:") else {
+            continue;
+        };
+        if binds(route, own, "body", name)
+            || binds(route, own, "path", name)
+            || names.iter().flatten().any(|own_name| own_name == name)
+            || !names_one_entity(name, &templates)
+        {
+            continue;
+        }
+        let having: Vec<usize> = (0..eligible.len())
+            .filter(|&other| {
+                other != index
+                    && eligible[other].origin.definition != route.origin.definition
+                    && templates[other].1.iter().flatten().any(|theirs| theirs == name)
+                    && binds(eligible[other], &featured[other], "path", name)
+            })
+            .collect();
+        if having.is_empty() {
+            continue;
+        }
+        if route.best_tier() == EvidenceTier::Privilege
+            && having.iter().all(|&other| eligible[other].best_tier() != EvidenceTier::Privilege)
+        {
+            continue;
+        }
+        // Peers across the application are a lead; three in its own
+        // namespace are a pattern.
+        let near = having
+            .iter()
+            .filter(|&&other| placement(eligible[other]).namespace == place.namespace)
+            .count();
+        let severity = if near >= MIN_POPULATION
+            && !other_scheme(own, &having, featured)
+            && route.best_tier() != EvidenceTier::Privilege
+        {
+            Severity::Medium
+        } else {
+            Severity::Low
+        };
+        let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+        let mut group_routes: Vec<RouteReference> = vec![route.into()];
+        group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+        peer_groups.push(PeerGroup {
+            id: id.clone(),
+            description: format!("routes that hold `{{{name}}}` to the caller"),
+            prefix: place.namespace.clone(),
+            level: GroupLevel::Linked,
+            method_class: MethodClass::of(&route.method),
+            routes: group_routes,
+        });
+        let feature = format!("{BINDS}body:{name}");
+        let invariant = AuthorizationInvariant {
+            peer_group_id: id.clone(),
+            description: format!("Routes that take `{{{name}}}` hold it to the caller."),
+            total_routes: having.len() + 1,
+            routes_with_authorization: having.len(),
+            routes_without_authorization: 1,
+            evidence_patterns: vec![feature.clone()],
+            strength: AuthStrength::Medium,
+            expected_tier: Some(EvidenceTier::Resource),
+            dominant_requirement: Some(feature),
+        };
+        invariants.push(invariant.clone());
+        let listed: Vec<String> = having
+            .iter()
+            .take(NAMED)
+            .map(|&other| format!("{} {}", eligible[other].method, eligible[other].path))
+            .collect();
+        return Some(Finding {
+            peer_group_id: id,
+            category: FindingCategory::SkipsPeerCheck,
+            severity,
+            rationale: format!(
+                "Reads `{name}` from the request body or query and never holds it to the caller, where {} route(s) that take `{{{name}}}` in the path do, {near} of them under {} ({}). Dismiss if the difference is intended.",
+                having.len(),
+                place.namespace,
+                listed.join(", ")
+            ),
+            invariant,
+            suspicious_route: route.into(),
+            suspicious_route_tier: route.best_tier(),
+            expected_tier: EvidenceTier::Resource,
+            suspicious_route_evidence: route.authorization.clone(),
+            evidence: FindingEvidence {
+                check: format!("holds `{name}` to the caller"),
+                supporting: having.len(),
+                compared: having.len(),
+                peers: having
+                    .iter()
+                    .take(super::explain::PEERS_SHOWN)
+                    .map(|&other| PeerCheck {
+                        method: eligible[other].method.clone(),
+                        path: eligible[other].path.clone(),
+                        check: format!("holds `{{{name}}}` to the caller"),
+                        file: eligible[other].file.clone(),
+                        line: eligible[other].line,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+        });
+    }
+    None
+}
+
+/// Middleware or a guard on the route (evidence outside the handler) that
+/// names the parameter: it may hold it to the caller before the handler
+/// runs, which this check cannot see.
+fn middleware_names(route: &Route, name: &str) -> bool {
+    route.authorization.iter().any(|evidence| {
+        evidence.handler.is_none()
+            && (evidence.mechanism.contains(&format!("`{name}`"))
+                || evidence.mechanism.contains(&format!("\"{name}\""))
+                || evidence.requirements.iter().any(|key| key == name))
+    })
+}
+
+/// The route names an authentication scheme that none of the given peers
+/// name (an operator key beside user sessions): another policy more often
+/// than a forgotten check.
+fn other_scheme(own: &Features, having: &[usize], featured: &[Features]) -> bool {
+    !own.schemes.is_empty()
+        && having
+            .iter()
+            .all(|&other| featured[other].schemes.is_disjoint(&own.schemes))
+}
+
+/// A parameter name that stands for one kind of entity in the application:
+/// wherever a template takes `{p}`, at least 75% of them name the same
+/// static segment before it (`business_profile/{profile_id}`), unlike a
+/// generic `{id}` under users, clients and groups alike.
+fn names_one_entity(name: &str, templates: &[(Vec<String>, Vec<Option<String>>)]) -> bool {
+    let mut before: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut total = 0;
+    for (shape, names) in templates {
+        for (position, found) in names.iter().enumerate() {
+            if found.as_deref() == Some(name) {
+                total += 1;
+                let previous = shape[..position].iter().rev().find(|segment| *segment != "{}");
+                *before.entry(previous.map_or("", String::as_str)).or_default() += 1;
+            }
+        }
+    }
+    total > 0 && before.values().max().is_some_and(|&most| most as f64 / total as f64 + 1e-9 >= CONSENSUS)
+}
+
+/// How a route holds a loaded record, by kind: a secret the request
+/// presents, a field compared with the caller, or a named check function
+/// given the record and the caller. A load scoped to the caller is no
+/// guard kind: it scopes, it does not check.
+fn guard_kinds(features: &Features) -> BTreeSet<String> {
+    features
+        .guards
+        .values()
+        .flatten()
+        .filter_map(|how| {
+            if how.contains("secret the request presents") {
+                Some("a secret the request presents".to_string())
+            } else if how.starts_with("compares ") {
+                Some("a field compared with the caller".to_string())
+            } else {
+                how.strip_prefix("checks it with `").map(|rest| format!("`{}`", rest.trim_end_matches('`')))
+            }
+        })
+        .collect()
+}
+
+/// The mechanism invariant: among the routes that admit authentication
+/// scheme `T` and load a record with request data, at least 3, of which at
+/// least 75% hold some loaded record by the same kind of guard (see
+/// `guard_kinds`), whatever the record. A route that admits `T`, loads a
+/// record and has no guard of that kind is reported. Medium with at least
+/// 5 such peers and a secret or field comparison; otherwise Low.
+#[allow(clippy::too_many_arguments)]
+fn mechanism_guard(
+    route: &Route,
+    own: &Features,
+    index: usize,
+    featured: &[Features],
+    eligible: &[&Route],
+    peer_groups: &mut Vec<PeerGroup>,
+    invariants: &mut Vec<AuthorizationInvariant>,
+) -> Option<Finding> {
+    if !super::caller_use::rule_on("R3") || own.loads.is_empty() {
+        return None;
+    }
+    let mine = guard_kinds(own);
+    let mut best: Option<(String, String, Vec<usize>, usize)> = None;
+    for scheme in own.schemes.iter().filter(|scheme| !admits_anyone(scheme)) {
+        let population: Vec<usize> = (0..eligible.len())
+            .filter(|&other| {
+                other != index
+                    && route_identity(eligible[other]) != route_identity(route)
+                    && eligible[other].origin.definition != route.origin.definition
+                    && featured[other].schemes.contains(scheme)
+                    && !featured[other].loads.is_empty()
+            })
+            .collect();
+        if population.len() < MIN_POPULATION {
+            continue;
+        }
+        let kinds: Vec<BTreeSet<String>> = population.iter().map(|&other| guard_kinds(&featured[other])).collect();
+        let mut counted: BTreeMap<&String, usize> = BTreeMap::new();
+        for found in &kinds {
+            for kind in found {
+                *counted.entry(kind).or_default() += 1;
+            }
+        }
+        for (kind, count) in counted {
+            if mine.contains(kind) || (count as f64) / (population.len() as f64) + 1e-9 < CONSENSUS {
+                continue;
+            }
+            let having: Vec<usize> = population
+                .iter()
+                .zip(&kinds)
+                .filter(|(_, found)| found.contains(kind))
+                .map(|(&other, _)| other)
+                .collect();
+            if best.as_ref().is_none_or(|(_, _, theirs, _)| having.len() > theirs.len()) {
+                best = Some((scheme.clone(), kind.clone(), having, population.len()));
+            }
+        }
+    }
+    let (scheme, kind, having, total) = best?;
+    if route.best_tier() == EvidenceTier::Privilege
+        && having.iter().all(|&other| eligible[other].best_tier() != EvidenceTier::Privilege)
+    {
+        return None;
+    }
+    let severity = if having.len() >= 5
+        && (kind.starts_with("a secret") || kind.starts_with("a field"))
+        && !other_scheme(own, &having, featured)
+    {
+        Severity::Medium
+    } else {
+        Severity::Low
+    };
+    let id = format!("peer-group-{:03}", peer_groups.len() + 1);
+    let mut group_routes: Vec<RouteReference> = vec![route.into()];
+    group_routes.extend(having.iter().map(|&other| eligible[other].into()));
+    peer_groups.push(PeerGroup {
+        id: id.clone(),
+        description: format!("routes that admit `{scheme}` and load a record with request data"),
+        prefix: format!("scheme `{scheme}`"),
+        level: GroupLevel::Linked,
+        method_class: MethodClass::of(&route.method),
+        routes: group_routes,
+    });
+    let feature = format!("{GUARDS}{kind}");
+    let invariant = AuthorizationInvariant {
+        peer_group_id: id.clone(),
+        description: format!("Routes that admit `{scheme}` and load a record hold it by {kind}."),
+        total_routes: total + 1,
+        routes_with_authorization: having.len(),
+        routes_without_authorization: total + 1 - having.len(),
+        evidence_patterns: vec![feature.clone()],
+        strength: AuthStrength::Medium,
+        expected_tier: Some(EvidenceTier::Resource),
+        dominant_requirement: Some(feature),
+    };
+    invariants.push(invariant.clone());
+    let listed: Vec<String> = having
+        .iter()
+        .take(NAMED)
+        .map(|&other| format!("{} {}", eligible[other].method, eligible[other].path))
+        .collect();
+    Some(Finding {
+        peer_group_id: id,
+        category: FindingCategory::SkipsPeerCheck,
+        severity,
+        rationale: format!(
+            "Admits `{scheme}` and loads a record with request data, but never holds a loaded record by {kind}, where {} of {total} routes that admit `{scheme}` and load records do ({}). Dismiss if the difference is intended.",
+            having.len(),
+            listed.join(", ")
+        ),
+        invariant,
+        suspicious_route: route.into(),
+        suspicious_route_tier: route.best_tier(),
+        expected_tier: EvidenceTier::Resource,
+        suspicious_route_evidence: route.authorization.clone(),
+        evidence: FindingEvidence {
+            check: format!("holds a loaded record by {kind}"),
+            supporting: having.len(),
+            compared: total,
+            peers: having
+                .iter()
+                .take(super::explain::PEERS_SHOWN)
+                .map(|&other| PeerCheck {
+                    method: eligible[other].method.clone(),
+                    path: eligible[other].path.clone(),
+                    check: featured[other]
+                        .guards
+                        .iter()
+                        .find_map(|(key, ways)| ways.first().map(|how| format!("`{key}`: {how}")))
+                        .unwrap_or_default(),
+                    file: eligible[other].file.clone(),
+                    line: eligible[other].line,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        authorized_peer_routes: having.iter().map(|&other| eligible[other].into()).collect(),
+    })
 }

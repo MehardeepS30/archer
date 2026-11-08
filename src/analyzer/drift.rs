@@ -1998,9 +1998,12 @@ pub(crate) fn peer_prefix(route: &Route) -> String {
     placement(route).resource
 }
 
+/// A parameter, or a part Archer could not resolve. A symbolic scope
+/// (`<scope:cfg.prefix>`) is static: routes under the same expression
+/// group together, and routes under another one stay apart.
 pub(crate) fn is_dynamic_segment(segment: &str) -> bool {
     (segment.starts_with('{') && (segment.ends_with('}') || segment.ends_with("}*")))
-        || (segment.starts_with('<') && segment.ends_with('>'))
+        || (segment.starts_with('<') && segment.ends_with('>') && !segment.starts_with(super::routes::SYMBOLIC_SCOPE))
 }
 
 /// A path's segments, empty ones dropped (so `""`, `"/"` and a trailing
