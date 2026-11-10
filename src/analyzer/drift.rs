@@ -444,7 +444,13 @@ pub(crate) fn build_analysis_layers_full(
         if expected == EvidenceTier::Resource
             && route.method == "POST"
             && !basis.peers.iter().any(|peer| {
-                peer.method == "POST" && peer.best_tier() >= EvidenceTier::Resource
+                peer.method == "POST"
+                    && peer.best_tier() >= EvidenceTier::Resource
+                    // An action on one record beneath the collection
+                    // (`POST /boards/{id}/archive`) is not another create.
+                    && !(super::public::rule_on("S3")
+                        && !route.path.ends_with('}')
+                        && peer.path.starts_with(&format!("{}/{{", route.path.trim_end_matches('/'))))
             })
         {
             expected = EvidenceTier::Identity;
@@ -2132,6 +2138,7 @@ fn authenticates_structurally(route: &Route) -> bool {
                 && !feature.starts_with(super::caller_use::BINDS)
                 && !feature.starts_with(super::caller_use::MENTIONS)
                 && !feature.starts_with(super::caller_use::GRANTS)
+                && !feature.starts_with(super::caller_use::KEYED)
         }))
         .map(|text| text.to_ascii_lowercase())
         .collect();

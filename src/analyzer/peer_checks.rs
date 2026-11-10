@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    caller_use::{BINDS, GRANTS, GUARDS, LOADS, MENTIONS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
+    caller_use::{BINDS, GRANTS, GUARDS, KEYED, LOADS, MENTIONS, SITE, SITE_SEPARATOR, UNKNOWN_TYPE},
     drift::{
         is_authentication_route, is_generic_segment, is_well_known_public_route, link_strength,
         placement, route_identity, unique_routes,
@@ -100,6 +100,8 @@ fn features(route: &Route) -> Features {
     for feature in &route.caller_use {
         if let Some(value) = feature.strip_prefix(GRANTS) {
             grants.insert(value.to_string());
+        } else if feature.starts_with(KEYED) {
+            // Bookkeeping for `public::likely_public`, not a check.
         } else if let Some(tag) = feature.strip_prefix(BINDS) {
             binds.insert(tag.to_string());
         } else if let Some(tag) = feature.strip_prefix(MENTIONS) {
@@ -962,6 +964,9 @@ pub(crate) fn skipped_peer_checks(
             continue;
         }
 
+        // Item routes beneath a create still count for taking the caller,
+        // the scope check, but not for their object-level checks.
+        let existing_record = |other: usize| acts_on_existing_record(route, own, eligible[other], &featured[other]);
         // Every feature some peer has, decided at its narrowest level.
         let mut decided: BTreeMap<String, (String, usize, Vec<usize>)> = BTreeMap::new();
         let mut undecidable: HashSet<String> = HashSet::new();
@@ -971,7 +976,7 @@ pub(crate) fn skipped_peer_checks(
             let sharing: Vec<usize> = members
                 .iter()
                 .copied()
-                .filter(|&other| !featured[other].takes.is_disjoint(&own.takes))
+                .filter(|&other| !featured[other].takes.is_disjoint(&own.takes) && !existing_record(other))
                 .collect();
             let mut candidates: BTreeSet<String> = BTreeSet::new();
             if own.takes.is_empty() {
@@ -1860,6 +1865,17 @@ fn mechanism_guard(
 /// the population size.
 type GrantSupport = (String, (String, String), Vec<usize>, usize);
 
+/// A create on a collection (`POST /notes`) has no record yet: an item
+/// route beneath it (`/notes/{id}`) that holds a record it loads to the
+/// caller makes an object-level check the create cannot make.
+fn acts_on_existing_record(route: &Route, own: &Features, other: &Route, theirs: &Features) -> bool {
+    super::public::rule_on("S3")
+        && route.method == "POST"
+        && !route.path.ends_with('}')
+        && other.path.starts_with(&format!("{}/{{", route.path.trim_end_matches('/')))
+        && theirs.guards.keys().any(|key| !own.loads.contains(key))
+}
+
 /// The caller's fields a route reads, by identity label: `team` for
 /// `reads:AccountUser:team`.
 fn caller_reads(features: &Features) -> BTreeSet<(&str, &str)> {
@@ -1917,6 +1933,7 @@ fn same_grant(
                     && route_identity(eligible[other]) != route_identity(route)
                     && eligible[other].origin.definition != route.origin.definition
                     && featured[other].grants.contains(grant)
+                    && !acts_on_existing_record(route, own, eligible[other], &featured[other])
             })
             .collect();
         if population.len() < MIN_POPULATION {

@@ -5471,3 +5471,42 @@ fn a_route_granted_what_its_peers_are_that_skips_their_caller_scope_is_reported(
     assert!(all.rationale.contains("the caller's `team`"), "{}", all.rationale);
     assert_eq!(all.evidence.supporting, 5);
 }
+
+#[test]
+fn public_by_design_routes_are_kept_at_low_and_a_missing_auth_write_is_not() {
+    let report = drift_fixture(
+        "f62",
+        include_str!("../../tests/fixtures/probes/drift/f62_public_routes.rs"),
+    );
+    let findings: Vec<(&str, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.severity))
+        .collect();
+    // The pairing route checks the token it is given, and the create has
+    // no board to own yet: neither is reported.
+    assert_eq!(
+        findings,
+        [
+            ("/api/v1/account/handle/taken", Severity::Low),
+            ("/api/v1/limits", Severity::High),
+            ("/api/v1/boards/purge", Severity::Medium),
+            ("/api/v1/account/close", Severity::High),
+        ],
+        "{findings:?}"
+    );
+    let taken = &report.finding_details[0];
+    assert!(taken.rationale.contains("Likely public by design"), "{}", taken.rationale);
+    assert!(taken.rationale.contains("POST /api/v1/signup"), "{}", taken.rationale);
+    assert!(
+        taken.evidence.notes.iter().any(|note| note.contains("[[public]]") && note.contains("path = \"/api/v1/account/handle/taken\"")),
+        "{:?}",
+        taken.evidence.notes
+    );
+    let pair = report.routes.iter().find(|route| route.path == "/api/v1/relay/pair").expect("pairing route");
+    assert!(
+        pair.authorization.iter().any(|evidence| evidence.kind == AuthEvidenceKind::SecretCheck),
+        "{:?}",
+        pair.authorization
+    );
+}

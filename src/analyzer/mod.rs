@@ -12,6 +12,7 @@ mod macros;
 mod middleware;
 mod model;
 mod peer_checks;
+mod public;
 mod resources;
 mod roles;
 mod route_tables;
@@ -296,6 +297,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         .collect();
     let (peer_groups, invariants, mut finding_details, _, mut unjudged) =
         build_analysis_layers_full(&judged_routes, options);
+    public::demote_likely_public(&judged_routes, &mut finding_details);
     explain::explain(&mut finding_details);
     unjudged.extend(declared_public);
     let mut dismissed = Vec::new();

@@ -110,9 +110,11 @@ pub(crate) fn caller_use<'f>(
     files: impl IntoIterator<Item = &'f syn::File>,
     routes: &[Route],
 ) -> Vec<Vec<String>> {
+    let files: Vec<&syn::File> = files.into_iter().collect();
     let mut walker = Walker {
         index,
-        shapes: return_shapes(files),
+        shapes: return_shapes(files.iter().copied()),
+        answers: answer_shapes(files.iter().copied()),
         sources: std::rc::Rc::new(identity_sources(index, routes)),
         analyzed: HashMap::new(),
         summaries: HashMap::new(),
@@ -161,6 +163,12 @@ pub(crate) fn caller_use<'f>(
         .collect()
 }
 
+/// Feature prefix: request data handed to a call Archer does not read and
+/// that may fetch or store a record keyed by it, as `keyed:callee`. A route
+/// with none only answers with flags and counts (`handle_taken`), which
+/// `public::likely_public` uses.
+pub(crate) const KEYED: &str = "keyed:";
+
 /// Feature prefix: a constant the route builds an authentication object
 /// with, as `grants:Type::Variant`. Compared by `peer_checks::same_grant`.
 pub(crate) const GRANTS: &str = "grants:";
@@ -200,6 +208,9 @@ struct Summary {
 struct Walker<'i, 'a> {
     index: &'i HandlerIndex<'a>,
     shapes: HashMap<String, Vec<bool>>,
+    /// For every function and method name, whether each definition by
+    /// that name returns a bare answer (see `answer_type`).
+    answers: HashMap<String, Vec<bool>>,
     sources: std::rc::Rc<HashSet<String>>,
     analyzed: HashMap<SummaryKey, Analysis>,
     summaries: HashMap<SummaryKey, Summary>,
@@ -376,8 +387,27 @@ impl Walker<'_, '_> {
         }
         self.in_progress.insert(key.clone());
         let analysis = self.analysis(definition, bound);
+        // Request data handed to code Archer does not read further: unless
+        // every definition by that name returns a bare answer (a flag or a
+        // count), the call may fetch or store a record keyed by it.
+        let mut keyed: BTreeSet<String> = BTreeSet::new();
+        for (target, name) in &analysis.keyed {
+            if target
+                .as_ref()
+                .is_some_and(|target| self.index.resolve_callee(definition, target).is_some())
+            {
+                continue;
+            }
+            let answers = self
+                .answers
+                .get(name)
+                .is_some_and(|shapes| !shapes.is_empty() && shapes.iter().all(|&answer| answer));
+            if !answers {
+                keyed.insert(format!("{KEYED}{name}"));
+            }
+        }
         let mut summary = Summary {
-            features: analysis.features.clone(),
+            features: analysis.features.iter().cloned().chain(keyed).collect(),
             rejects: analysis.rejects,
             sites: BTreeMap::new(),
         };
@@ -532,6 +562,8 @@ struct Analysis {
     rejects: bool,
     /// Calls that pass request data and a closure (see `WrapperShape`).
     wrapper_calls: Vec<WrapperCall>,
+    /// Calls handed request data, by target and name (see `KEYED`).
+    keyed: Vec<(Option<HandlerTarget>, String)>,
 }
 
 /// A call such as `wrap(flow, &req, payload, |state, auth, req| ..)`,
@@ -653,6 +685,7 @@ fn analyze_function(
         flows: visitor.flows,
         rejects: visitor.rejects,
         wrapper_calls: visitor.wrapper_calls,
+        keyed: visitor.keyed,
     }
 }
 
@@ -679,11 +712,14 @@ struct CallerUseVisitor {
     used_records: HashSet<String>,
     /// Visiting a branch condition.
     in_condition: bool,
+
     /// Where each request-data name comes from (see `Origin`).
     origins: HashMap<String, Origin>,
     /// Closure inputs to bind as request data: what a wrapper hands them.
     closure_inputs: HashMap<ClosureKey, Vec<(usize, Option<Origin>)>>,
     wrapper_calls: Vec<WrapperCall>,
+    /// Calls handed request data, by target and name (see `KEYED`).
+    keyed: Vec<(Option<HandlerTarget>, String)>,
 }
 
 impl CallerUseVisitor {
@@ -732,6 +768,27 @@ impl CallerUseVisitor {
                     self.features.insert(format!("{MENTIONS}path:{name}"));
                 }
             }
+        }
+    }
+
+    /// A call handed request data as an argument, other than a conversion
+    /// or a probe (`trim`, `is_empty`): it may fetch or store a record
+    /// keyed by it (see `KEYED`).
+    fn keys<'e>(&mut self, target: Option<HandlerTarget>, callee: &str, method: bool, mut arguments: impl Iterator<Item = &'e Expr>) {
+        if !super::public::rule_on("S2")
+            || TRANSPARENT_CALLS.contains(&callee)
+            || NOT_LOADERS.contains(&callee)
+            || PROBES.contains(&callee)
+        {
+            return;
+        }
+        // The value itself, not one computed from it by another call
+        // (`json(runner(&body).await?)` hands over the runner's result).
+        if arguments.any(|argument| {
+            let whole = strip_transparent(argument);
+            matches!(whole, Expr::Path(_) | Expr::Field(_)) && self.mentions_requested(whole)
+        }) {
+            self.keyed.push((target, format!("{}{callee}", if method { "." } else { "" })));
         }
     }
 
@@ -1212,6 +1269,15 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         let Some(name) = node.path.segments.last().map(|segment| segment.ident.to_string()) else {
             return;
         };
+        // `query!("..", data.id)`: request data in a macro's tokens may key
+        // a query Archer cannot read.
+        if super::public::rule_on("S2")
+            && node.tokens.clone().into_iter().any(|token| {
+                matches!(&token, proc_macro2::TokenTree::Ident(ident) if self.requested.contains(&ident.to_string()))
+            })
+        {
+            self.keyed.push((None, format!("{name}!")));
+        }
         if name != "matches" && !super::evidence::ENFORCING_MACROS.contains(&name.as_str()) {
             return;
         }
@@ -1359,6 +1425,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             && let Some(last) = path.path.segments.last()
         {
             self.path_passed(&last.ident.to_string(), node.args.iter());
+            self.keys(handler_target(&node.func), &last.ident.to_string(), false, node.args.iter());
         }
         // `constant_time_eq(invite.stored.as_bytes(), given.as_bytes())`
         if let Expr::Path(path) = &*node.func
@@ -1487,6 +1554,16 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         self.path_passed(&node.method.to_string(), node.args.iter());
+        self.keys(
+            receiver_path(&node.receiver).map(|receiver| HandlerTarget::Method {
+                receiver,
+                method: node.method.to_string(),
+            }),
+            &node.method.to_string(),
+            true,
+            node.args.iter(),
+        );
+
         // `note.readers.contains(&user.id)`: the caller in a loaded record.
         if self.derived(&node.receiver).is_none()
             && node.args.iter().any(|argument| self.derived(argument).is_some())
@@ -1700,6 +1777,62 @@ fn verdict_type(ty: &Type) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Whether a type is a bare answer: a flag or a number, alone or as the
+/// value of a wrapper (`DbResult<bool>`, `Option<u32>`, `Result<i64, E>`),
+/// rather than a record or `()`. Language primitives, not app names.
+fn answer_type(ty: &Type) -> bool {
+    match ty {
+        Type::Paren(paren) => answer_type(&paren.elem),
+        Type::Group(group) => answer_type(&group.elem),
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            let name = segment.ident.to_string();
+            if path.path.segments.len() == 1
+                && (name == "bool"
+                    || name == "usize"
+                    || name == "isize"
+                    || ((name.starts_with('u') || name.starts_with('i') || name.starts_with('f'))
+                        && name.len() > 1
+                        && name[1..].chars().all(|c| c.is_ascii_digit())))
+            {
+                return true;
+            }
+            match &segment.arguments {
+                PathArguments::AngleBracketed(arguments) => {
+                    matches!(arguments.args.first(), Some(GenericArgument::Type(inner)) if answer_type(inner))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// For every function and method name in the scanned files, whether each
+/// definition by that name returns a bare answer (see `answer_type`).
+fn answer_shapes<'f>(files: impl IntoIterator<Item = &'f syn::File>) -> HashMap<String, Vec<bool>> {
+    #[derive(Default)]
+    struct Shapes(HashMap<String, Vec<bool>>);
+    impl<'ast> Visit<'ast> for Shapes {
+        fn visit_signature(&mut self, node: &'ast syn::Signature) {
+            // Methods and free functions apart (`.name` for a method), so a
+            // handler named like the store method it calls does not count.
+            let answers = matches!(&node.output, syn::ReturnType::Type(_, ty) if answer_type(ty));
+            let method = matches!(node.inputs.first(), Some(FnArg::Receiver(_)));
+            let key = format!("{}{}", if method { "." } else { "" }, node.ident);
+            self.0.entry(key).or_default().push(answers);
+            visit::visit_signature(self, node);
+        }
+    }
+    let mut shapes = Shapes::default();
+    for file in files {
+        shapes.visit_file(file);
+    }
+    shapes.0
 }
 
 /// For every function and method name in the scanned files, whether each

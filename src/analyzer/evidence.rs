@@ -3584,6 +3584,34 @@ fn secret_checks(file: &Path, handler: &str, block: &Block) -> Vec<AuthEvidence>
             _ => None,
         }
     }
+    /// `pairings.get(&body.pair_token)`: a lookup keyed by a value named as
+    /// a secret, through `.await`, `?` and adapters. A miss that rejects
+    /// the request is a secret check: the presented value must match one
+    /// stored.
+    fn secret_lookup(expr: &Expr) -> bool {
+        if !super::public::rule_on("S1") {
+            return false;
+        }
+        match expr {
+            Expr::Paren(inner) => secret_lookup(&inner.expr),
+            Expr::Group(inner) => secret_lookup(&inner.expr),
+            Expr::Try(inner) => secret_lookup(&inner.expr),
+            Expr::Await(inner) => secret_lookup(&inner.base),
+            Expr::Call(call) => call.args.iter().any(names_secret),
+            Expr::MethodCall(call) => call.args.iter().any(names_secret) || secret_lookup(&call.receiver),
+            _ => false,
+        }
+    }
+    /// A match arm taken on a miss: `None`, `Err(..)` or `_`.
+    fn on_miss(pattern: &Pat) -> bool {
+        match pattern {
+            Pat::Ident(ident) => ident.ident == "None",
+            Pat::Path(path) => path.path.is_ident("None"),
+            Pat::TupleStruct(tuple) => tuple.path.segments.last().is_some_and(|segment| segment.ident == "Err"),
+            Pat::Wild(_) => true,
+            _ => false,
+        }
+    }
     impl Secrets<'_> {
         fn push(&mut self, condition: &Expr, by_name: bool, line: usize) {
             if self.evidence.iter().any(|existing| existing.line == line) {
@@ -3618,7 +3646,40 @@ fn secret_checks(file: &Path, handler: &str, block: &Block) -> Vec<AuthEvidence>
             if rejects && let Some(by_name) = compares(&node.cond) {
                 self.push(&node.cond, by_name, node.if_token.span.start().line);
             }
+            // `if let Some(relay) = pairings.get(&body.pair_token) { .. } else { return Err(..) }`
+            if let Expr::Let(binding) = &*node.cond
+                && secret_lookup(&binding.expr)
+                && node
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, otherwise)| super::caller_use::rejects_in(otherwise))
+            {
+                self.push(&binding.expr, true, node.if_token.span.start().line);
+            }
             visit::visit_expr_if(self, node);
+        }
+        // `match pairings.get(&body.pair_token) { Some(..) => .., None => Err(..) }`
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if secret_lookup(&node.expr)
+                && node
+                    .arms
+                    .iter()
+                    .any(|arm| on_miss(&arm.pat) && super::caller_use::rejects_in(&arm.body))
+            {
+                self.push(&node.expr, true, node.match_token.span.start().line);
+            }
+            visit::visit_expr_match(self, node);
+        }
+        // `let Some(relay) = pairings.get(&body.pair_token) else { return Err(..) };`
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let Some(init) = &node.init
+                && let Some((_, diverge)) = &init.diverge
+                && secret_lookup(&init.expr)
+                && super::caller_use::rejects_in(diverge)
+            {
+                self.push(&init.expr, true, node.let_token.span.start().line);
+            }
+            visit::visit_local(self, node);
         }
         // `verify_password(&given, &stored.hash)?;`
         fn visit_expr_try(&mut self, node: &'ast ExprTry) {

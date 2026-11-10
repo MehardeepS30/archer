@@ -87,3 +87,25 @@ fn each_missed_drift_rule_has_a_switch() {
         assert!(!off.iter().any(|finding| finding.contains(route)), "{switch} off: {off:?}");
     }
 }
+
+#[test]
+fn each_public_route_rule_has_a_switch() {
+    let fixture = "tests/fixtures/probes/drift/f62_public_routes.rs";
+    let on = findings_with(fixture, &[]);
+    // With the rule on, the first line is there and the second is not;
+    // with it off, the reverse. An empty line is not looked for.
+    let cases = [
+        // The secret lookup makes the pairing route authenticated, so the
+        // writes under /api/v1 agree on a caller.
+        ("ARCHER_P6_S1", "High POST /api/v1/account/close", ""),
+        ("ARCHER_P6_S2", "Low POST /api/v1/account/handle/taken", "High POST /api/v1/account/handle/taken"),
+        ("ARCHER_P6_S3", "", "Low POST /api/v1/boards"),
+    ];
+    for (switch, with, without) in cases {
+        let off = findings_with(fixture, &[(switch, "0")]);
+        for (present, absent, found) in [(with, without, &on), (without, with, &off)] {
+            assert!(present.is_empty() || found.iter().any(|line| line == present), "{switch}: {found:?}");
+            assert!(absent.is_empty() || !found.iter().any(|line| line == absent), "{switch}: {found:?}");
+        }
+    }
+}
