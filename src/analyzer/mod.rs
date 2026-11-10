@@ -6,6 +6,7 @@ mod config;
 mod drift;
 mod evidence;
 mod explain;
+mod extractor_flow;
 mod extractors;
 mod handlers;
 mod macros;
@@ -149,7 +150,9 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // registrations can resolve handlers defined in other files.
     // Before the index, whose evidence uses what extractors check.
     roles::index_role_orders(parsed_files.iter().map(|(_, _, syntax)| syntax));
-    extractors::index_extractors(parsed_files.iter().map(|(_, _, syntax)| syntax));
+    extractors::index_extractors(
+        parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)),
+    );
     auth_objects::index_auth_objects(
         parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)),
     );

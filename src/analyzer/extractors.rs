@@ -21,9 +21,9 @@
 //! Otherwise it only identifies the caller. Extractors that never fail are
 //! not protection, and are left to the name heuristic.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, path::{Path, PathBuf}};
 use syn::{
-    Expr, ImplItem, Item, Pat,
+    Expr, Pat,
     visit::{self, Visit},
 };
 
@@ -35,6 +35,29 @@ pub(crate) struct Learned {
     pub(crate) kind: AuthEvidenceKind,
     /// Admitted role variants (`owner`), or role-like names it branches on.
     pub(crate) requirements: Vec<String>,
+    /// Where the check is made, when it is not read from the type's own
+    /// `from_request` body alone (see `extractor_flow`).
+    pub(crate) via: Option<Via>,
+    /// It reads a credential the request presents (a header, a cookie, a
+    /// session, another caller extractor), itself or through what it runs.
+    pub(crate) credential: bool,
+}
+
+/// How an extractor's comparison of a credential value with a path value
+/// reads as a mechanism.
+pub(crate) const CREDENTIAL_PATH_CHECK: &str =
+    "rejects the request unless a credential value matches a path value";
+
+/// The path from an extractor to the check it makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Via {
+    /// The innermost extractor: the one whose code makes the check.
+    pub(crate) extractor: String,
+    /// The extractors run to reach it, outermost first, ending with it.
+    pub(crate) chain: Vec<String>,
+    /// The comparison of a credential value with a path value, if that is
+    /// the check.
+    pub(crate) site: Option<(PathBuf, usize)>,
 }
 
 thread_local! {
@@ -63,10 +86,29 @@ const PRIVILEGE_WORDS: [&str; 14] = [
 /// Error names that refuse an identified caller.
 const FORBIDDING_WORDS: [&str; 4] = ["forbidden", "denied", "insufficient", "unprivileged"];
 
-pub(crate) fn index_extractors<'a>(files: impl IntoIterator<Item = &'a syn::File>) {
+pub(crate) fn index_extractors<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File)>) {
+    let index = super::extractor_flow::Index::build(files);
+    let mut resolver = super::extractor_flow::Resolver::new(&index);
     let mut learned: HashMap<String, Option<Learned>> = HashMap::new();
-    for file in files {
-        collect(&file.items, &mut learned);
+    for name in index.extractor_names() {
+        let found = resolver.resolve(&name);
+        learned.insert(name, found);
+    }
+    if std::env::var_os("ARCHER_DEBUG_EXTRACTORS").is_some() {
+        let mut names: Vec<&String> = learned.keys().collect();
+        names.sort();
+        for name in names {
+            match &learned[name] {
+                Some(found) => eprintln!(
+                    "extractor {name}: {:?} {:?} credential={} via={}",
+                    found.kind,
+                    found.requirements,
+                    found.credential,
+                    found.via.as_ref().map_or("-".to_string(), |via| via.chain.join(" -> "))
+                ),
+                None => eprintln!("extractor {name}: nothing learned"),
+            }
+        }
     }
     LEARNED.with(|map| *map.borrow_mut() = learned);
 }
@@ -76,55 +118,17 @@ pub(crate) fn learned(name: &str) -> Option<Learned> {
     LEARNED.with(|map| map.borrow().get(name).cloned().flatten())
 }
 
-fn collect(items: &[Item], learned: &mut HashMap<String, Option<Learned>>) {
-    for item in items {
-        match item {
-            Item::Mod(module) => {
-                if let Some((_, items)) = &module.content {
-                    collect(items, learned);
-                }
-            }
-            Item::Impl(implementation) => {
-                let Some((trait_path, _)) = &implementation.trait_ else {
-                    continue;
-                };
-                if trait_path
-                    .segments
-                    .last()
-                    .is_none_or(|segment| segment.ident != "FromRequest")
-                {
-                    continue;
-                }
-                let syn::Type::Path(self_type) = &*implementation.self_ty else {
-                    continue;
-                };
-                let Some(name) = self_type.path.segments.last().map(|s| s.ident.to_string()) else {
-                    continue;
-                };
-                let Some(body) = implementation.items.iter().find_map(|item| match item {
-                    ImplItem::Fn(function) if function.sig.ident == "from_request" => {
-                        Some(&function.block)
-                    }
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                let Some(found) = classify(body) else {
-                    continue;
-                };
-                match learned.get(&name) {
-                    None => {
-                        learned.insert(name, Some(found));
-                    }
-                    Some(Some(previous)) if *previous != found => {
-                        learned.insert(name, None);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+/// Whether a piece of evidence can be the check that admits a caller. An
+/// extractor of the scanned code whose `from_request`, with what it runs
+/// and calls, reads no credential cannot: it fails for other reasons.
+/// `ARCHER_P12=0` turns the distinction off.
+pub(crate) fn reads_credential(evidence: &super::model::AuthEvidence) -> bool {
+    if std::env::var("ARCHER_P12").is_ok_and(|value| value == "0")
+        || !super::extractor_flow::enabled()
+    {
+        return true;
     }
+    learned(&evidence.mechanism).is_none_or(|learned| learned.credential)
 }
 
 fn privileged(name: &str) -> bool {
@@ -149,7 +153,7 @@ fn forbidding(name: &str) -> bool {
     FORBIDDING_WORDS.iter().any(|word| lower.contains(word))
 }
 
-fn classify(body: &syn::Block) -> Option<Learned> {
+pub(super) fn classify(body: &syn::Block) -> Option<Learned> {
     let mut visitor = BodyVisitor::default();
     visitor.visit_block(body);
     if !visitor.rejects {
@@ -170,6 +174,8 @@ fn classify(body: &syn::Block) -> Option<Learned> {
         return Some(Learned {
             kind: AuthEvidenceKind::RoleCheck,
             requirements,
+            via: None,
+            credential: false,
         });
     }
     // Failing alone is not about the caller: an extractor that loads the
@@ -181,6 +187,8 @@ fn classify(body: &syn::Block) -> Option<Learned> {
     Some(Learned {
         kind: AuthEvidenceKind::IdentityExtraction,
         requirements: Vec::new(),
+        via: None,
+        credential: false,
     })
 }
 

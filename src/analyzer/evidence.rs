@@ -897,7 +897,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 } else {
                     AuthStrength::Medium
                 };
-                evidence.push(AuthEvidence {
+                let mut found = AuthEvidence {
                     kind: learned.kind,
                     mechanism: name,
                     symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
@@ -907,7 +907,23 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     strength,
                     requirements: learned.requirements,
                     name_based: false,
-                });
+                };
+                // The check is made by an extractor this one runs, or by a
+                // comparison in a function it calls: cite that.
+                if let Some(via) = learned.via {
+                    if via.chain.len() > 1 {
+                        found.symbol = Some(via.chain.join(" -> "));
+                    }
+                    found.mechanism = match &via.site {
+                        Some(_) => format!("`{}` {}", via.extractor, super::extractors::CREDENTIAL_PATH_CHECK),
+                        None => via.extractor,
+                    };
+                    if let Some((site_file, site_line)) = via.site {
+                        found.file = site_file;
+                        found.line = site_line;
+                    }
+                }
+                evidence.push(found);
                 return;
             }
             if let Some((kind, strength)) = classify_extractor_name(&name) {

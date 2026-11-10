@@ -435,7 +435,13 @@ pub(crate) fn build_analysis_layers_full(
         // (`/admin/password`, `/admin/logout`), peers' ownership checks say
         // that their callers are identified, not that every route has a
         // record to own.
-        if expected == EvidenceTier::Resource && basis_key.level != GroupLevel::Resource {
+        // Unless the peers' check is made by their extractors on a value
+        // of the path itself (`/shelves/{shelf}/..`): that holds for every
+        // route under the same path parameter, record or not.
+        if expected == EvidenceTier::Resource
+            && basis_key.level != GroupLevel::Resource
+            && !path_check_spans(route, &basis.peers)
+        {
             expected = EvidenceTier::Identity;
         }
         // A create (`POST /messages`) makes the record its caller will own;
@@ -571,6 +577,38 @@ pub(crate) fn build_analysis_layers_full(
     }
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings, unjudged)
+}
+
+/// Whether a route's peers hold the caller to a value of the request path
+/// in their extractors (see `extractor_flow`), under the path parameter
+/// the route has too. `ARCHER_P11=0` turns it off.
+fn path_check_spans(route: &Route, peers: &[&Route]) -> bool {
+    fn first_parameter(path: &str) -> Option<(usize, &str)> {
+        path.split('/')
+            .enumerate()
+            .find(|(_, segment)| segment.starts_with('{'))
+    }
+    if !super::extractor_flow::enabled() {
+        return false;
+    }
+    let Some(own) = first_parameter(&route.path) else {
+        return false;
+    };
+    let holders: Vec<&&Route> = peers
+        .iter()
+        .filter(|peer| !std::ptr::eq(**peer, route))
+        .filter(|peer| {
+            peer.authorization.iter().any(|evidence| {
+                evidence.kind == AuthEvidenceKind::OwnershipCheck
+                    && evidence.mechanism.ends_with(super::extractors::CREDENTIAL_PATH_CHECK)
+            })
+        })
+        .collect();
+    let sharing = holders
+        .iter()
+        .filter(|peer| first_parameter(&peer.path) == Some(own))
+        .count();
+    sharing >= 2 && sharing * 2 > holders.len()
 }
 
 /// A write on a resource's collection or record that requires less than

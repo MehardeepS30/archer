@@ -5510,3 +5510,82 @@ fn public_by_design_routes_are_kept_at_low_and_a_missing_auth_write_is_not() {
         pair.authorization
     );
 }
+
+#[test]
+fn a_check_made_by_a_nested_extractor_is_followed_and_cited() {
+    let source = include_str!("../../tests/fixtures/probes/drift/f63_nested_extractors.rs");
+    let report = drift_fixture("f63", source);
+    let findings: Vec<(&str, FindingCategory, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.category, finding.severity))
+        .collect();
+    // `/summary` never runs the ticket extractor, and `/preview` runs it
+    // but discards its failure. `/audit/raw` takes no caller.
+    assert_eq!(
+        findings,
+        [
+            ("/shelves/{shelf}/summary", FindingCategory::MissingAuthorization, Severity::Medium),
+            ("/shelves/{shelf}/preview", FindingCategory::MissingAuthorization, Severity::Medium),
+            ("/audit/raw", FindingCategory::MissingAuthentication, Severity::High),
+        ],
+        "{findings:?}"
+    );
+    // The comparison in the innermost extractor's helper is the check,
+    // cited where it is written and with how the handler reaches it.
+    let comparison = source
+        .lines()
+        .position(|line| line.contains("ticket.shelf != wanted"))
+        .expect("the comparison")
+        + 1;
+    let summary = &report.finding_details[0];
+    assert!(
+        summary.evidence.check.contains("`Ticket` rejects the request unless a credential value matches a path value"),
+        "{}",
+        summary.evidence.check
+    );
+    assert!(summary.evidence.check.contains("`ShelfRead -> Ticket`"), "{}", summary.evidence.check);
+    assert_eq!(summary.evidence.supporting, 4);
+    assert!(summary.evidence.peers.iter().all(|peer| peer.line == comparison), "{:?}", summary.evidence.peers);
+    // Reads and writes reach it through different extractors.
+    for (path, method, chain) in [
+        ("/shelves/{shelf}/items", "GET", "ShelfRead -> Ticket"),
+        ("/shelves/{shelf}/labels", "PUT", "ShelfWrite -> Ticket"),
+    ] {
+        let route = report
+            .routes
+            .iter()
+            .find(|route| route.path == path && route.method == method)
+            .expect("route");
+        assert!(
+            route.authorization.iter().any(|evidence| {
+                evidence.kind == AuthEvidenceKind::OwnershipCheck && evidence.symbol.as_deref() == Some(chain)
+            }),
+            "{:?}",
+            route.authorization
+        );
+    }
+    // An extractor that reads no credential is not cited as the check,
+    // though every peer takes it and it comes last.
+    let raw = &report.finding_details[2];
+    assert_eq!(raw.evidence.check, "takes the caller: `Operator`");
+}
+
+#[test]
+fn an_unresolved_path_warning_shows_the_expression_as_written() {
+    let report = drift_fixture(
+        "p12_warning",
+        r#"
+use actix_web::{web, App, HttpResponse};
+fn app() {
+    App::new().service(web::resource(&mounted("/info/quota", "a b")).route(web::get().to(quota)));
+}
+async fn quota() -> HttpResponse { HttpResponse::Ok().finish() }
+"#,
+    );
+    assert!(
+        report.warnings.iter().any(|warning| warning.contains(r#"path `mounted("/info/quota","a b")`"#)),
+        "{:?}",
+        report.warnings
+    );
+}

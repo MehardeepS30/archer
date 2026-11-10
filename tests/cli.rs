@@ -109,3 +109,35 @@ fn each_public_route_rule_has_a_switch() {
         }
     }
 }
+
+#[test]
+fn the_nested_extractor_round_has_switches() {
+    let fixture = "tests/fixtures/probes/drift/f63_nested_extractors.rs";
+    let on = findings_with(fixture, &[]);
+    let off = findings_with(fixture, &[("ARCHER_P11", "0")]);
+    for route in ["Medium GET /shelves/{shelf}/summary", "Medium GET /shelves/{shelf}/preview"] {
+        assert!(on.iter().any(|line| line == route), "on: {on:?}");
+        assert!(!off.iter().any(|line| line == route), "off: {off:?}");
+    }
+    // The citation rule changes what a finding says, not which are made.
+    let uncited = findings_with(fixture, &[("ARCHER_P12", "0")]);
+    assert_eq!(on, uncited);
+    let check = |switches: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_archer"));
+        command.args(["--json", fixture]);
+        for (name, value) in switches {
+            command.env(name, value);
+        }
+        let output = command.output().expect("archer runs");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+        report["finding_details"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| finding["suspicious_route"]["path"] == "/audit/raw")
+            .map(|finding| finding["evidence"]["check"].as_str().unwrap_or_default().to_owned())
+            .expect("the audit finding")
+    };
+    assert_eq!(check(&[]), "takes the caller: `Operator`");
+    assert_eq!(check(&[("ARCHER_P12", "0")]), "takes the caller: `Stock`");
+}

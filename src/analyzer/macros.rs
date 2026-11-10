@@ -277,6 +277,14 @@ fn transcribe(tokens: &TokenStream, bindings: &HashMap<String, Binding>) -> Toke
                             let mut tokens = value.clone().into_iter();
                             match (tokens.next(), tokens.next()) {
                                 (Some(single), None) => output.push(single),
+                                (Some(first), _) => {
+                                    // The group stands where the argument
+                                    // was written: a new group's own span
+                                    // is the start of the file.
+                                    let mut group = Group::new(Delimiter::None, value.clone());
+                                    group.set_span(first.span());
+                                    output.push(TokenTree::Group(group));
+                                }
                                 _ => output.push(TokenTree::Group(Group::new(
                                     Delimiter::None,
                                     value.clone(),
@@ -376,6 +384,15 @@ mod tests {
                 .map(|expr| quote::ToTokens::to_token_stream(&expr).to_string())
                 .unwrap_or_else(|_| tokens.to_string())
         })
+    }
+
+    #[test]
+    fn an_expression_argument_keeps_the_line_it_was_written_on() {
+        let rules = parse_rules(&"($m:expr) => { App::new().wrap($m) };".parse().unwrap());
+        let expanded = expand(&rules, &"\n\n\nbuild(&settings, 3)".parse().unwrap()).unwrap();
+        let call = syn::parse2::<syn::ExprMethodCall>(expanded).unwrap();
+        let argument = call.args.first().unwrap();
+        assert_eq!(syn::spanned::Spanned::span(argument).start().line, 4);
     }
 
     #[test]

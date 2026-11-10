@@ -56,11 +56,28 @@ fn peer_check<'a>(finding: &Finding, peer: &'a RouteReference) -> Option<&'a Aut
     }
     evaluated()
         .filter(|evidence| EvidenceTier::of(&evidence.kind) <= finding.expected_tier.max(EvidenceTier::Identity))
-        .max_by_key(|evidence| (EvidenceTier::of(&evidence.kind), evidence.symbol.as_deref().map_or(0, |symbol| symbol.matches(" -> ").count())))
+        .max_by_key(|evidence| {
+            (
+                EvidenceTier::of(&evidence.kind),
+                // An extractor that reads no credential (a pool, a metrics
+                // handle) is not the check, whatever tier its body reads as.
+                super::extractors::reads_credential(evidence),
+                evidence.symbol.as_deref().map_or(0, |symbol| symbol.matches(" -> ").count()),
+            )
+        })
         .or_else(|| evaluated().max_by_key(|evidence| EvidenceTier::of(&evidence.kind)))
 }
 
 fn describe(evidence: &AuthEvidence) -> String {
+    // A check made by an extractor the handler's own extractor runs: say
+    // what it does, and how the handler reaches it.
+    if evidence.mechanism.ends_with(super::extractors::CREDENTIAL_PATH_CHECK) {
+        let mut text = format!("{}: {}", kind_label(&evidence.kind), evidence.mechanism);
+        if let Some(chain) = evidence.symbol.as_deref().filter(|symbol| symbol.contains(" -> ")) {
+            text.push_str(&format!(" (reached as `{chain}`)"));
+        }
+        return text;
+    }
     let what = evidence.symbol.as_deref().unwrap_or(&evidence.mechanism);
     let mut text = format!("{}: `{what}`", kind_label(&evidence.kind));
     if !evidence.requirements.is_empty() && !what.contains(&evidence.requirements[0]) {

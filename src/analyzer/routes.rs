@@ -1747,11 +1747,17 @@ impl RouteVisitor<'_> {
                 if text.is_empty() { "expression".to_owned() } else { text }
             }
         };
+        // The warning shows the expression as written; the segment keeps
+        // the short form, which must hold no `/`.
+        let shown = match expr {
+            Expr::Path(_) => written.clone(),
+            _ => expression_text(expr),
+        };
         self.warnings.push(format!(
             "{}:{}: path `{}` is not a string literal or resolvable const",
             self.file.display(),
             line,
-            written
+            shown
         ));
         Some((format!("<unresolved:{written}>"), line))
     }
@@ -1850,6 +1856,33 @@ impl RouteVisitor<'_> {
             _ => None,
         }
     }
+}
+
+/// An expression as its source reads, without the spaces the token
+/// printer puts between tokens (`cfg_path("/info/quota")`). Spaces inside
+/// string literals are kept.
+fn expression_text(expr: &Expr) -> String {
+    let mut text = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in expr.to_token_stream().to_string().chars() {
+        if in_string {
+            text.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+            text.push(character);
+        } else if !character.is_whitespace() {
+            text.push(character);
+        }
+    }
+    text.chars().take(80).collect()
 }
 
 /// The mark of a scope prefix Archer could not resolve, kept by the source
