@@ -5589,3 +5589,70 @@ async fn quota() -> HttpResponse { HttpResponse::Ok().finish() }
         report.warnings
     );
 }
+
+#[test]
+fn paths_built_in_code_are_evaluated_and_unknown_parts_kept() {
+    let source = include_str!("../../tests/fixtures/probes/drift/f64_built_paths.rs");
+    let report = drift_fixture("f64", source);
+    let findings: Vec<(&str, FindingCategory, Severity)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.category, finding.severity))
+        .collect();
+    // One finding per part, at the path the code builds; the docs redirect
+    // at `/` is not grouped with the ledger.
+    assert_eq!(
+        findings,
+        [
+            ("/v2/{book}/entries/{entry:[0-9]{1,8}}/merge", FindingCategory::MissingAuthorization, Severity::High),
+            ("/shelf/{id}/stamp", FindingCategory::MissingAuthorization, Severity::High),
+            ("/<unresolved:cfg.depot_prefix>/depot/crates/{id}/open", FindingCategory::MissingAuthorization, Severity::High),
+        ],
+        "{findings:?}"
+    );
+    // Each table's `Shelf` gives its own paths, through the rename too.
+    let paths: Vec<&str> = report.routes.iter().map(|route| route.path.as_str()).collect();
+    for path in ["/api/shelf", "/api/shelf/{id}/stamp", "/shelf", "/shelf/{id}"] {
+        assert!(paths.contains(&path), "{paths:?}");
+    }
+    assert_eq!(report.coverage.unresolved_paths, 4);
+    assert!(
+        report.warnings.iter().any(|warning| warning.contains("path `depot` is partly resolved, as `/<unresolved:cfg.depot_prefix>/depot`")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn a_path_that_is_only_an_unresolved_expression_is_not_judged() {
+    let report = drift_fixture(
+        "lone-unresolved",
+        r#"
+use actix_web::{web, App, HttpResponse};
+fn app(settings: &Settings) {
+    App::new()
+        .route("/", web::get().to(home))
+        .route(&settings.status_path(), web::get().to(status))
+        .route("/items", web::get().to(items))
+        .route("/items/{id}", web::get().to(item));
+}
+async fn home() -> HttpResponse { HttpResponse::Ok().finish() }
+async fn status() -> HttpResponse { HttpResponse::Ok().finish() }
+async fn items(me: AccountUser) -> HttpResponse { HttpResponse::Ok().finish() }
+async fn item(me: AccountUser) -> HttpResponse { HttpResponse::Ok().finish() }
+"#,
+    );
+    assert!(
+        report
+            .unjudged
+            .iter()
+            .any(|route| route.path.starts_with("/<unresolved:") && route.reason == UnjudgedReason::UnresolvedPath),
+        "{:?}",
+        report.unjudged
+    );
+    assert!(
+        report.finding_details.iter().all(|finding| !finding.suspicious_route.path.contains("unresolved")),
+        "{:?}",
+        report.finding_details
+    );
+}

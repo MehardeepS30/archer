@@ -736,6 +736,8 @@ pub struct Coverage {
     pub unresolved_handlers: usize,
     /// Routes whose path holds a part that is not a literal or a constant.
     pub unresolved_paths: usize,
+    /// A few of those, as `file:line METHOD path`.
+    pub unresolved_path_examples: Vec<String>,
     /// Attribute routes that nothing registers, left out of `routes`.
     pub unregistered_attribute_routes: usize,
     /// Route-like call sites seen (route constructors, resources, route

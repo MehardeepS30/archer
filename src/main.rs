@@ -113,6 +113,14 @@ fn run(cli: &Cli) -> Result<bool> {
         "Peer groups: {} of {} routes compared in {} peer groups",
         coverage.routes_compared, coverage.routes_total, coverage.peer_groups
     );
+    println!(
+        "Paths: {} of {} routes have fully resolved paths",
+        report.routes.len() - coverage.unresolved_paths.min(report.routes.len()),
+        report.routes.len()
+    );
+    for example in &coverage.unresolved_path_examples {
+        println!("  unresolved: {example}");
+    }
     if coverage.unresolved_handlers > 0 || coverage.unresolved_paths > 0 {
         println!(
             "  routes with unresolved handlers: {}; with unresolved paths: {}",

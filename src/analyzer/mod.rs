@@ -7,6 +7,7 @@ mod drift;
 mod evidence;
 mod explain;
 mod extractor_flow;
+mod path_eval;
 mod extractors;
 mod handlers;
 mod macros;
@@ -616,6 +617,12 @@ fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
         .iter()
         .filter(|route| has_unresolved_segment(&route.path))
         .count();
+    coverage.unresolved_path_examples = routes
+        .iter()
+        .filter(|route| has_unresolved_segment(&route.path))
+        .take(5)
+        .map(|route| format!("{}:{} {} {}", route.file.display(), route.line, route.method, route.path))
+        .collect();
     coverage
 }
 

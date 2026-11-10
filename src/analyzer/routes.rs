@@ -36,6 +36,9 @@ pub(crate) struct BlockScope {
     /// Bound builders not yet used; visited when the block ends so that
     /// their routes are not lost.
     pub(crate) unused_builders: Vec<String>,
+    /// Values of `let` bindings a path can be built from (`let base =
+    /// format!("/v1/{mount}")`), as far as they are known.
+    pub(crate) values: HashMap<String, super::path_eval::Value>,
 }
 
 impl BlockScope {
@@ -752,11 +755,31 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
             }
             self.visit_stmt(statement);
             if let Stmt::Local(local) = statement {
+                let value = if super::path_eval::enabled() {
+                    super::path_eval::binding_value(
+                        self.index,
+                        &self.crate_key,
+                        &self.module,
+                        &self.block_scopes,
+                        &self.loop_values,
+                        local,
+                    )
+                } else {
+                    None
+                };
                 let scope = self
                     .block_scopes
                     .last_mut()
                     .expect("block scope pushed above");
-                pattern_bindings(&local.pat, &mut scope.locals);
+                let mut names = HashSet::new();
+                pattern_bindings(&local.pat, &mut names);
+                for name in &names {
+                    scope.values.remove(name);
+                }
+                scope.locals.extend(names);
+                if let Some((name, value)) = value {
+                    scope.values.insert(name, value);
+                }
             }
         }
         let unused = std::mem::take(
@@ -910,8 +933,14 @@ impl RouteVisitor<'_> {
             // `path = "crate::ROUTES.auth.login"`: a field of a constant
             // route table, which a codegen fork resolves at compile time.
             let written = path_literal.value();
+            let evaluated = (!written.is_empty() && !written.starts_with('/'))
+                .then(|| syn::parse_str::<Expr>(&written).ok())
+                .flatten()
+                .and_then(|expr| self.evaluated_path(&expr, path_literal.span().start().line));
             let literal_path = if written.is_empty() || written.starts_with('/') {
                 written
+            } else if let Some(path) = evaluated {
+                path
             } else {
                 match self.field_paths.resolve(&written) {
                     Some(value) => value,
@@ -1732,19 +1761,18 @@ impl RouteVisitor<'_> {
                 {
                     return Some((value, line));
                 }
+                if let Some(path) = self.evaluated_path(expr, line) {
+                    return Some((path, line));
+                }
                 segments.join("::")
             }
             // `web::scope(&cfg.common.base_uri)`: kept by its text, so two
             // different runtime prefixes stay apart.
             _ => {
-                let text: String = expr
-                    .to_token_stream()
-                    .to_string()
-                    .chars()
-                    .filter(|character| !character.is_whitespace() && !"&/<>{}".contains(*character))
-                    .take(48)
-                    .collect();
-                if text.is_empty() { "expression".to_owned() } else { text }
+                if let Some(path) = self.evaluated_path(expr, line) {
+                    return Some((path, line));
+                }
+                super::path_eval::segment_text(expr)
             }
         };
         // The warning shows the expression as written; the segment keeps
@@ -1760,6 +1788,43 @@ impl RouteVisitor<'_> {
             shown
         ));
         Some((format!("<unresolved:{written}>"), line))
+    }
+
+    /// A path built in code (`format!`, a `let` value, a route table field,
+    /// a call to a project function), when evaluation knows more than the
+    /// expression's text. Parts it cannot know stay as `<unresolved:..>`
+    /// segments, with a warning.
+    fn evaluated_path(&mut self, expr: &Expr, line: usize) -> Option<String> {
+        if !super::path_eval::enabled() {
+            return None;
+        }
+        let value = super::path_eval::evaluate_at_site(
+            self.index,
+            &self.crate_key,
+            &self.module,
+            &self.block_scopes,
+            &self.loop_values,
+            expr,
+        );
+        let super::path_eval::Value::Str(path) = value else {
+            return None;
+        };
+        if has_unresolved_segment(&path) {
+            // Only an unknown whole is no better than the expression's text.
+            if path.trim_start_matches('/').starts_with("<unresolved:")
+                && !path.trim_start_matches('/').contains('/')
+            {
+                return None;
+            }
+            self.warnings.push(format!(
+                "{}:{}: path `{}` is partly resolved, as `{}`",
+                self.file.display(),
+                line,
+                expression_text(expr),
+                path
+            ));
+        }
+        Some(path)
     }
 
     /// The prefix a builder chain's `web::scope(...)` root and any `.scope(...)`
@@ -1895,6 +1960,11 @@ pub(crate) const SYMBOLIC_SCOPE: &str = "<scope:";
 fn symbolic_scope(path: String) -> String {
     match path.strip_prefix("<unresolved:") {
         Some(text) if super::caller_use::rule_on("R4") => format!("{SYMBOLIC_SCOPE}{text}"),
+        // A partly evaluated prefix (`/v1/<unresolved:mount>`): each unknown
+        // part is symbolic, so two mounts stay apart.
+        _ if super::caller_use::rule_on("R4") && super::path_eval::enabled() => {
+            path.replace("<unresolved:", SYMBOLIC_SCOPE)
+        }
         _ => path,
     }
 }
@@ -1919,6 +1989,15 @@ pub(crate) fn has_unresolved_segment(path: &str) -> bool {
 /// `web::scope(&cfg.base_uri)` wrapping a whole app prefixes every route
 /// alike, so routes under it can still be compared with each other.
 pub(crate) fn has_unresolved_inner_segment(path: &str) -> bool {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    // A path that is one unresolved expression and nothing else is not a
+    // mount prefix: nothing is known of where the route is.
+    if super::path_eval::enabled()
+        && let (Some(only), None) = (segments.next(), segments.next())
+        && only.starts_with("<unresolved:")
+    {
+        return true;
+    }
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .skip(1)

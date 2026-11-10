@@ -121,6 +121,10 @@ pub(crate) struct HandlerIndex<'a> {
     pub(crate) local_types: std::cell::RefCell<HashMap<usize, std::rc::Rc<HashMap<String, Type>>>>,
     /// `const NAME: &str = "..."` items, keyed by crate, module, and name.
     pub(crate) consts: HashMap<(PathBuf, Vec<String>, String), String>,
+    /// Other `const` and `static` items, by the same key, with the
+    /// expression that gives their value (`Routes::new()`), for path
+    /// evaluation.
+    pub(crate) const_exprs: HashMap<(PathBuf, Vec<String>, String), &'a syn::Expr>,
     pub(crate) by_name: HashMap<String, Vec<usize>>,
     pub(crate) scopes: HashMap<ModuleKey, ModuleScope>,
     pub(crate) modules: HashSet<ModuleKey>,
@@ -567,7 +571,18 @@ impl<'a> HandlerIndex<'a> {
                             ),
                             value.value(),
                         );
+                    } else {
+                        self.const_exprs.insert(
+                            (crate_key.to_path_buf(), module.clone(), item_const.ident.to_string()),
+                            &item_const.expr,
+                        );
                     }
+                }
+                Item::Static(item_static) => {
+                    self.const_exprs.insert(
+                        (crate_key.to_path_buf(), module.clone(), item_static.ident.to_string()),
+                        &item_static.expr,
+                    );
                 }
                 Item::Use(item_use) => {
                     let scope = self
@@ -617,12 +632,46 @@ impl<'a> HandlerIndex<'a> {
         module: &[String],
         segments: &[String],
     ) -> Option<String> {
+        self.resolve_const_with(crate_key, module, segments, |key| self.consts.get(key).cloned())
+    }
+
+    /// The `const` or `static` item `segments` names, as written in
+    /// `module`, whose value is an expression: the module that defines it
+    /// and that expression.
+    pub(crate) fn resolve_const_expr(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        segments: &[String],
+    ) -> Option<(ModuleKey, &'a syn::Expr)> {
+        self.resolve_const_with(crate_key, module, segments, |key| {
+            self.const_exprs
+                .get(key)
+                .map(|expr| ((key.0.clone(), key.1.clone()), *expr))
+        })
+    }
+
+    fn resolve_const_with<T>(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        segments: &[String],
+        get: impl Fn(&(PathBuf, Vec<String>, String)) -> Option<T>,
+    ) -> Option<T> {
         let (name, qualifier) = segments.split_last()?;
-        let lookup = |(crate_key, module): &ModuleKey| {
-            self.consts
-                .get(&(crate_key.clone(), module.clone(), name.clone()))
-                .cloned()
-        };
+        if super::path_eval::enabled() {
+            let start = if qualifier.is_empty() {
+                (crate_key.to_path_buf(), module.to_vec())
+            } else {
+                let qualifier = UsePath {
+                    segments: qualifier.to_vec(),
+                    leading_colon: false,
+                };
+                self.resolve_module(crate_key, module, &qualifier, 0)?
+            };
+            return self.const_in(&start, name, &get, 0);
+        }
+        let lookup = |(crate_key, module): &ModuleKey| get(&(crate_key.clone(), module.clone(), name.clone()));
         if !qualifier.is_empty() {
             let qualifier = UsePath {
                 segments: qualifier.to_vec(),
@@ -642,6 +691,34 @@ impl<'a> HandlerIndex<'a> {
             leading_colon: import.leading_colon,
         };
         lookup(&self.resolve_module(crate_key, module, &prefix, 0)?)
+    }
+
+    /// The constant `name` as seen in `module`: defined there, or brought
+    /// in by one `use`, followed through re-exports and renames
+    /// (`pub use api::ROUTES as API_ROUTES`).
+    fn const_in<T>(
+        &self,
+        (crate_key, module): &ModuleKey,
+        name: &str,
+        get: &impl Fn(&(PathBuf, Vec<String>, String)) -> Option<T>,
+        depth: usize,
+    ) -> Option<T> {
+        if depth > MAX_RESOLUTION_DEPTH {
+            return None;
+        }
+        if let Some(value) = get(&(crate_key.clone(), module.clone(), name.to_owned())) {
+            return Some(value);
+        }
+        let [import] = self.scope(crate_key, module)?.imports.get(name)?.as_slice() else {
+            return None;
+        };
+        let (original, prefix) = import.segments.split_last()?;
+        let prefix = UsePath {
+            segments: prefix.to_vec(),
+            leading_colon: import.leading_colon,
+        };
+        let target = self.resolve_module(crate_key, module, &prefix, 0)?;
+        self.const_in(&target, original, get, depth + 1)
     }
 
     /// The top-level function `name` defined directly in `module`, if exactly one is.

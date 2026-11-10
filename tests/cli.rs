@@ -141,3 +141,19 @@ fn the_nested_extractor_round_has_switches() {
     assert_eq!(check(&[]), "takes the caller: `Operator`");
     assert_eq!(check(&[("ARCHER_P12", "0")]), "takes the caller: `Stock`");
 }
+
+#[test]
+fn the_built_paths_round_has_a_switch() {
+    let fixture = "tests/fixtures/probes/drift/f64_built_paths.rs";
+    let on = findings_with(fixture, &[]);
+    let off = findings_with(fixture, &[("ARCHER_P7", "0")]);
+    assert!(on.iter().any(|line| line == "High POST /v2/{book}/entries/{entry:[0-9]{1,8}}/merge"), "on: {on:?}");
+    assert!(off.iter().all(|line| !line.contains("/v2/")), "off: {off:?}");
+    let output = Command::new(env!("CARGO_BIN_EXE_archer"))
+        .arg(fixture)
+        .output()
+        .expect("archer runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Paths: 11 of 15 routes have fully resolved paths"), "{text}");
+    assert!(text.contains("  unresolved: "), "{text}");
+}
