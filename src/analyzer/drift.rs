@@ -483,7 +483,53 @@ pub(crate) fn build_analysis_layers_full(
             let Some((category, group, key, id)) = mismatch else {
                 continue;
             };
+            // P13: permissions dispatched through a type argument are one
+            // constant per action; see `dispatch::difference`.
+            let dispatched = if category == FindingCategory::DifferentAuthorization {
+                super::dispatch::difference(route)
+            } else {
+                None
+            };
+            if matches!(dispatched, Some(super::dispatch::Difference::OwnAction)) {
+                continue;
+            }
             let mut reported = finding(route, category, expected, group, key, id, options);
+            // P13: a requirement of a group that pools several namespaces
+            // (a scope tree, a version root, the whole app) must be named
+            // by routes of at least two resources. Named by one resource
+            // only, it is that resource's rule, not the group's.
+            if category == FindingCategory::DifferentAuthorization
+                && super::p13::enabled("SPREAD")
+                && matches!(key.level, GroupLevel::Subtree | GroupLevel::Version | GroupLevel::App)
+                && let Some(required) = &group.dominant_requirement
+            {
+                let mut naming: Vec<String> = group
+                    .peers
+                    .iter()
+                    .filter(|peer| route_identity(peer) != route_identity(route))
+                    .filter(|peer| peer.privilege_requirements().contains(&required.as_str()))
+                    .map(|peer| placement(peer).resource.trim_end_matches("/{}").to_string())
+                    .collect();
+                naming.sort();
+                naming.dedup();
+                if let [only] = naming.as_slice() {
+                    reported.severity = Severity::Low;
+                    reported.rationale.push_str(&format!(
+                        " Only the routes of {only} name `{required}`, so it is that resource's requirement and weak support for the rest of {}.",
+                        key.prefix
+                    ));
+                }
+            }
+            match dispatched {
+                Some(super::dispatch::Difference::ReadOnWrite(note)) => {
+                    reported.rationale.push_str(&note);
+                }
+                Some(super::dispatch::Difference::Elsewhere(note)) => {
+                    reported.severity = Severity::Low;
+                    reported.rationale.push_str(&note);
+                }
+                _ => {}
+            }
             if category == FindingCategory::WeakerAuthorization {
                 let mut extra: Vec<String> = refused_roles(route, &requirement, group, options);
                 if extra.is_empty() {
@@ -544,6 +590,7 @@ pub(crate) fn build_analysis_layers_full(
     super::peer_checks::skipped_peer_checks(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     super::auth_objects::unscoped_objects(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     super::roles::delete_admits_more(routes, &mut peer_groups, &mut invariants, &mut finding_details);
+    super::dispatch::writes_with_read_permission(routes, &mut peer_groups, &mut invariants, &mut finding_details);
     per_route_permissions(routes, &mut finding_details);
     for fallback in fallback_details {
         let route = &fallback.suspicious_route;
@@ -575,8 +622,74 @@ pub(crate) fn build_analysis_layers_full(
             format!("{detail}; no routes are linked to it by shared data"),
         ));
     }
+    consistent_resources(routes, &peer_groups, &mut finding_details);
     let findings = finding_details.iter().map(format_finding).collect();
     (peer_groups, invariants, finding_details, findings, unjudged)
+}
+
+/// P13: a route that identifies the caller, judged against a group wider
+/// than its resource, when every other route of that resource (at least
+/// two, of any method) stops at the same tier as it does. The resource is
+/// consistent in itself (a self-service resource such as the caller's own
+/// preferences inside a permissioned API), so what the wider group requires
+/// is weak support: the finding is kept, at Low, with the reason.
+fn consistent_resources(routes: &[Route], peer_groups: &[PeerGroup], finding_details: &mut [Finding]) {
+    if !super::p13::enabled("AGREES") {
+        return;
+    }
+    let unique = unique_routes(routes.iter());
+    let collection = |route: &Route| placement(route).resource.trim_end_matches("/{}").to_string();
+    for finding in finding_details.iter_mut() {
+        if finding.severity == Severity::Low
+            || !matches!(
+                finding.category,
+                FindingCategory::MissingAuthorization | FindingCategory::WeakerAuthorization
+            )
+            || finding.suspicious_route_tier < EvidenceTier::Identity
+        {
+            continue;
+        }
+        let wider = peer_groups
+            .iter()
+            .find(|group| group.id == finding.peer_group_id)
+            .is_some_and(|group| {
+                matches!(
+                    group.level,
+                    GroupLevel::Namespace | GroupLevel::Subtree | GroupLevel::Version | GroupLevel::App
+                )
+            });
+        if !wider {
+            continue;
+        }
+        let suspicious = &finding.suspicious_route;
+        let Some(route) = unique.iter().find(|route| {
+            route.method == suspicious.method
+                && route.path == suspicious.path
+                && route.handler == suspicious.handler
+        }) else {
+            continue;
+        };
+        let own = collection(route);
+        // The group it was judged in must reach beyond the resource.
+        let mates: Vec<&&Route> = unique
+            .iter()
+            .filter(|other| route_identity(other) != route_identity(route) && collection(other) == own)
+            .collect();
+        if mates.len() < 2 || !mates.iter().all(|mate| mate.best_tier() == finding.suspicious_route_tier) {
+            continue;
+        }
+        finding.severity = Severity::Low;
+        finding.rationale.push_str(&format!(
+            " Every other route of {own} stops at {} too ({}), so the resource is consistent in itself and only the wider group asks for more.",
+            finding.suspicious_route_tier,
+            mates
+                .iter()
+                .take(4)
+                .map(|mate| format!("{} {}", mate.method, mate.path))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 }
 
 /// Whether a route's peers hold the caller to a value of the request path
@@ -1126,6 +1239,8 @@ pub(crate) fn infer_prototype_drift(routes: &[Route]) -> Vec<String> {
 pub(crate) struct Placement {
     pub(crate) namespace: String,
     pub(crate) resource: String,
+    /// P13: see `GroupKey::app`.
+    pub(crate) app: usize,
     pub(crate) class: MethodClass,
     /// The route's leading generic segments (`/api/v1`), if any.
     pub(crate) version: Option<String>,
@@ -1135,6 +1250,7 @@ impl Placement {
     pub(crate) fn key(&self, level: GroupLevel) -> GroupKey {
         GroupKey {
             level,
+            app: self.app,
             prefix: match level {
                 GroupLevel::Resource => self.resource.clone(),
                 GroupLevel::Namespace
@@ -1153,6 +1269,7 @@ impl Placement {
     fn subtree_key(&self, prefix: String) -> GroupKey {
         GroupKey {
             level: GroupLevel::Subtree,
+            app: self.app,
             prefix,
             class: self.class,
         }
@@ -1191,12 +1308,14 @@ impl Placement {
         {
             keys.push(GroupKey {
                 level: GroupLevel::Version,
+                app: self.app,
                 prefix: version.clone(),
                 class: self.class,
             });
         }
         keys.push(GroupKey {
             level: GroupLevel::App,
+            app: self.app,
             prefix: "/".into(),
             class: self.class,
         });
@@ -1220,6 +1339,9 @@ fn fallback_key(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GroupKey {
     pub(crate) level: GroupLevel,
+    /// P13: which application of the scanned code the group belongs to;
+    /// 0 is the one with the most routes.
+    pub(crate) app: usize,
     pub(crate) prefix: String,
     pub(crate) class: MethodClass,
 }
@@ -2023,9 +2145,40 @@ pub(crate) fn placement(route: &Route) -> Placement {
     Placement {
         namespace: prefix(namespace_length),
         resource: prefix(resource_length),
+        app: app_index(route),
         class: MethodClass::of(&route.method),
         version: (generic > 0 && generic < segments.len()).then(|| prefix(generic)),
     }
+}
+
+thread_local! {
+    /// P13: the `App::new()` sites of the scanned code that register
+    /// routes, the one with the most routes first.
+    static APPS: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records which `App` each route was registered under. Routes of
+/// different `App`s are served by different servers (the API beside a
+/// health-probe server on its own port) and are never peers. Routes that
+/// no `App::new()` encloses form one application of their own.
+pub(crate) fn index_apps(routes: &[Route]) {
+    let mut counts: Vec<(Option<String>, usize)> = Vec::new();
+    if super::p13::enabled("APPS") {
+        for route in unique_routes(routes.iter()) {
+            match counts.iter_mut().find(|(app, _)| *app == route.origin.app) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((route.origin.app.clone(), 1)),
+            }
+        }
+    }
+    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    APPS.with(|apps| *apps.borrow_mut() = counts.into_iter().map(|(app, _)| app).collect());
+}
+
+fn app_index(route: &Route) -> usize {
+    APPS.with(|apps| {
+        apps.borrow().iter().position(|app| *app == route.origin.app).unwrap_or(0)
+    })
 }
 
 /// A path without its leading `<unresolved:..>` mount segment, if any.

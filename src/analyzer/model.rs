@@ -240,6 +240,15 @@ pub(crate) struct RouteOrigin {
     pub(crate) called: Vec<String>,
     /// Its handler takes a request body with a credential field.
     pub(crate) takes_credentials: bool,
+    /// P13: its handler takes the raw request or a header, cookie or
+    /// session extractor, so it can read a credential by itself.
+    pub(crate) sees_request: bool,
+    /// P13: registered on an `App` that is built but never served (one
+    /// built only to produce the OpenAPI document).
+    pub(crate) unserved: bool,
+    /// P13: the `App::new()` the route was registered under, as
+    /// `file:line:column`; `None` when no `App` constructor encloses it.
+    pub(crate) app: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

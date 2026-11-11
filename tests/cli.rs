@@ -203,3 +203,48 @@ fn the_associated_handlers_round_has_a_switch() {
     assert_eq!(resolutions(&[]), ["Qualified"]);
     assert_eq!(resolutions(&[("ARCHER_P9", "0")]), ["Unresolved"]);
 }
+
+#[test]
+fn the_known_issues_round_has_switches() {
+    let run = |fixture: &str, switches: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_archer"));
+        command.args(["--json", fixture]);
+        for (name, value) in switches {
+            command.env(name, value);
+        }
+        let output = command.output().expect("archer runs");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+        let routes = report["routes"].as_array().expect("routes").len();
+        let mut findings: Vec<String> = report["finding_details"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{} {} {}",
+                    finding["severity"].as_str().unwrap_or_default(),
+                    finding["suspicious_route"]["method"].as_str().unwrap_or_default(),
+                    finding["suspicious_route"]["path"].as_str().unwrap_or_default()
+                )
+            })
+            .collect();
+        findings.sort();
+        (routes, findings)
+    };
+    // Unserved apps: the spec builder and the test app repeat the routes.
+    let fixture = "tests/fixtures/probes/drift/f69_unserved_and_separate_apps.rs";
+    assert_eq!(run(fixture, &[]).0, 7);
+    assert_eq!(run(fixture, &[("ARCHER_P13", "0")]).0, 15);
+    assert_eq!(run(fixture, &[("ARCHER_P13_SPEC", "0")]).0, 15);
+    // The app-wide caller rule alone.
+    let fixture = "tests/fixtures/probes/drift/f71_app_wide_caller.rs";
+    let medium = "Medium POST /imports/rules".to_string();
+    assert!(run(fixture, &[]).1.contains(&medium));
+    assert!(!run(fixture, &[("ARCHER_P13_APPWIDE", "0")]).1.contains(&medium));
+    assert!(!run(fixture, &[("ARCHER_P13", "0")]).1.contains(&medium));
+    // Dispatched permissions: without the round the gate is not a check.
+    let fixture = "tests/fixtures/probes/drift/f68_dispatched_permissions.rs";
+    let weaker = "Medium DELETE /books/{id}".to_string();
+    assert!(run(fixture, &[]).1.contains(&weaker));
+    assert!(!run(fixture, &[("ARCHER_P13_DISPATCH", "0")]).1.contains(&weaker));
+}

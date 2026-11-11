@@ -850,6 +850,12 @@ impl<'ast> Visit<'ast> for Rejects {
     }
 }
 
+/// Whether a block can end the request with an error: `?`, `return`,
+/// `Err(..)` or `bail!`, anywhere in it.
+pub(crate) fn block_rejects(block: &Block) -> bool {
+    rejects_block(block)
+}
+
 fn rejects_block(block: &Block) -> bool {
     let mut rejects = Rejects::default();
     rejects.visit_block(block);

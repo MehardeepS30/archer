@@ -76,6 +76,9 @@ struct State {
     unauthenticated: HashSet<(String, String)>,
     /// Mapped to 403.
     forbidding: HashSet<(String, String)>,
+    /// P13: mapped to 409 or 412, a conflict with the stored state (a
+    /// stale revision or ETag), not a refusal of the caller.
+    conflict: HashSet<(String, String)>,
 }
 
 thread_local! {
@@ -115,6 +118,14 @@ fn variant_in(set: &HashSet<(String, String)>, path: &str) -> bool {
 /// `AppError::Unauthorized` when the crate's `ResponseError` maps it to 401.
 pub(crate) fn unauthenticated_variant(path: &str) -> bool {
     enabled() && STATE.with(|state| variant_in(&state.borrow().unauthenticated, path))
+}
+
+/// P13: `Error::MidAirCollision` when the crate's `ResponseError` maps it
+/// to 409 Conflict or 412 Precondition Failed.
+pub(crate) fn conflict_variant(path: &str) -> bool {
+    enabled()
+        && super::p13::enabled("CONFLICT")
+        && STATE.with(|state| variant_in(&state.borrow().conflict, path))
 }
 
 pub(crate) fn forbidding_variant(path: &str) -> bool {
@@ -378,11 +389,32 @@ fn status_of(body: &Expr) -> (bool, bool) {
 struct StatusArms {
     unauthenticated: HashSet<(String, String)>,
     forbidding: HashSet<(String, String)>,
+    conflict: HashSet<(String, String)>,
+}
+
+/// Whether an arm body answers 409 or 412.
+fn conflict_status(body: &Expr) -> bool {
+    let written = quote::ToTokens::to_token_stream(body).to_string();
+    ["PRECONDITION_FAILED", "PreconditionFailed ()", "ErrorPreconditionFailed", "CONFLICT", "Conflict ()", "ErrorConflict"]
+        .iter()
+        .any(|status| written.contains(status))
 }
 
 impl<'ast> Visit<'ast> for StatusArms {
     fn visit_arm(&mut self, node: &'ast syn::Arm) {
         let (unauthorized, forbidden) = status_of(&node.body);
+        if !unauthorized && !forbidden && conflict_status(&node.body) {
+            let mut paths = PatPaths::default();
+            paths.visit_pat(&node.pat);
+            for path in paths.0 {
+                if let [.., ty, variant] = path.as_slice() {
+                    self.conflict.insert((ty.clone(), variant.clone()));
+                }
+                if let Some(variant) = path.last() {
+                    self.conflict.insert((String::new(), variant.clone()));
+                }
+            }
+        }
         if unauthorized || forbidden {
             let mut paths = PatPaths::default();
             paths.visit_pat(&node.pat);
@@ -698,6 +730,7 @@ pub(crate) fn index<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File
             rejecting,
             unauthenticated: arms.unauthenticated,
             forbidding: arms.forbidding,
+            conflict: arms.conflict,
         }
     });
 }

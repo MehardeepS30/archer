@@ -97,6 +97,10 @@ pub(crate) struct RouteVisitor<'a> {
     /// The type of the `impl` block being visited, so that `Self::users`
     /// names `Type::users` (P9).
     pub(crate) self_type: Option<String>,
+    /// P13: inside an `App` built only for its OpenAPI document.
+    pub(crate) unserved: usize,
+    /// P13: the outermost `App::new()` chain being visited.
+    pub(crate) app: Option<String>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -107,6 +111,8 @@ pub(crate) struct Registration {
     /// Guard and middleware evidence of the registering scope and its parents.
     pub(crate) inherited: Vec<AuthEvidence>,
     pub(crate) enclosing: Option<usize>,
+    pub(crate) unserved: bool,
+    pub(crate) app: Option<String>,
 }
 
 impl<'a> RouteVisitor<'a> {
@@ -140,6 +146,8 @@ impl<'a> RouteVisitor<'a> {
             route_sites: std::collections::BTreeMap::new(),
             read_lines: HashSet::new(),
             self_type: None,
+            unserved: 0,
+            app: None,
         }
     }
 
@@ -177,6 +185,13 @@ impl<'a> RouteVisitor<'a> {
     /// if it starts from one: `admin.route(..)` for `let admin =
     /// web::scope("/admin").wrap(G);` becomes `web::scope("/admin").wrap(G).route(..)`.
     pub(crate) fn substituted(&self, expr: &Expr) -> Option<Expr> {
+        // P13: a chain that starts from a project function returning a
+        // builder, `members().route(..)` with `fn members() -> Scope {
+        // web::scope("/members").wrap(Auth) }`, is read as if the returned
+        // builder were written in place.
+        if let Some(builder) = helper_builder(chain_root_expr(expr)) {
+            return Some(substitute_root(expr, &builder));
+        }
         let Expr::Path(path) = chain_root_expr(expr) else {
             return None;
         };
@@ -449,6 +464,8 @@ impl<'a> RouteVisitor<'a> {
             prefix: self.scope_context.clone(),
             inherited: self.inherited_evidence(),
             enclosing: self.enclosing,
+            unserved: self.unserved > 0,
+            app: self.app.clone(),
         });
     }
 
@@ -599,6 +616,9 @@ impl<'a> RouteVisitor<'a> {
                     definition: resolved_definition,
                     called: Vec::new(),
                     takes_credentials: false,
+                    sees_request: false,
+                    unserved: self.unserved > 0,
+                    app: self.app.clone(),
                 },
             });
         }
@@ -675,7 +695,16 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         {
             self.expand_configure(definition);
         }
+        // P13: `test::init_service(App::new()..)` builds an app for a test
+        // of the scanned code, wherever the test lives.
+        let test_app = super::p13::enabled("SPEC") && is_test_service(&node.func);
+        if test_app {
+            self.unserved += 1;
+        }
         visit::visit_expr_call(self, node);
+        if test_app {
+            self.unserved -= 1;
+        }
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
@@ -879,11 +908,26 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         // and in scopes nested under it, receives them.
         let root = chain_root(node);
         let starts_chain = self.chain_scopes.last().map(|(chain, _)| *chain) != Some(root);
+        let mut enters_app = false;
         if starts_chain {
             let resolved = self.resolve_call(node);
             let evidence =
                 chain_configuration_evidence(resolved.as_ref().unwrap_or(node), &self.file);
             self.chain_scopes.push((root, evidence));
+            // P13: routes registered under one `App::new()` belong to one
+            // application; a second `App` (a health-probe server on its own
+            // port) is another.
+            if self.app.is_none() && super::p13::enabled("APPS") {
+                let mut start = &*resolved.as_ref().unwrap_or(node).receiver;
+                while let Expr::MethodCall(receiver) = start {
+                    start = &receiver.receiver;
+                }
+                if is_app_constructor(start) {
+                    let (line, column) = span_position(start.span());
+                    self.app = Some(format!("{}:{line}:{column}", self.file.display()));
+                    enters_app = true;
+                }
+            }
         }
 
         // `.default_service(web::route().to(not_found))`: the fallback for
@@ -927,7 +971,83 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
         if starts_chain {
             self.chain_scopes.pop();
         }
+        if enters_app {
+            self.app = None;
+        }
     }
+
+    /// P13: `let (_, api) = App::new().into_utoipa_app()...split_for_parts();`
+    /// builds an `App` for its OpenAPI document and drops the `App`: routes
+    /// registered there are not served from this place.
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let spec_only = super::p13::enabled("SPEC") && discards_app(node);
+        if spec_only {
+            self.unserved += 1;
+        }
+        visit::visit_local(self, node);
+        if spec_only {
+            self.unserved -= 1;
+        }
+    }
+}
+
+/// actix-web's test entry points: `test::init_service`,
+/// `test::try_init_service`, and `actix_test::start`/`start_with`.
+fn is_test_service(func: &Expr) -> bool {
+    let Expr::Path(path) = func else {
+        return false;
+    };
+    let segments: Vec<String> =
+        path.path.segments.iter().map(|segment| segment.ident.to_string()).collect();
+    match segments.as_slice() {
+        [.., last] if last == "init_service" || last == "try_init_service" => true,
+        [.., module, last] => {
+            (module == "actix_test" || module == "test") && (last == "start" || last == "start_with")
+        }
+        _ => false,
+    }
+}
+
+/// `App::new()`.
+fn is_app_constructor(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let segments: Vec<String> =
+        path.path.segments.iter().map(|segment| segment.ident.to_string()).collect();
+    matches!(segments.as_slice(), [.., owner, new] if owner == "App" && new == "new")
+}
+
+/// Whether a `let` splits an app into `(App, OpenApi)` and binds the `App`
+/// part to `_`.
+fn discards_app(local: &syn::Local) -> bool {
+    let mut pat = &local.pat;
+    if let Pat::Type(typed) = pat {
+        pat = &typed.pat;
+    }
+    let Pat::Tuple(tuple) = pat else {
+        return false;
+    };
+    if !matches!(tuple.elems.first(), Some(Pat::Wild(_))) {
+        return false;
+    }
+    let Some(init) = &local.init else {
+        return false;
+    };
+    let mut expr = &*init.expr;
+    loop {
+        match expr {
+            Expr::Paren(paren) => expr = &paren.expr,
+            Expr::Group(group) => expr = &group.expr,
+            Expr::Await(awaited) => expr = &awaited.base,
+            Expr::Try(tried) => expr = &tried.expr,
+            _ => break,
+        }
+    }
+    matches!(expr, Expr::MethodCall(call) if call.method == "split_for_parts")
 }
 
 impl RouteVisitor<'_> {
@@ -1048,6 +1168,9 @@ impl RouteVisitor<'_> {
                     definition,
                     called: Vec::new(),
                     takes_credentials: false,
+                    sees_request: false,
+                    unserved: false,
+                    app: None,
                 },
             });
         }
@@ -1468,6 +1591,22 @@ pub(crate) fn configuration_call_evidence(
             AuthStrength::Medium,
         )
     } else {
+        // P13: a closure applied to the builder, `scope.map(|s| s.wrap(M))`:
+        // the calls it makes on its own parameter are part of the chain.
+        if super::p13::enabled("CLOSURES") {
+            for arg in &method.args {
+                if let Some(chain) = closure_builder_chain(arg) {
+                    let mut call = chain;
+                    loop {
+                        configuration_call_evidence(call, file, handler, evidence);
+                        match &*call.receiver {
+                            Expr::MethodCall(receiver) => call = receiver,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
         // An application's own builder extension on a route or scope:
         // `web::post().to(h).authorize(Action::PutAlert)`. Named as a check,
         // it wraps the route in that check.
@@ -1543,7 +1682,12 @@ pub(crate) fn configuration_call_evidence(
             if found.is_empty() {
                 continue;
             }
-            if found.iter().any(|found| found.kind != AuthEvidenceKind::Unknown) {
+            // P13: a helper returning middleware enabled only by
+            // configuration keeps that reading.
+            let conditional = found.iter().any(|found| {
+                found.symbol.as_deref().is_some_and(|symbol| symbol.contains("(conditional "))
+            }) && super::p13::enabled("CONDITIONAL");
+            if conditional || found.iter().any(|found| found.kind != AuthEvidenceKind::Unknown) {
                 let written = arg.to_token_stream().to_string().replace(' ', "");
                 for found in found.iter_mut() {
                     found.line = arg.span().start().line;
@@ -1552,6 +1696,29 @@ pub(crate) fn configuration_call_evidence(
                 continue;
             }
             evidence.truncate(start);
+        }
+        // P13: authentication or authorization middleware enabled only by
+        // configuration (`Condition::from_option(auth.map(..))`,
+        // `Condition::new(flag, Auth)`): whether it runs is decided at
+        // runtime, so it is recorded as protection Archer cannot evaluate,
+        // not as protection.
+        if method.method != "guard"
+            && super::p13::enabled("CONDITIONAL")
+            && is_conditional_component(arg)
+            && let Some((_, identifier)) = route_configuration_name_in_expr(arg)
+        {
+            evidence.push(AuthEvidence {
+                kind: AuthEvidenceKind::Unknown,
+                mechanism: format!("{}, enabled only by configuration", identifier.name),
+                symbol: Some(format!(".{}(conditional {})", method.method, identifier.name)),
+                file: file.to_path_buf(),
+                line: arg.span().start().line,
+                handler: handler.map(str::to_owned),
+                strength: AuthStrength::Weak,
+                requirements: Vec::new(),
+                name_based: false,
+            });
+            continue;
         }
         let Some((class, identifier)) = route_configuration_name_in_expr(arg) else {
             // Neither authorization, authentication, nor a known harmless
@@ -1908,6 +2075,10 @@ impl RouteVisitor<'_> {
                         None => String::new(),
                     };
                 }
+                Expr::Call(_) if helper_builder(expr).is_some() => {
+                    let builder = helper_builder(expr).expect("checked above");
+                    break self.scope_prefix(&builder);
+                }
                 Expr::Path(path) => {
                     let builder = path
                         .path
@@ -2063,6 +2234,38 @@ pub(crate) fn has_unresolved_inner_segment(path: &str) -> bool {
 /// What a closure passed as middleware or a guard checks, from the words it
 /// uses: a role or permission, else the caller's credentials. `None` when
 /// the argument holds no closure or the closure names neither.
+/// The method chain a one-parameter closure builds on its parameter:
+/// `|scope| scope.wrap(A).wrap(B)` gives the `.wrap(B)` call. `None` for any
+/// other closure.
+fn closure_builder_chain(expr: &Expr) -> Option<&ExprMethodCall> {
+    let Expr::Closure(closure) = expr else {
+        return None;
+    };
+    if closure.inputs.len() != 1 {
+        return None;
+    }
+    let parameter = simple_binding(closure.inputs.first()?)?;
+    let mut body = &*closure.body;
+    loop {
+        match body {
+            Expr::Block(block) => match block.block.stmts.as_slice() {
+                [Stmt::Expr(expr, None)] => body = expr,
+                _ => return None,
+            },
+            Expr::Paren(paren) => body = &paren.expr,
+            Expr::Group(group) => body = &group.expr,
+            _ => break,
+        }
+    }
+    let Expr::MethodCall(chain) = body else {
+        return None;
+    };
+    match chain_root_expr(body) {
+        Expr::Path(path) if path.path.is_ident(&parameter) => Some(chain),
+        _ => None,
+    }
+}
+
 fn closure_check(expr: &Expr) -> Option<(AuthEvidenceKind, Vec<String>)> {
     const PRIVILEGE: [&str; 6] = ["admin", "admins", "role", "roles", "permission", "permissions"];
     const CREDENTIAL: [&str; 11] = [
@@ -2321,6 +2524,8 @@ pub(crate) fn apply_registrations(
             let mut registered = route.clone();
             registered.path = join_paths(&registration.prefix, &attribute_path);
             registered.scope_prefix = registration.prefix.clone();
+            registered.origin.unserved = registration.unserved;
+            registered.origin.app = registration.app.clone();
             add_inherited_evidence(
                 &mut registered.authorization,
                 &registration.inherited,
@@ -2867,7 +3072,9 @@ fn helper_return(arg: &Expr) -> Option<Expr> {
     let Expr::Call(call) = arg else {
         return None;
     };
-    if !call.args.is_empty() {
+    // P13: `new_auth(config)` is read as what it returns too; before, only
+    // a helper called without arguments was.
+    if !call.args.is_empty() && !super::p13::enabled("HELPERS") {
         return None;
     }
     let Expr::Path(function) = &*call.func else {
@@ -2895,6 +3102,25 @@ fn helper_return(arg: &Expr) -> Option<Expr> {
             .all(|(_, tail)| tail.as_ref().is_some_and(|tail| tail.to_token_stream().to_string() == text))
             .then_some(first)
     })
+}
+
+/// The builder a call to a project function returns, when the function's
+/// body is one expression whose chain starts from a builder constructor
+/// (`web::scope(..)`, `App::new()`, ..) or from another such function.
+pub(crate) fn helper_builder(root: &Expr) -> Option<Expr> {
+    if !matches!(root, Expr::Call(_)) || is_builder_constructor(root) || !super::p13::enabled("HELPERS") {
+        return None;
+    }
+    let mut builder = helper_return(root)?;
+    for _ in 0..4 {
+        let inner = chain_root_expr(&builder);
+        if is_builder_constructor(inner) {
+            return Some(builder);
+        }
+        let next = helper_return(inner)?;
+        builder = substitute_root(&builder, &next);
+    }
+    None
 }
 
 /// Whether a called path builds a route or resource: `web::get`,

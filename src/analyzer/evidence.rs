@@ -916,6 +916,26 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
             if DATA_EXTRACTORS.contains(&name.as_str()) {
                 return;
             }
+            // P13: an extractor that dispatches its check to a type
+            // argument (`Require<ReadSbom>`, with `T::enforce(..)?` in its
+            // `from_request`) is a permission check on what that argument's
+            // impl requires.
+            if let Some(requirements) =
+                super::dispatch::gate_requirements(&name, &segment.arguments)
+            {
+                evidence.push(AuthEvidence {
+                    kind: AuthEvidenceKind::PermissionCheck,
+                    mechanism: name,
+                    symbol: Some(ty.to_token_stream().to_string().replace(' ', "")),
+                    file: file.to_path_buf(),
+                    line: ty.span().start().line,
+                    handler: Some(handler.into()),
+                    strength: AuthStrength::Medium,
+                    requirements,
+                    name_based: false,
+                });
+                return;
+            }
             // A policy type argument names the requirement more precisely
             // than the extractor's own body, which only runs the policy.
             if let PathArguments::AngleBracketed(arguments) = &segment.arguments

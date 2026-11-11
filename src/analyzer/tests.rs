@@ -5807,3 +5807,144 @@ fn self_handlers_resolve_inside_their_impl_and_count_in_coverage() {
         report.warnings
     );
 }
+
+fn p13_lines(report: &Report) -> Vec<String> {
+    let mut lines: Vec<String> = report
+        .finding_details
+        .iter()
+        .map(|finding| {
+            format!(
+                "{:?} {:?} {} {}",
+                finding.severity,
+                finding.category,
+                finding.suspicious_route.method,
+                finding.suspicious_route.path
+            )
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[test]
+fn middleware_added_through_closures_helpers_and_conditions_is_read() {
+    let report = drift_fixture(
+        "f67",
+        include_str!("../../tests/fixtures/probes/drift/f67_indirect_middleware.rs"),
+    );
+    let kind = |path: &str| {
+        report
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.authorization.iter().map(|evidence| evidence.kind.clone()).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("no route {path}"))
+    };
+    // `.map(|scope| scope.wrap(..))`, a function returning a wrapped scope,
+    // and `.wrap(bearer("staff"))`.
+    for path in ["/api/a", "/members/list", "/staff/detail"] {
+        assert_eq!(kind(path), [AuthEvidenceKind::IdentityExtraction], "{path}");
+    }
+    // `Condition::from_option(..)`: on or off by configuration.
+    assert_eq!(kind("/opt/x"), [AuthEvidenceKind::Unknown]);
+    let conditional = report.routes.iter().find(|route| route.path == "/opt/x").expect("route");
+    assert!(
+        conditional.authorization[0].mechanism.contains("enabled only by configuration"),
+        "{:?}",
+        conditional.authorization
+    );
+    assert!(kind("/export").is_empty());
+    assert_eq!(
+        p13_lines(&report),
+        [
+            "Low UnverifiedProtection GET /opt/x",
+            "Low UnverifiedProtection GET /opt/y",
+            "Medium InconsistentRegistration GET /export",
+        ]
+    );
+}
+
+#[test]
+fn permission_parameters_of_a_dispatching_extractor_are_compared() {
+    let report = drift_fixture(
+        "f68",
+        include_str!("../../tests/fixtures/probes/drift/f68_dispatched_permissions.rs"),
+    );
+    // `Gate<P>` calls `P::allows(..)` and can reject: a permission check
+    // whose requirement is the constant `P`'s impl names.
+    let delete = report
+        .routes
+        .iter()
+        .find(|route| route.method == "DELETE" && route.path == "/authors/{id}")
+        .expect("route");
+    assert_eq!(delete.authorization[0].kind, AuthEvidenceKind::PermissionCheck);
+    // Each action having its own permission is not a difference; a route
+    // with no gate, and a write holding a read permission, are.
+    assert_eq!(
+        p13_lines(&report),
+        [
+            "High MissingAuthorization GET /books/{id}/export",
+            "Medium WeakerAuthorization DELETE /books/{id}",
+        ]
+    );
+    let weaker = report
+        .finding_details
+        .iter()
+        .find(|finding| finding.category == FindingCategory::WeakerAuthorization)
+        .expect("finding");
+    assert!(weaker.rationale.contains("`read_book`"), "{}", weaker.rationale);
+}
+
+#[test]
+fn apps_that_are_never_served_do_not_add_routes() {
+    let report = drift_fixture(
+        "f69",
+        include_str!("../../tests/fixtures/probes/drift/f69_unserved_and_separate_apps.rs"),
+    );
+    // The OpenAPI builder and the test app register the same handlers
+    // again; only the served registrations are routes.
+    assert_eq!(report.routes.len(), 7);
+    assert!(
+        report.warnings.iter().any(|warning| warning.contains("never served")),
+        "{:?}",
+        report.warnings
+    );
+    // The probe server is its own app: its open routes are not peers of
+    // the API's.
+    assert_eq!(p13_lines(&report), ["High MissingAuthentication GET /api/notes/{id}/export"]);
+}
+
+#[test]
+fn a_stale_revision_error_is_not_a_check_of_the_caller() {
+    let report = drift_fixture(
+        "f70",
+        include_str!("../../tests/fixtures/probes/drift/f70_conflict_branches.rs"),
+    );
+    // `write_setting` only fails with a variant answered with 412, so the
+    // handlers calling it make no check with the caller.
+    for route in &report.routes {
+        assert!(
+            route.caller_use.iter().all(|feature| !feature.starts_with("checks:") && !feature.starts_with("binds:")),
+            "{} {:?}",
+            route.method,
+            route.caller_use
+        );
+    }
+    assert!(report.finding_details.is_empty(), "{:?}", p13_lines(&report));
+}
+
+#[test]
+fn a_write_without_the_caller_every_other_write_takes_is_medium() {
+    let report = drift_fixture(
+        "f71",
+        include_str!("../../tests/fixtures/probes/drift/f71_app_wide_caller.rs"),
+    );
+    // The handler that reads the raw request can authenticate by itself.
+    assert_eq!(
+        p13_lines(&report),
+        [
+            "Low SkipsPeerCheck POST /incoming/hook",
+            "Medium SkipsPeerCheck POST /imports/rules",
+        ]
+    );
+}

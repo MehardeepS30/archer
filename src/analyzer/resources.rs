@@ -30,8 +30,30 @@ pub(crate) fn resource_keys<'a>(
     let handlers: HashSet<usize> = routes.iter().filter_map(|route| route.origin.definition).collect();
     let mut by_definition: HashMap<usize, Vec<String>> = HashMap::new();
     let mut called: HashMap<usize, Vec<String>> = HashMap::new();
+    // P13: two crates of a workspace can each hold `crate::endpoints::delete`.
+    // Those are different handlers, so such a path is told apart by its
+    // crate's directory.
+    let mut crates_by_path: HashMap<String, HashSet<&std::path::Path>> = HashMap::new();
+    if super::p13::enabled("CRATES") {
+        for &definition in &handlers {
+            let target = &index.definitions[definition];
+            crates_by_path.entry(target.rust_path()).or_default().insert(target.crate_key.as_path());
+        }
+    }
     for &definition in &handlers {
-        let mut keys = vec![format!("handler {}", index.definitions[definition].rust_path())];
+        let target = &index.definitions[definition];
+        let path = target.rust_path();
+        let handler_key = if crates_by_path.get(&path).is_some_and(|crates| crates.len() > 1) {
+            let directory = target
+                .crate_key
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("handler {}", path.replacen("crate", &directory, 1))
+        } else {
+            format!("handler {path}")
+        };
+        let mut keys = vec![handler_key];
         let mut data = RequestData::default();
         data.start(&index.items[definition].sig);
         data.visit_block(&index.items[definition].block);

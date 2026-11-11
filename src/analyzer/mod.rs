@@ -3,6 +3,7 @@
 mod auth_objects;
 mod caller_use;
 mod config;
+mod dispatch;
 mod drift;
 mod evidence;
 mod explain;
@@ -12,6 +13,7 @@ mod extractors;
 mod handlers;
 mod macros;
 mod middleware;
+mod p13;
 mod model;
 mod peer_checks;
 mod public;
@@ -153,6 +155,10 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // Before the index, whose evidence uses what extractors check.
     roles::index_role_orders(parsed_files.iter().map(|(_, _, syntax)| syntax));
     structural::index(parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)));
+    dispatch::index(
+        parsed_files.iter().map(|(_, _, syntax)| syntax),
+        &routes::project_macros(parsed_files.iter().map(|(_, _, syntax)| syntax)),
+    );
     extractors::index_extractors(
         parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)),
     );
@@ -242,6 +248,26 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
             unregistered.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
         ));
     }
+    // P13: a registration made on an `App` that is only built for its
+    // OpenAPI document repeats a route the served `App` registers. It is
+    // dropped when the served registration exists, and kept otherwise.
+    if p13::enabled("SPEC") {
+        let served: HashSet<(String, String)> = routes
+            .iter()
+            .filter(|route| !route.origin.unserved)
+            .map(|route| (route.method.clone(), route.path.clone()))
+            .collect();
+        let before = routes.len();
+        routes.retain(|route| {
+            !route.origin.unserved || !served.contains(&(route.method.clone(), route.path.clone()))
+        });
+        if routes.len() < before {
+            warnings.push(format!(
+                "{} route registration(s) made on an `App` that is never served (built only for its OpenAPI document, or passed to `test::init_service`) repeat served routes and are not counted",
+                before - routes.len()
+            ));
+        }
+    }
     // Builder chains are visited outermost call first; report routes in the
     // order they are written.
     routes.sort_by(|a, b| (&a.file, a.origin.position).cmp(&(&b.file, b.origin.position)));
@@ -273,6 +299,18 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         route.resource_keys = keys;
         route.origin.called = called;
         route.origin.takes_credentials = credentials;
+        // P13: whether the handler can see the request's credentials.
+        route.origin.sees_request = route.origin.definition.is_some_and(|definition| {
+            index.items[definition].sig.inputs.iter().any(|input| match input {
+                syn::FnArg::Typed(typed) => {
+                    let written = quote::ToTokens::to_token_stream(&typed.ty).to_string();
+                    ["HttpRequest", "ServiceRequest", "Header", "Session", "Identity", "BearerAuth", "BasicAuth"]
+                        .iter()
+                        .any(|name| written.split(|c: char| !c.is_alphanumeric()).any(|word| word == *name))
+                }
+                syn::FnArg::Receiver(_) => false,
+            })
+        });
     }
     let uses = caller_use::caller_use(
         &index,
@@ -301,6 +339,13 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         })
         .cloned()
         .collect();
+    drift::index_apps(&judged_routes);
+    if std::env::var_os("ARCHER_DEBUG_APPS").is_some() {
+        for route in &judged_routes {
+            eprintln!("app {:?} unserved={} {} {}", route.origin.app, route.origin.unserved, route.method, route.path);
+        }
+    }
+    dispatch::index_usage(&judged_routes);
     let (peer_groups, invariants, mut finding_details, _, mut unjudged) =
         build_analysis_layers_full(&judged_routes, options);
     public::demote_likely_public(&judged_routes, &mut finding_details);

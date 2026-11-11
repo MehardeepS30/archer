@@ -360,6 +360,9 @@ fn expand(
                     definition,
                     called: Vec::new(),
                     takes_credentials: false,
+                    sees_request: false,
+                    unserved: false,
+                    app: None,
                 },
             });
         }

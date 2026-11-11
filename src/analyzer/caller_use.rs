@@ -1181,6 +1181,42 @@ pub(crate) fn block_rejects(block: &syn::Block) -> bool {
 }
 
 impl<'ast> Visit<'ast> for Rejects {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        // P13: `Err(Error::MidAirCollision)`, where the variant answers
+        // 409 or 412: the stored state has moved on (a stale revision),
+        // which says nothing about who the caller is.
+        if let Expr::Path(func) = &*node.func
+            && func.path.segments.last().is_some_and(|last| last.ident == "Err")
+            && let Some(argument) = node.args.first()
+        {
+            let mut value = argument;
+            loop {
+                match value {
+                    Expr::MethodCall(call) => value = &call.receiver,
+                    Expr::Paren(paren) => value = &paren.expr,
+                    Expr::Reference(reference) => value = &reference.expr,
+                    _ => break,
+                }
+            }
+            let path = match value {
+                Expr::Path(path) => Some(&path.path),
+                Expr::Call(call) => match &*call.func {
+                    Expr::Path(path) => Some(&path.path),
+                    _ => None,
+                },
+                Expr::Struct(literal) => Some(&literal.path),
+                _ => None,
+            };
+            if let Some(path) = path {
+                let written: Vec<String> =
+                    path.segments.iter().map(|segment| segment.ident.to_string()).collect();
+                if super::structural::conflict_variant(&written.join("::")) {
+                    return;
+                }
+            }
+        }
+        visit::visit_expr_call(self, node);
+    }
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         let segments: Vec<String> = node
             .path

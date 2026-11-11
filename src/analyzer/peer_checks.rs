@@ -1250,7 +1250,25 @@ pub(crate) fn skipped_peer_checks(
                     })
                 })
         });
-        let severity = if app_wide
+        // P13: a write that takes no caller at all, where the writes of
+        // the whole application take one almost without exception (at
+        // least 10, and 95% of them): the consensus is too wide and too
+        // even to be an accident of pooling. The same exception the
+        // whole-app tier comparison makes for writes (`at_level`). A
+        // handler that takes the raw request, a header, a cookie or a
+        // session can authenticate the caller by itself (a signed webhook
+        // or federation inbox), so it stays Low.
+        let everyone_takes = super::p13::enabled("APPWIDE")
+            && app_wide
+            && !route.origin.sees_request
+            && place.class == MethodClass::Write
+            && route.best_tier() == EvidenceTier::None
+            && top_feature.starts_with("takes:")
+            && top_having.len() >= 10
+            && top_having.len() as f64 >= 0.95 * *top_total as f64;
+        let severity = if everyone_takes && !unknown && own_source.is_none() {
+            Severity::Medium
+        } else if app_wide
             || unknown
             || own_source.is_some()
             || skipped
