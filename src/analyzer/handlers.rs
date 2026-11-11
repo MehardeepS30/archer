@@ -98,6 +98,12 @@ pub(crate) enum Lookup {
     },
 }
 
+/// Whether associated-function handlers (`.to(Handlers::users)`) are
+/// resolved: `ARCHER_P9=0` turns it off.
+pub(crate) fn associated_enabled() -> bool {
+    std::env::var("ARCHER_P9").map_or(true, |value| value != "0")
+}
+
 /// Every free function in the scanned repository, keyed by crate and module
 /// path, together with each module's `use` declarations.
 #[derive(Default)]
@@ -735,6 +741,28 @@ impl<'a> HandlerIndex<'a> {
         matches.next().is_none().then_some(first)
     }
 
+    /// The single function `owner::name` defined in an `impl` block of
+    /// this module.
+    pub(crate) fn associated_in(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        owner: &str,
+        name: &str,
+    ) -> Option<usize> {
+        let mut matches = self
+            .methods
+            .get(&(owner.to_owned(), name.to_owned()))?
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let definition = &self.definitions[index];
+                definition.crate_key == crate_key && definition.module == module
+            });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     /// Like `resolve_handler`, returning the definition's index.
     pub(crate) fn resolve_handler_index(
         &self,
@@ -837,7 +865,11 @@ impl<'a> HandlerIndex<'a> {
             };
             let Some(qualifier_module) = self.resolve_module(crate_key, module, &qualifier_path, 0)
             else {
-                return (None, HandlerResolution::Unresolved);
+                // Not a module: perhaps a type, as in `.to(Handlers::users)` (P9).
+                return match self.resolve_associated(crate_key, module, qualifier, name) {
+                    Some(index) => (Some(index), HandlerResolution::Qualified),
+                    None => (None, HandlerResolution::Unresolved),
+                };
             };
             let mut visited = HashSet::new();
             let lookup =
@@ -884,6 +916,73 @@ impl<'a> HandlerIndex<'a> {
                 }
             }
         }
+    }
+
+    /// The associated function `name` (no receiver) of the type that
+    /// `qualifier` names as seen from `module`: a type defined there,
+    /// `handlers::H`, or `H` brought in by one explicit `use` or by exactly
+    /// one glob import. `Self` is not resolved here.
+    pub(crate) fn resolve_associated(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        qualifier: &[String],
+        name: &str,
+    ) -> Option<usize> {
+        if !associated_enabled() {
+            return None;
+        }
+        let (type_name, prefix) = qualifier.split_last()?;
+        if type_name == "Self" {
+            return None;
+        }
+        let lookup = |(key_crate, key_module): ModuleKey, owner: &str| -> Option<usize> {
+            let candidates: Vec<usize> = self
+                .methods
+                .get(&(owner.to_owned(), name.to_owned()))?
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    let definition = &self.definitions[index];
+                    definition.crate_key == key_crate
+                        && definition.module == key_module
+                        && self.items[index].sig.receiver().is_none()
+                })
+                .collect();
+            match candidates.as_slice() {
+                [index] => Some(*index),
+                _ => None,
+            }
+        };
+        if !prefix.is_empty() {
+            let path = UsePath {
+                segments: prefix.to_vec(),
+                leading_colon: false,
+            };
+            return lookup(self.resolve_module(crate_key, module, &path, 0)?, type_name);
+        }
+        if let Some(found) = lookup((crate_key.to_path_buf(), module.to_vec()), type_name) {
+            return Some(found);
+        }
+        let scope = self.scope(crate_key, module)?;
+        if let Some(imports) = scope.imports.get(type_name) {
+            let [import] = imports.as_slice() else {
+                return None;
+            };
+            let (imported, import_prefix) = import.segments.split_last()?;
+            let path = UsePath {
+                segments: import_prefix.to_vec(),
+                leading_colon: import.leading_colon,
+            };
+            return lookup(self.resolve_module(crate_key, module, &path, 0)?, imported);
+        }
+        let mut found = scope
+            .globs
+            .iter()
+            .filter_map(|glob| self.resolve_module(crate_key, module, glob, 0))
+            .filter_map(|key| lookup(key, type_name));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
     }
 
     pub(crate) fn ambiguous(&self, candidates: Vec<usize>) -> HandlerResolution {

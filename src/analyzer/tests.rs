@@ -2165,7 +2165,6 @@ cfg.route(\"/external\", web::get().to(other_crate::h))
         "/external",
         "/absolute",
         "/explicit-external-import",
-        "/method",
         "/missing",
     ] {
         let route = route_at(&report, path);
@@ -2174,6 +2173,8 @@ cfg.route(\"/external\", web::get().to(other_crate::h))
         assert!(!route.is_authorized(), "{path}");
         assert!(!route.unverified.is_empty(), "{path}");
     }
+    // An associated function of a local type resolves (P9).
+    assert_eq!(resolution(route_at(&report, "/method")), &HandlerResolution::Qualified);
     // A closure handler is analysed in place; this one checks nothing.
     let closure = route_at(&report, "/closure");
     assert_eq!(resolution(closure), &HandlerResolution::Closure);
@@ -5720,4 +5721,89 @@ async fn b(user: web::ReqData<CurrentUser>) -> HttpResponse { HttpResponse::Ok()
             route.authorization
         );
     }
+}
+
+#[test]
+fn handlers_written_as_associated_functions_are_resolved() {
+    let report = drift_fixture(
+        "f41",
+        include_str!("../../tests/fixtures/probes/drift/f41_associated_handlers.rs"),
+    );
+    let route = |path: &str| report.routes.iter().find(|route| route.path == path).unwrap();
+    for (path, written) in [
+        ("/admin/users", "Admin::users"),
+        ("/admin/orders", "admin::Admin::orders"),
+        ("/admin/reports", "Admin::reports"),
+        ("/admin/payments", "Admin::payments"),
+    ] {
+        let found = route(path);
+        assert_eq!(found.handler_path.as_deref(), Some(written), "{path}");
+        assert!(
+            matches!(found.handler_resolution, Some(HandlerResolution::Qualified)),
+            "{path}: {:?}",
+            found.handler_resolution
+        );
+    }
+    assert!(
+        route("/admin/users").authorization.iter().any(|evidence| evidence
+            .symbol
+            .as_deref()
+            .is_some_and(|symbol| symbol.contains("ensure_admin"))),
+        "{:?}",
+        route("/admin/users").authorization
+    );
+    // The bare `audit` is the free function, not `Admin::audit`.
+    assert_eq!(route("/admin/audit").handler_path.as_deref(), Some("audit"));
+    assert!(route("/admin/audit").authorization.is_empty());
+    let mut found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| finding.suspicious_route.path.clone())
+        .collect();
+    found.sort();
+    assert_eq!(found, ["/admin/audit", "/admin/payments"], "{found:?}");
+}
+
+#[test]
+fn self_handlers_resolve_inside_their_impl_and_count_in_coverage() {
+    let report = drift_fixture(
+        "f66",
+        include_str!("../../tests/fixtures/probes/drift/f66_self_handlers.rs"),
+    );
+    // `.configure(Shelf::routes)` expands the associated function once.
+    let shelf: Vec<_> = report
+        .routes
+        .iter()
+        .filter(|route| route.path.starts_with("/shelf"))
+        .map(|route| (route.method.as_str(), route.handler_path.as_deref().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        shelf,
+        [
+            ("GET", "Self::books"),
+            ("GET", "Self::book"),
+            ("PUT", "Self::edit"),
+            ("DELETE", "Self::wipe"),
+        ]
+    );
+    assert!(report.routes.iter().filter(|route| route.path.starts_with("/shelf")).all(
+        |route| matches!(route.handler_resolution, Some(HandlerResolution::Qualified))
+    ));
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.method.clone(), finding.suspicious_route.path.clone()))
+        .collect();
+    assert_eq!(found, [("DELETE".to_string(), "/shelf/books/{id}".to_string())]);
+    // Associated functions with no receiver count as likely handlers; the
+    // unrouted `spare` is reported.
+    assert_eq!(report.coverage.likely_handlers, 5);
+    assert_eq!(report.coverage.routed_handlers, 4);
+    assert!(report.coverage.unrouted_names.contains("spare"));
+    assert!(
+        report.warnings.iter().any(|warning| warning.contains("`Ghost::list`")
+            && warning.contains("`impl` block was not found")),
+        "{:?}",
+        report.warnings
+    );
 }

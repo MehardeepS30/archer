@@ -94,6 +94,9 @@ pub(crate) struct RouteVisitor<'a> {
     pub(crate) route_sites: std::collections::BTreeMap<(usize, usize), String>,
     /// Positions of route-like sites some route was read from.
     pub(crate) read_lines: HashSet<(usize, usize)>,
+    /// The type of the `impl` block being visited, so that `Self::users`
+    /// names `Type::users` (P9).
+    pub(crate) self_type: Option<String>,
 }
 
 /// A `.service(handler)` call naming a function, with the scope it is made in.
@@ -136,7 +139,24 @@ impl<'a> RouteVisitor<'a> {
             field_paths: std::rc::Rc::default(),
             route_sites: std::collections::BTreeMap::new(),
             read_lines: HashSet::new(),
+            self_type: None,
         }
+    }
+
+    /// `Self::name` written inside `impl Type`, as `Type::name` (P9).
+    pub(crate) fn concrete_target(&self, target: &HandlerTarget) -> HandlerTarget {
+        if let HandlerTarget::Path { segments, leading_colon: false } = target
+            && segments.len() == 2
+            && segments[0] == "Self"
+            && let Some(owner) = &self.self_type
+            && crate::analyzer::handlers::associated_enabled()
+        {
+            return HandlerTarget::Path {
+                segments: vec![owner.clone(), segments[1].clone()],
+                leading_colon: false,
+            };
+        }
+        target.clone()
     }
 
     /// The innermost builder bound to `name`, with the index of its block
@@ -292,7 +312,7 @@ impl<'a> RouteVisitor<'a> {
     /// The definition a `.service`/`.configure` argument names, unless it is
     /// a block-local function (which has no index entry).
     pub(crate) fn named_definition(&self, arg: &Expr) -> Option<usize> {
-        let target = handler_target(arg)?;
+        let target = self.concrete_target(&handler_target(arg)?);
         if self.block_local_handler(&target).is_some() {
             return None;
         }
@@ -315,6 +335,7 @@ impl<'a> RouteVisitor<'a> {
         let file = std::mem::replace(&mut self.file, target.file.clone());
         let crate_key = std::mem::replace(&mut self.crate_key, target.crate_key.clone());
         let module = std::mem::replace(&mut self.module, target.module.clone());
+        let self_type = std::mem::replace(&mut self.self_type, target.owner.clone());
         let block_scopes = std::mem::take(&mut self.block_scopes);
         self.expanding.push(definition);
         self.with_locals(signature_bindings(&item.sig), |visitor| {
@@ -322,6 +343,7 @@ impl<'a> RouteVisitor<'a> {
         });
         self.expanding.pop();
         self.block_scopes = block_scopes;
+        self.self_type = self_type;
         self.module = module;
         self.crate_key = crate_key;
         self.file = file;
@@ -491,9 +513,11 @@ impl<'a> RouteVisitor<'a> {
                 Some(Some(evidence)) => (evidence.to_vec(), Some(HandlerResolution::Local)),
                 Some(None) => (Vec::new(), Some(HandlerResolution::Unresolved)),
                 None => {
-                    let (definition, resolution) =
-                        self.index
-                            .resolve_handler_index(&self.crate_key, &self.module, target);
+                    let (definition, resolution) = self.index.resolve_handler_index(
+                        &self.crate_key,
+                        &self.module,
+                        &self.concrete_target(target),
+                    );
                     resolved_definition = definition;
                     (
                         definition.map_or_else(Vec::new, |definition| {
@@ -582,6 +606,16 @@ impl<'a> RouteVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for RouteVisitor<'_> {
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let owner = match &*node.self_ty {
+            syn::Type::Path(path) => path.path.segments.last().map(|segment| segment.ident.to_string()),
+            _ => None,
+        };
+        let previous = std::mem::replace(&mut self.self_type, owner);
+        visit::visit_item_impl(self, node);
+        self.self_type = previous;
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.add_attribute_routes(node);
         let enclosing = self.enclosing;
@@ -599,9 +633,26 @@ impl<'ast> Visit<'ast> for RouteVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        // A route-registering associated function (`Type::routes`) passed
+        // to `.configure(..)` is expanded at the call; its own visit is then
+        // discarded, as for a free function (P9).
+        let enclosing = self.enclosing;
+        if crate::analyzer::handlers::associated_enabled()
+            && self.block_scopes.is_empty()
+            && self.expanding.is_empty()
+            && let Some(owner) = &self.self_type
+        {
+            self.enclosing = self.index.associated_in(
+                &self.crate_key,
+                &self.module,
+                owner,
+                &node.sig.ident.to_string(),
+            );
+        }
         self.with_locals(signature_bindings(&node.sig), |visitor| {
             visit::visit_impl_item_fn(visitor, node)
         });
+        self.enclosing = enclosing;
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {

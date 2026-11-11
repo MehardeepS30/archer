@@ -403,6 +403,36 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
             "{handlers} unrouted handler(s) are named inside macro `{name}`; routes registered by macros are not analyzed"
         ));
     }
+    if handlers::associated_enabled() {
+        let mut missing: Vec<String> = routes
+            .iter()
+            .filter(|route| matches!(route.handler_resolution, Some(HandlerResolution::Unresolved)))
+            .filter_map(|route| {
+                let written = route.handler_path.as_deref()?;
+                let (owner, name) = written.rsplit_once("::")?;
+                let owner = owner.rsplit("::").next().unwrap_or(owner);
+                (owner == "Self" || owner.chars().next().is_some_and(char::is_uppercase)).then(
+                    || {
+                        format!(
+                            "{}:{} `{owner}::{name}`",
+                            route.file.display(),
+                            route.line
+                        )
+                    },
+                )
+            })
+            .collect();
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            let count = missing.len();
+            missing.truncate(5);
+            warnings.push(format!(
+                "{count} route handler(s) name an associated function whose `impl` block was not found among the scanned files, so those routes carry no handler evidence, for example {}",
+                missing.join(", ")
+            ));
+        }
+    }
     if coverage.routed_handlers < coverage.likely_handlers {
         warnings.push(format!(
             "{} of {} functions that look like handlers are not reached by any route, for example {}",
@@ -587,12 +617,20 @@ fn coverage(index: &HandlerIndex, routes: &[Route]) -> Coverage {
         .collect();
     let mut coverage = Coverage::default();
     for (index_position, item) in index.items.iter().enumerate() {
-        if index.definitions[index_position].owner.is_some() || !looks_like_handler(item) {
+        // An associated function with no receiver can be a handler
+        // (`.to(Handlers::users)`, P9); a method cannot.
+        let associated = index.definitions[index_position].owner.is_some();
+        if (associated && (!handlers::associated_enabled() || item.sig.receiver().is_some()))
+            || !looks_like_handler(item)
+        {
             continue;
         }
         coverage.likely_handlers += 1;
         let definition = &index.definitions[index_position];
-        if routed.contains(&index_position) || routed_names.contains(definition.name.as_str()) {
+        // An associated function is routed only through its resolved
+        // definition: its bare name says nothing about its type.
+        let named = !associated && routed_names.contains(definition.name.as_str());
+        if routed.contains(&index_position) || named {
             coverage.routed_handlers += 1;
         } else {
             coverage.unrouted_names.insert(definition.name.clone());

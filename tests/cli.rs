@@ -180,3 +180,26 @@ fn the_structural_signals_round_has_a_switch() {
     assert_eq!(kinds(&[]), "IdentityExtraction");
     assert_eq!(kinds(&[("ARCHER_P8", "0")]), "Unknown");
 }
+
+#[test]
+fn the_associated_handlers_round_has_a_switch() {
+    let fixture = "tests/fixtures/probes/drift/f66_self_handlers.rs";
+    let resolutions = |switches: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_archer"));
+        command.args(["--json", fixture]);
+        for (name, value) in switches {
+            command.env(name, value);
+        }
+        let output = command.output().expect("archer runs");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+        report["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .filter(|route| route["path"] == "/shelf/books")
+            .map(|route| route["handler_resolution"]["kind"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(resolutions(&[]), ["Qualified"]);
+    assert_eq!(resolutions(&[("ARCHER_P9", "0")]), ["Unresolved"]);
+}
