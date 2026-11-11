@@ -277,7 +277,7 @@ impl<'a> RouteVisitor<'a> {
         }
         let index = self.index;
         let target = &index.definitions[definition];
-        let item = index.items[definition];
+        let item = &index.items[definition];
         let file = std::mem::replace(&mut self.file, target.file.clone());
         let crate_key = std::mem::replace(&mut self.crate_key, target.crate_key.clone());
         let module = std::mem::replace(&mut self.module, target.module.clone());

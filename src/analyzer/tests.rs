@@ -4510,3 +4510,35 @@ fn f40_tenant_comparisons_and_membership_helpers_are_object_level_checks() {
         [finding(MissingAuthorization, "DELETE", "/api/projects/{project_id}")]
     );
 }
+
+#[test]
+fn handlers_written_as_associated_functions_are_resolved() {
+    let report = drift_fixture(
+        "f41",
+        include_str!("../../tests/fixtures/probes/drift/f41_associated_handlers.rs"),
+    );
+    let handler = |path: &str| {
+        let route = report.routes.iter().find(|route| route.path == path).unwrap();
+        (route.handler_path.clone(), route.handler_resolution.clone())
+    };
+    for path in ["/admin/users", "/admin/orders", "/admin/reports", "/admin/payments"] {
+        let (handler_path, resolution) = handler(path);
+        let name = path.trim_start_matches("/admin/");
+        assert_eq!(handler_path.as_deref(), Some(format!("crate::admin::Admin::{name}").as_str()), "{path}");
+        assert!(matches!(resolution, Some(HandlerResolution::Qualified)), "{path}: {resolution:?}");
+    }
+    let users = report.routes.iter().find(|route| route.path == "/admin/users").unwrap();
+    assert!(
+        users.authorization.iter().any(|evidence| evidence.symbol.as_deref().is_some_and(|symbol| symbol.contains("ensure_admin"))),
+        "{:?}",
+        users.authorization
+    );
+    // The bare `audit` is the free function, not `Admin::audit`.
+    assert_eq!(handler("/admin/audit").0.as_deref(), Some("crate::audit"));
+    let found: Vec<_> = report
+        .finding_details
+        .iter()
+        .map(|finding| finding.suspicious_route.path.clone())
+        .collect();
+    assert_eq!(found, ["/admin/audit", "/admin/payments"], "{found:?}");
+}

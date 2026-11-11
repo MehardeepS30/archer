@@ -1,6 +1,7 @@
 //! Handler index: every free function in the repository and Rust-style path resolution to it.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
@@ -21,6 +22,9 @@ pub(crate) struct HandlerDefinition {
     pub(crate) crate_key: PathBuf,
     pub(crate) module: Vec<String>,
     pub(crate) name: String,
+    /// The type whose inherent `impl` block defines this associated function
+    /// (`H` for `impl H { async fn users() {} }`); `None` for free functions.
+    pub(crate) owner: Option<String>,
     /// The function's own evidence combined with its helpers'.
     pub(crate) evidence: Vec<AuthEvidence>,
     /// The function's own evidence and calls, before helpers are combined.
@@ -39,6 +43,7 @@ impl HandlerDefinition {
     pub(crate) fn rust_path(&self) -> String {
         std::iter::once("crate")
             .chain(self.module.iter().map(String::as_str))
+            .chain(self.owner.as_deref())
             .chain(std::iter::once(self.name.as_str()))
             .collect::<Vec<_>>()
             .join("::")
@@ -74,11 +79,17 @@ pub(crate) enum Lookup {
 pub(crate) struct HandlerIndex<'a> {
     pub(crate) definitions: Vec<HandlerDefinition>,
     /// The syntax of each definition, parallel to `definitions`, so that
-    /// `.configure(f)` can visit `f`'s body.
-    pub(crate) items: Vec<&'a ItemFn>,
+    /// `.configure(f)` can visit `f`'s body. Associated functions are copied
+    /// into an `ItemFn`, so they are analyzed exactly like free functions.
+    pub(crate) items: Vec<Cow<'a, ItemFn>>,
     /// `const NAME: &str = "..."` items, keyed by crate, module, and name.
     pub(crate) consts: HashMap<(PathBuf, Vec<String>, String), String>,
+    /// Free functions by name. Associated functions are not here: they are
+    /// found only through their type (`H::users`), never by a bare name.
     pub(crate) by_name: HashMap<String, Vec<usize>>,
+    /// Associated functions without a receiver, keyed by crate, module of the
+    /// `impl` block, type name, and function name.
+    pub(crate) associated: HashMap<(PathBuf, Vec<String>, String, String), Vec<usize>>,
     pub(crate) scopes: HashMap<ModuleKey, ModuleScope>,
     pub(crate) modules: HashSet<ModuleKey>,
     pub(crate) file_modules: HashMap<PathBuf, ModuleKey>,
@@ -284,18 +295,48 @@ impl<'a> HandlerIndex<'a> {
                 Item::Fn(function) => {
                     let name = function.sig.ident.to_string();
                     self.by_name
-                        .entry(name.clone())
+                        .entry(name)
                         .or_default()
                         .push(self.definitions.len());
-                    self.items.push(function);
-                    self.definitions.push(HandlerDefinition {
-                        file: file.to_path_buf(),
-                        crate_key: crate_key.to_path_buf(),
-                        module: module.clone(),
-                        name,
-                        evidence: Vec::new(),
-                        own: function_evidence(file, function),
-                    });
+                    self.add_definition(file, crate_key, module, None, Cow::Borrowed(function));
+                }
+                Item::Impl(implementation) if implementation.trait_.is_none() => {
+                    let Some(owner) = impl_owner(&implementation.self_ty) else {
+                        continue;
+                    };
+                    for impl_item in &implementation.items {
+                        let syn::ImplItem::Fn(method) = impl_item else {
+                            continue;
+                        };
+                        // Actix handlers take no receiver: a method with
+                        // `self` cannot be registered as `.to(H::method)`.
+                        if method.sig.receiver().is_some() {
+                            continue;
+                        }
+                        self.associated
+                            .entry((
+                                crate_key.to_path_buf(),
+                                module.clone(),
+                                owner.clone(),
+                                method.sig.ident.to_string(),
+                            ))
+                            .or_default()
+                            .push(self.definitions.len());
+                        let function = ItemFn {
+                            attrs: method.attrs.clone(),
+                            vis: method.vis.clone(),
+                            modifiers: method.modifiers.clone(),
+                            sig: method.sig.clone(),
+                            block: Box::new(method.block.clone()),
+                        };
+                        self.add_definition(
+                            file,
+                            crate_key,
+                            module,
+                            Some(owner.clone()),
+                            Cow::Owned(function),
+                        );
+                    }
                 }
                 Item::Mod(item_mod) => {
                     module.push(item_mod.ident.to_string());
@@ -337,6 +378,83 @@ impl<'a> HandlerIndex<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Adds one function to `definitions` and `items`. Its module is where it
+    /// is written, so calls in its body resolve as Rust resolves them.
+    fn add_definition(
+        &mut self,
+        file: &Path,
+        crate_key: &Path,
+        module: &[String],
+        owner: Option<String>,
+        function: Cow<'a, ItemFn>,
+    ) {
+        self.definitions.push(HandlerDefinition {
+            file: file.to_path_buf(),
+            crate_key: crate_key.to_path_buf(),
+            module: module.to_vec(),
+            name: function.sig.ident.to_string(),
+            owner,
+            evidence: Vec::new(),
+            own: function_evidence(file, &function),
+        });
+        self.items.push(function);
+    }
+
+    /// The associated function `name` of the type that `qualifier` names as
+    /// seen from `module`: `H` defined there, `handlers::H`, or `H` brought in
+    /// by one explicit `use` or by exactly one glob import.
+    pub(crate) fn resolve_associated(
+        &self,
+        crate_key: &Path,
+        module: &[String],
+        qualifier: &[String],
+        name: &str,
+    ) -> Option<usize> {
+        let (type_name, prefix) = qualifier.split_last()?;
+        if type_name == "Self" {
+            return None;
+        }
+        let lookup = |(key_crate, key_module): ModuleKey, owner: &str| -> Option<usize> {
+            match self
+                .associated
+                .get(&(key_crate, key_module, owner.to_owned(), name.to_owned()))?
+                .as_slice()
+            {
+                [index] => Some(*index),
+                _ => None,
+            }
+        };
+        if !prefix.is_empty() {
+            let path = UsePath {
+                segments: prefix.to_vec(),
+                leading_colon: false,
+            };
+            return lookup(self.resolve_module(crate_key, module, &path, 0)?, type_name);
+        }
+        if let Some(found) = lookup((crate_key.to_path_buf(), module.to_vec()), type_name) {
+            return Some(found);
+        }
+        let scope = self.scope(crate_key, module)?;
+        if let Some(imports) = scope.imports.get(type_name) {
+            let [import] = imports.as_slice() else {
+                return None;
+            };
+            let (imported, import_prefix) = import.segments.split_last()?;
+            let path = UsePath {
+                segments: import_prefix.to_vec(),
+                leading_colon: import.leading_colon,
+            };
+            return lookup(self.resolve_module(crate_key, module, &path, 0)?, imported);
+        }
+        let mut found = scope
+            .globs
+            .iter()
+            .filter_map(|glob| self.resolve_module(crate_key, module, glob, 0))
+            .filter_map(|key| lookup(key, type_name));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
     }
 
     pub(crate) fn is_module(&self, crate_key: &Path, module: &[String]) -> bool {
@@ -442,7 +560,11 @@ impl<'a> HandlerIndex<'a> {
             };
             let Some(qualifier_module) = self.resolve_module(crate_key, module, &qualifier_path, 0)
             else {
-                return (None, HandlerResolution::Unresolved);
+                // Not a module: perhaps a type, as in `.to(Handlers::users)`.
+                return match self.resolve_associated(crate_key, module, qualifier, name) {
+                    Some(index) => (Some(index), HandlerResolution::Qualified),
+                    None => (None, HandlerResolution::Unresolved),
+                };
             };
             let mut visited = HashSet::new();
             let lookup =
@@ -795,4 +917,17 @@ pub(crate) fn module_location(root: &Path, file: &Path) -> ModuleKey {
         segments.push(stem.to_owned());
     }
     (crate_dir.to_path_buf(), segments)
+}
+
+/// The type an inherent `impl` block is for, by its last path segment
+/// (`H` for `impl H` and for `impl<T> handlers::H<T>`).
+fn impl_owner(self_ty: &syn::Type) -> Option<String> {
+    match self_ty {
+        syn::Type::Path(syn::TypePath {
+            qself: None, path, ..
+        }) => {
+            path.segments.last().map(|segment| segment.ident.to_string())
+        }
+        _ => None,
+    }
 }

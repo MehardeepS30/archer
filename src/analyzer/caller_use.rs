@@ -126,7 +126,7 @@ pub(crate) fn caller_use<'f>(
         analyzed
             .entry((definition, bound.to_vec()))
             .or_insert_with(|| {
-                let mut analysis = analyze_function(index.items[definition], bound, &sources);
+                let mut analysis = analyze_function(&index.items[definition], bound, &sources);
                 for candidate in std::mem::take(&mut analysis.checks) {
                     if is_check(definition, &candidate) {
                         analysis.features.insert(candidate.feature);
