@@ -156,6 +156,9 @@ fn run(cli: &Cli) -> Result<bool> {
                     evidence.handler.as_deref().unwrap_or("<none>")
                 );
                 println!("      strength: {}", evidence.strength);
+                if evidence.name_based && std::env::var("ARCHER_P8").map_or(true, |value| value != "0") {
+                    println!("      name-based: recognized by an identifier's name only");
+                }
             }
         }
     }

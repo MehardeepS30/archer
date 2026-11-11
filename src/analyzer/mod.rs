@@ -17,6 +17,7 @@ mod peer_checks;
 mod public;
 mod resources;
 mod roles;
+mod structural;
 mod route_tables;
 mod routes;
 #[cfg(test)]
@@ -151,6 +152,7 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
     // registrations can resolve handlers defined in other files.
     // Before the index, whose evidence uses what extractors check.
     roles::index_role_orders(parsed_files.iter().map(|(_, _, syntax)| syntax));
+    structural::index(parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)));
     extractors::index_extractors(
         parsed_files.iter().map(|(_, path, syntax)| (path.as_path(), syntax)),
     );

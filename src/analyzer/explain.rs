@@ -83,6 +83,9 @@ fn describe(evidence: &AuthEvidence) -> String {
     if !evidence.requirements.is_empty() && !what.contains(&evidence.requirements[0]) {
         text.push_str(&format!(" requiring {}", evidence.requirements.iter().map(|named| format!("`{named}`")).collect::<Vec<_>>().join(", ")));
     }
+    if evidence.name_based && super::structural::enabled() {
+        text.push_str(" (name-based)");
+    }
     text
 }
 

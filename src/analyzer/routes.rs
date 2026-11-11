@@ -1530,7 +1530,12 @@ pub(crate) fn configuration_call_evidence(
                 let conditional = is_conditional_component(arg);
                 let wrapped = method.method != "guard" && !conditional;
                 let authorizes = wrapped && names_authorization(&name);
-                let authenticates = wrapped && !authorizes && names_authentication(&name);
+                // P8: a component whose code reads a credential and can
+                // reject, or stores a caller value, authenticates whatever
+                // its name. The name test is the fallback.
+                let structural = wrapped && super::structural::authenticating_component(&name);
+                let authenticates =
+                    wrapped && !authorizes && (structural || names_authentication(&name));
                 let mut requirements = Vec::new();
                 if authorizes {
                     requirements = name_keys(&name);
@@ -1563,7 +1568,7 @@ pub(crate) fn configuration_call_evidence(
                     handler: handler.map(str::to_owned),
                     strength: AuthStrength::Weak,
                     requirements,
-                    name_based: false,
+                    name_based: super::structural::enabled() && (authorizes || authenticates) && !structural,
                 });
             }
             continue;

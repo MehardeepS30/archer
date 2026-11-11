@@ -221,8 +221,9 @@ pub(crate) fn identity_type(ty: &Type) -> bool {
             };
             let name = segment.ident.to_string();
             if name == "ReqData" {
-                return first_type_argument_name(&segment.arguments)
-                    .is_some_and(|inner| super::extractors::names_caller(&inner));
+                return first_type_argument_name(&segment.arguments).is_some_and(|inner| {
+                    super::structural::caller_type(&inner) || super::extractors::names_caller(&inner)
+                });
             }
             if name == "Option" || name == "Box" || name == "Arc" {
                 return match &segment.arguments {
@@ -243,6 +244,7 @@ pub(crate) fn identity_type(ty: &Type) -> bool {
             !DATA_EXTRACTORS.contains(&name.as_str())
                 && !wraps_data
                 && (super::extractors::learned(&name).is_some()
+                    || super::structural::caller_extractor(&name)
                     || classify_extractor_name(&name).is_some()
                     || names_authentication(&name))
         }
@@ -648,6 +650,47 @@ impl<'ast> Visit<'ast> for DelegationVisitor {
         }
     }
 
+    /// P8: `auth.check(..)?`: a method of the scanned code that can build an
+    /// error is called on the caller, and the error is passed on. (Free
+    /// functions given the caller are followed as helpers instead.) That rejects the request unless the check passes,
+    /// whatever the function is called. A call whose name already reads as
+    /// a check is left to the name test, which also gives its kind.
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        let mut inner = &*node.expr;
+        while let Expr::Await(awaited) = inner {
+            inner = &awaited.base;
+        }
+        let checked = match inner {
+            Expr::MethodCall(call) => {
+                let method = call.method.to_string();
+                self.binding(&call.receiver)
+                    .filter(|_| {
+                        !TRANSPARENT_METHODS.contains(&method.as_str())
+                            && classify_check_name(&method).is_none()
+                            && super::structural::rejecting_function(&method)
+                    })
+                    .map(|binding| (format!("{binding}.{method}()"), call.span().start().line))
+            }
+            _ => None,
+        };
+        if let Some((written, line)) = checked {
+            // What the check requires is not read without its name, so it
+            // counts as making sure of the caller, not as a privilege.
+            self.evidence.push(AuthEvidence {
+                kind: AuthEvidenceKind::IdentityExtraction,
+                mechanism: format!("rejects the request unless `{written}` passes for the caller"),
+                symbol: Some(written),
+                file: self.file.clone(),
+                line,
+                handler: Some(self.handler.clone()),
+                strength: AuthStrength::Weak,
+                requirements: Vec::new(),
+                name_based: false,
+            });
+        }
+        visit::visit_expr_try(self, node);
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
         let line = node.method.span().start().line;
@@ -854,8 +897,9 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
             // for the request. Present only once that middleware ran.
             if name == "ReqData"
                 && let Some(inner) = first_type_argument_name(&segment.arguments)
-                && super::extractors::names_caller(&inner)
+                && (super::structural::caller_type(&inner) || super::extractors::names_caller(&inner))
             {
+                let name_based = super::structural::enabled() && !super::structural::caller_type(&inner);
                 evidence.push(AuthEvidence {
                     kind: AuthEvidenceKind::IdentityExtraction,
                     mechanism: format!("ReqData<{inner}>"),
@@ -865,7 +909,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength: AuthStrength::Weak,
                     requirements: Vec::new(),
-                    name_based: false,
+                    name_based,
                 });
                 return;
             }
@@ -906,7 +950,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength,
                     requirements: learned.requirements,
-                    name_based: false,
+                    name_based: learned.name_based,
                 };
                 // The check is made by an extractor this one runs, or by a
                 // comparison in a function it calls: cite that.
@@ -950,7 +994,7 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                     handler: Some(handler.into()),
                     strength,
                     requirements,
-                    name_based: false,
+                    name_based: super::structural::enabled(),
                 });
                 return;
             }
@@ -1484,6 +1528,11 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         {
             evidence.line = node.span().start().line;
             evidence.requirements = requirement_keys(&method, &node.args);
+            // Read from the method's name; structural only when the method
+            // is one of the scanned code's and can build an error.
+            if super::structural::enabled() && !super::structural::rejecting_function(&method) {
+                evidence.name_based = true;
+            }
             let imperative = is_imperative(&method, &evidence.kind);
             self.record(evidence, imperative);
         }
@@ -2227,7 +2276,13 @@ fn rejects_unauthenticated(
     handler: &str,
 ) -> Option<AuthEvidence> {
     let lower = name.to_ascii_lowercase();
-    (lower.contains("unauthorized") || lower.contains("unauthenticated")).then(|| AuthEvidence {
+    // Structural: the crate maps this error to 401, or it is actix's own
+    // 401 response. Otherwise only the error's name says so.
+    let structural = super::structural::unauthenticated_variant(symbol)
+        || name == "ErrorUnauthorized"
+        || symbol.ends_with("HttpResponse::Unauthorized");
+    let by_name = lower.contains("unauthorized") || lower.contains("unauthenticated");
+    (structural || by_name).then(|| AuthEvidence {
         kind: AuthEvidenceKind::IdentityExtraction,
         mechanism: format!("rejects unauthenticated callers (`{name}`)"),
         symbol: Some(symbol.into()),
@@ -2236,7 +2291,7 @@ fn rejects_unauthenticated(
         handler: Some(handler.into()),
         strength: AuthStrength::Weak,
         requirements: Vec::new(),
-        name_based: false,
+        name_based: super::structural::enabled() && !structural,
     })
 }
 

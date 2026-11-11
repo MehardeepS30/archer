@@ -139,7 +139,7 @@ fn the_nested_extractor_round_has_switches() {
             .expect("the audit finding")
     };
     assert_eq!(check(&[]), "takes the caller: `Operator`");
-    assert_eq!(check(&[("ARCHER_P12", "0")]), "takes the caller: `Stock`");
+    assert_eq!(check(&[("ARCHER_P12", "0")]), "takes the caller: `Stock` (name-based)");
 }
 
 #[test]
@@ -156,4 +156,27 @@ fn the_built_paths_round_has_a_switch() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Paths: 11 of 15 routes have fully resolved paths"), "{text}");
     assert!(text.contains("  unresolved: "), "{text}");
+}
+
+#[test]
+fn the_structural_signals_round_has_a_switch() {
+    let fixture = "tests/fixtures/probes/drift/f65_structural_signals.rs";
+    let kinds = |switches: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_archer"));
+        command.args(["--json", fixture]);
+        for (name, value) in switches {
+            command.env(name, value);
+        }
+        let output = command.output().expect("archer runs");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+        report["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .find(|route| route["path"] == "/desk/notes")
+            .map(|route| route["authorization"][0]["kind"].as_str().unwrap_or_default().to_owned())
+            .expect("the notes route")
+    };
+    assert_eq!(kinds(&[]), "IdentityExtraction");
+    assert_eq!(kinds(&[("ARCHER_P8", "0")]), "Unknown");
 }

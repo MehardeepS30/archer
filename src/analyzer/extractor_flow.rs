@@ -331,6 +331,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                     site: Some((file.clone(), *line)),
                 }),
                 credential: true,
+                name_based: false,
             });
         }
         for inner in &outcome.inner {
@@ -349,7 +350,29 @@ impl<'i, 'a> Resolver<'i, 'a> {
                     requirements: found.requirements,
                     via: Some(Via { extractor, chain, site }),
                     credential: found.credential,
+                    name_based: found.name_based,
                 });
+            }
+        }
+        // P8: an extractor that fails without a credential, or that takes a
+        // value a credential reader stored, identifies the caller whatever
+        // its words say.
+        if super::structural::enabled() {
+            let structural = super::structural::caller_extractor(name)
+                || (super::structural::credential_extractor(name) && rejects_block(def.body));
+            if best.is_none() && structural {
+                best = Some(Learned {
+                    kind: AuthEvidenceKind::IdentityExtraction,
+                    requirements: Vec::new(),
+                    via: None,
+                    credential,
+                    name_based: false,
+                });
+            } else if let Some(found) = &mut best
+                && found.kind == AuthEvidenceKind::IdentityExtraction
+                && structural
+            {
+                found.name_based = false;
             }
         }
         if let Some(best) = &mut best {
@@ -550,7 +573,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                                 if keeps_failure && self.discarding == 0 && !outcome.inner.contains(&ty) {
                                     outcome.inner.push(ty);
                                 }
-                            } else if names_caller(&ty) {
+                            } else if super::structural::caller_type(&ty) || names_caller(&ty) {
                                 marks |= CRED;
                             }
                         }
@@ -652,7 +675,7 @@ fn method_source(call: &syn::ExprMethodCall) -> u8 {
         return PATH;
     }
     // `req.extensions().get::<Claims>()`: what authentication stored.
-    if name == "get"
+    if (name == "get" || (name == "remove" && super::structural::enabled()))
         && let Some(turbofish) = &call.turbofish
     {
         let mut types = Vec::new();
@@ -661,7 +684,7 @@ fn method_source(call: &syn::ExprMethodCall) -> u8 {
                 type_names(ty, true, &mut types);
             }
         }
-        if types.iter().any(|(ty, _)| names_caller(ty)) {
+        if types.iter().any(|(ty, _)| super::structural::caller_type(ty) || names_caller(ty)) {
             return CRED;
         }
     }

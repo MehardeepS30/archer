@@ -1,0 +1,11 @@
+[package]
+name = "archer-rename-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "3.0.4", features = ["full", "visit"] }
+walkdir = "2"
+
+[workspace]

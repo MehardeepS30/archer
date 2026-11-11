@@ -41,6 +41,9 @@ pub(crate) struct Learned {
     /// It reads a credential the request presents (a header, a cookie, a
     /// session, another caller extractor), itself or through what it runs.
     pub(crate) credential: bool,
+    /// Decided only by identifier words (`CALLER_WORDS`, `PRIVILEGE_WORDS`,
+    /// "unauthorized" in an error's name), with no structural signal.
+    pub(crate) name_based: bool,
 }
 
 /// How an extractor's comparison of a credential value with a path value
@@ -171,17 +174,21 @@ pub(super) fn classify(body: &syn::Block) -> Option<Learned> {
             requirements.sort();
             requirements.dedup();
         }
+        // Role variants and conditions are read from privilege words; a
+        // refusal is structural when the crate maps its errors to 401/403.
+        let name_based = super::structural::enabled() && !(refuses_identified && visitor.status_structural);
         return Some(Learned {
             kind: AuthEvidenceKind::RoleCheck,
             requirements,
             via: None,
             credential: false,
+            name_based,
         });
     }
     // Failing alone is not about the caller: an extractor that loads the
     // current organization fails too. It identifies the caller when it
     // reads a user, session, token, or credential.
-    if !visitor.caller {
+    if !visitor.caller && !visitor.caller_structural {
         return None;
     }
     Some(Learned {
@@ -189,6 +196,7 @@ pub(super) fn classify(body: &syn::Block) -> Option<Learned> {
         requirements: Vec::new(),
         via: None,
         credential: false,
+        name_based: super::structural::enabled() && !visitor.caller_structural,
     })
 }
 
@@ -240,6 +248,11 @@ struct BodyVisitor {
     variants: Vec<String>,
     /// Role-like fields or calls in a branch condition (`is_admin`).
     conditions: Vec<String>,
+    /// It reads a credential or a caller type, or fails with an error the
+    /// crate maps to 401: shown by what the code does, not by names (P8).
+    caller_structural: bool,
+    /// The unauthenticated/forbidding errors were found by status mapping.
+    status_structural: bool,
 }
 
 impl BodyVisitor {
@@ -279,6 +292,9 @@ impl<'ast> Visit<'ast> for BodyVisitor {
         if names_caller(&name) || unauthenticated(&name) {
             self.caller = true;
         }
+        if super::structural::caller_type(&name) || super::structural::caller_extractor(&name) {
+            self.caller_structural = true;
+        }
     }
 
     fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
@@ -310,6 +326,7 @@ impl<'ast> Visit<'ast> for BodyVisitor {
         if name == "ok_or" || name == "ok_or_else" || name == "map_err" {
             self.rejects = true;
         }
+
         visit::visit_expr_method_call(self, node);
     }
 
@@ -319,6 +336,17 @@ impl<'ast> Visit<'ast> for BodyVisitor {
     }
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        let written: Vec<String> = node.path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let written = written.join("::");
+        if super::structural::unauthenticated_variant(&written) {
+            self.unauthorized = true;
+            self.caller_structural = true;
+            self.status_structural = true;
+        }
+        if super::structural::forbidding_variant(&written) {
+            self.forbids = true;
+            self.status_structural = true;
+        }
         for segment in &node.path.segments {
             let name = segment.ident.to_string();
             if forbidding(&name) {

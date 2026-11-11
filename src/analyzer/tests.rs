@@ -5656,3 +5656,68 @@ async fn item(me: AccountUser) -> HttpResponse { HttpResponse::Ok().finish() }
         report.finding_details
     );
 }
+
+#[test]
+fn structural_signals_stand_in_for_names() {
+    let source = include_str!("../../tests/fixtures/probes/drift/f65_structural_signals.rs");
+    let report = drift_fixture("f65", source);
+    let evidence = |method: &str, path: &str| -> Vec<(AuthEvidenceKind, String, bool)> {
+        report
+            .routes
+            .iter()
+            .find(|route| route.method == method && route.path == path)
+            .map(|route| {
+                route
+                    .authorization
+                    .iter()
+                    .map(|evidence| (evidence.kind.clone(), evidence.mechanism.clone(), evidence.name_based))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The middleware reads a cookie, rejects without it and stores a value:
+    // it authenticates, and so does `ReqData` of what it stores.
+    assert_eq!(
+        evidence("GET", "/desk/notes"),
+        [
+            (AuthEvidenceKind::IdentityExtraction, "gatekeeper".to_string(), false),
+            (AuthEvidenceKind::IdentityExtraction, "ReqData<Badge>".to_string(), false),
+        ]
+    );
+    // The extractor reads the Authorization header and fails with an error
+    // mapped to 401.
+    assert_eq!(
+        evidence("GET", "/ledger/rows"),
+        [(AuthEvidenceKind::IdentityExtraction, "Pass".to_string(), false)]
+    );
+    let findings: Vec<(&str, FindingCategory)> = report
+        .finding_details
+        .iter()
+        .map(|finding| (finding.suspicious_route.path.as_str(), finding.category))
+        .collect();
+    assert_eq!(findings, [("/ledger/rows/{id}/close", FindingCategory::MissingAuthentication)]);
+}
+
+#[test]
+fn an_identity_found_only_by_name_is_tagged() {
+    let report = drift_fixture(
+        "name-only",
+        r#"
+use actix_web::{web, App, HttpResponse};
+fn app() {
+    App::new()
+        .route("/a", web::get().to(a))
+        .route("/b", web::get().to(b));
+}
+async fn a(user: AuthUser) -> HttpResponse { HttpResponse::Ok().finish() }
+async fn b(user: web::ReqData<CurrentUser>) -> HttpResponse { HttpResponse::Ok().finish() }
+"#,
+    );
+    for route in &report.routes {
+        assert!(
+            route.authorization.iter().all(|evidence| evidence.name_based),
+            "{:?}",
+            route.authorization
+        );
+    }
+}
