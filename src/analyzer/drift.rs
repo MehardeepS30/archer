@@ -1124,7 +1124,17 @@ fn same_resource_weaker(
             .iter()
             .map(|other| {
                 let same_handler = link_strength(route, other) == usize::MAX;
-                (*other, stronger_fields(&requirement, &Requirement::of(other), same_handler))
+                let mut fields = stronger_fields(&requirement, &Requirement::of(other), same_handler);
+                // The caller-use reading saw the handler hold a record it
+                // loads to the caller: it does not lack an ownership check.
+                if super::pu::enabled("GUARDED")
+                    && route.caller_use.iter().any(|feature| {
+                        feature.starts_with(super::caller_use::GUARDS) && feature.ends_with("with the caller")
+                    })
+                {
+                    fields.retain(|field| *field != "an ownership check");
+                }
+                (*other, fields)
             })
             .filter(|(_, fields)| !fields.is_empty())
             .collect();
@@ -1716,9 +1726,45 @@ fn role_mismatch(
         .as_ref()
         .is_some_and(|required| !requirement.roles.contains(required));
     if lacks_leading && !(group.roles_any_of && !extra) {
+        if named_after_operation(route, requirement, group) {
+            return None;
+        }
         return Some(FindingCategory::DifferentAuthorization);
     }
     None
+}
+
+/// A permission named after the one operation it guards: the route checks
+/// a permission its peers do not, and that permission's name holds two or
+/// more words of the route's own handler (`remove_team_member` checking
+/// `REMOVE_MEMBER`, `version_delete` checking `DELETE_VERSION`). Where
+/// permissions are per operation, differing from the peers is the scheme,
+/// not a drift; a handler checking some other operation's permission
+/// (`delete_project` checking `PROJECT_READ`) is still reported.
+fn named_after_operation(route: &Route, requirement: &Requirement, group: &GroupStats) -> bool {
+    const GENERIC: [&str; 6] = ["route", "handler", "controller", "endpoint", "api", "impl"];
+    if !super::pu::enabled("OPNAMED") {
+        return false;
+    }
+    let Some(handler) = route.handler.as_deref() else {
+        return false;
+    };
+    let words: Vec<String> = handler
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .flat_map(super::evidence::camel_case_words)
+        .filter(|word| word.len() >= 3 && !GENERIC.contains(&word.as_str()))
+        .collect();
+    requirement
+        .roles
+        .iter()
+        .filter(|role| !group.dominant_roles.contains(role))
+        .any(|role| {
+            let role = role.to_ascii_lowercase();
+            let mut held: Vec<&String> = words.iter().filter(|word| role.contains(word.as_str())).collect();
+            held.sort();
+            held.dedup();
+            held.len() >= 2
+        })
 }
 
 /// Unanalyzed protection that can wrap many routes alike: an unrecognized
@@ -2249,6 +2295,9 @@ fn static_segments(path: &str) -> Vec<String> {
 /// segments before it are generic or about accounts. `/admin/settings/auth`
 /// and `/admin/users/{id}/token` manage something and are analysed.
 pub(crate) fn is_authentication_route(route: &Route) -> bool {
+    // Steps of signing in that a caller takes before holding a session:
+    // a second factor, a passkey ceremony, a code sent again.
+    const STEPS: [&str; 9] = ["otp", "totp", "mfa", "2fa", "webauthn", "passkey", "resend", "sso", "saml"];
     const ENDPOINTS: [&str; 22] = [
         "device",
         "revoke",
@@ -2282,12 +2331,60 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
         return false;
     };
     // `password_reset`, `request-reset`, `email_confirm`.
-    let named = last.split(['_', '-'])
-        .any(|word| ENDPOINTS.contains(&word))
-        && before.iter().all(|segment| {
-            is_generic_segment(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str())
+    // `sign_up`, `sign-in` and `log_out` are `signup`, `signin` and
+    // `logout` written apart.
+    let words: Vec<&str> = last.split(['_', '-']).collect();
+    let joined = super::pu::enabled("AUTHFLOW")
+        && words.windows(2).any(|pair| ENDPOINTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()));
+    // `/_internal/auth/login`: a mount named with a leading underscore is
+    // a prefix like `/api`.
+    let prefix = |segment: &String| {
+        is_generic_segment(segment) || (super::pu::enabled("SUBTREE") && segment.starts_with('_'))
+    };
+    let named = (joined
+        || words
+            .iter()
+            .any(|word| ENDPOINTS.contains(word) || (super::pu::enabled("AUTHFLOW") && STEPS.contains(word))))
+        && before.iter().all(|segment| prefix(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str()));
+    // A flow under the application's sign-in subtree
+    // (`/auth/email/verify`, `/auth/create/validate`,
+    // `/auth/passkey/register/start`): below a segment that names sign-in,
+    // itself below prefixes only, a segment names an endpoint or a step.
+    const ROOTS: [&str; 6] = ["auth", "oauth", "oauth2", "sso", "saml", "oidc"];
+    const FLOW: [&str; 2] = ["validate", "validation"];
+    let subtree = super::pu::enabled("SUBTREE")
+        && statics.iter().position(|segment| ROOTS.contains(&segment.as_str())).is_some_and(|root| {
+            statics[..root].iter().all(prefix)
+                // `/auth/v1/..` is where an identity server mounts its
+                // whole API, not a flow.
+                && statics.get(root + 1).is_some_and(|next| !is_generic_segment(next))
+                && statics[root + 1..].iter().flat_map(|segment| segment.split(['_', '-'])).any(|word| {
+                    ENDPOINTS.contains(&word) || STEPS.contains(&word) || FLOW.contains(&word)
+                })
         });
-    named && authenticates_structurally(route) && !kept_behind_exempt_list(route)
+    (named || subtree || creates_account(route)) && authenticates_structurally(route) && !kept_behind_exempt_list(route)
+}
+
+/// Account creation outside any sign-in path (`POST /api/user` handled by
+/// `post_register`): the handler is named for registering or signing in,
+/// takes a password from the body and takes no caller.
+fn creates_account(route: &Route) -> bool {
+    const NAMES: [&str; 6] = ["register", "registration", "signup", "signin", "login", "logon"];
+    if !super::pu::enabled("SIGNUP") || route.method != "POST" || route.best_tier() != EvidenceTier::None {
+        return false;
+    }
+    let password = route.caller_use.iter().any(|feature| {
+        feature
+            .strip_prefix(super::caller_use::MENTIONS)
+            .and_then(|rest| rest.strip_prefix("body:"))
+            .is_some_and(|field| field.to_ascii_lowercase().contains("password"))
+    });
+    let handler = route.handler.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let words: Vec<&str> = handler.split('_').collect();
+    password
+        && !route.caller_use.iter().any(|feature| feature.starts_with("takes:"))
+        && (words.iter().any(|word| NAMES.contains(word))
+            || words.windows(2).any(|pair| NAMES.contains(&format!("{}{}", pair[0], pair[1]).as_str())))
 }
 
 /// A route the app's own middleware checks while exempting other paths by

@@ -2191,6 +2191,28 @@ impl<'ast> Visit<'ast> for RejectionVisitor {
         {
             self.rejects = true;
         }
+        // An application's own early-return macro, named by the refusal it
+        // is given (`die!(UNAUTHORIZED, ..)`, `fail!(Forbidden)`). A
+        // logging macro that only mentions one refuses nothing.
+        const REPORTING: [&str; 12] = [
+            "trace", "debug", "info", "warn", "error", "log", "println", "eprintln", "print", "eprint", "format", "write",
+        ];
+        if super::pu::enabled("MACROS")
+            && node
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| !REPORTING.contains(&segment.ident.to_string().as_str()))
+            && node.tokens.clone().into_iter().any(|tree| match tree {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    let written = ident.to_string().to_ascii_lowercase();
+                    REJECTION_WORDS.iter().any(|word| written.contains(word))
+                }
+                _ => false,
+            })
+        {
+            self.rejects = true;
+        }
     }
 
     fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}

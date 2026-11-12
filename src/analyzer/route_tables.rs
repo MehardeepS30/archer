@@ -363,6 +363,7 @@ fn expand(
                     sees_request: false,
                     takes_nothing: false,
                     takes_data: false,
+                    openapi: None,
                     unserved: false,
                     app: None,
                 },

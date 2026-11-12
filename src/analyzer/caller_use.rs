@@ -169,6 +169,26 @@ pub(crate) fn caller_use<'f>(
 /// with none only answers with flags and counts (`handle_taken`), which
 /// `public::likely_public` uses.
 pub(crate) const KEYED: &str = "keyed:";
+/// The handler reads the caller but goes on without one.
+pub(crate) const OPTIONAL: &str = "optional:";
+
+/// `source(..).await.ok()`, `source(..).ok().map(..)`, `source(..).unwrap_or_default()`:
+/// the expression keeps going when the call fails, nothing unwraps it.
+fn tolerates_failure(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(inner) => tolerates_failure(&inner.base),
+        Expr::Paren(inner) => tolerates_failure(&inner.expr),
+        Expr::Group(inner) => tolerates_failure(&inner.expr),
+        Expr::Reference(inner) => tolerates_failure(&inner.expr),
+        Expr::MethodCall(call) => match call.method.to_string().as_str() {
+            "ok" | "unwrap_or_default" => true,
+            // What is done to the `Option` afterwards keeps it optional.
+            "map" | "flatten" | "and_then" | "filter" | "cloned" | "as_ref" => tolerates_failure(&call.receiver),
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 /// Feature prefix: the route hands the caller whole to a call, as
 /// `hands:Label`. Not compared; `peer_checks` does not report such a
@@ -2133,6 +2153,11 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             // caller from a call rather than an extractor.
             if bound && label.ends_with("()") {
                 self.features.insert(format!("takes:{label}"));
+                // `let user = current_user(&req).await.ok();`: a failed
+                // login is kept as `None`, so anonymous callers go on.
+                if super::pu::enabled("OPTIONAL") && tolerates_failure(&init.expr) {
+                    self.features.insert(format!("{OPTIONAL}{label}"));
+                }
             }
         }
         visit::visit_local(self, node);
@@ -2953,6 +2978,8 @@ fn identity_sources(index: &HandlerIndex, routes: &[Route]) -> HashSet<String> {
         .iter()
         .filter_map(|route| route.origin.definition)
         .collect();
+    let handler_names: HashSet<&str> =
+        handlers.iter().map(|&position| index.definitions[position].name.as_str()).collect();
     index
         .definitions
         .iter()
@@ -2963,6 +2990,13 @@ fn identity_sources(index: &HandlerIndex, routes: &[Route]) -> HashSet<String> {
                 && definition.owner.is_none()
                 && matches!(item.sig.output, syn::ReturnType::Type(..))
                 && !returns_verdict(&item.sig.output)
+                // `v3::report_get(req, ..) -> Result<HttpResponse, _>` under
+                // the handler `v2::report_get`: a handler's body another
+                // handler delegates to answers the request, it does not
+                // hand the caller back.
+                && !(super::pu::enabled("RESPONSES")
+                    && returns_response(&item.sig.output)
+                    && handler_names.contains(definition.name.as_str()))
                 && item
                     .sig
                     .inputs
@@ -2980,6 +3014,20 @@ fn identity_sources(index: &HandlerIndex, routes: &[Route]) -> HashSet<String> {
         })
         .map(|(_, (definition, _))| definition.name.clone())
         .collect()
+}
+
+/// A function that answers the request (`-> Result<HttpResponse, E>`,
+/// `-> impl Responder`): a handler another handler delegates to, such as
+/// the current version's behind an older version's route. What it returns
+/// is the response, not the caller, whatever it authenticates on the way.
+fn returns_response(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let written = quote::ToTokens::to_token_stream(ty).to_string();
+    written
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == "HttpResponse" || word == "Responder")
 }
 
 /// `HttpRequest`, `&HttpRequest`, `ServiceRequest`.

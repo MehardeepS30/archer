@@ -137,47 +137,60 @@ fn leaves(expr: &Expr) -> bool {
 /// last expression, through `Box::pin(async move { .. })`, `.await`,
 /// adapters, a local bound to the call, and branches that all forward.
 fn tail_forwards(block: &Block) -> bool {
-    fn value(expr: &Expr, block: &Block, depth: usize) -> bool {
+    // `scopes` are the blocks enclosing the expression, innermost last: a
+    // name is looked up in each (`let fut = srv.call(req); async move {
+    // let res = fut.await; res }`).
+    fn value(expr: &Expr, scopes: &[&Block], depth: usize) -> bool {
         if depth > 12 {
             return false;
         }
         match expr {
             Expr::MethodCall(call) => {
-                (call.method == "call" && call.args.len() == 1) || value(&call.receiver, block, depth + 1)
+                (call.method == "call" && call.args.len() == 1) || value(&call.receiver, scopes, depth + 1)
             }
-            Expr::Await(inner) => value(&inner.base, block, depth + 1),
-            Expr::Paren(inner) => value(&inner.expr, block, depth + 1),
-            Expr::Group(inner) => value(&inner.expr, block, depth + 1),
-            Expr::Async(inner) => tail(&inner.block, depth + 1),
-            Expr::Block(inner) => tail(&inner.block, depth + 1),
-            Expr::Unsafe(inner) => tail(&inner.block, depth + 1),
-            Expr::Call(call) => call.args.len() == 1 && value(&call.args[0], block, depth + 1),
+            Expr::Await(inner) => value(&inner.base, scopes, depth + 1),
+            Expr::Try(inner) if super::pu::enabled("FORWARDS") => value(&inner.expr, scopes, depth + 1),
+            Expr::Paren(inner) => value(&inner.expr, scopes, depth + 1),
+            Expr::Group(inner) => value(&inner.expr, scopes, depth + 1),
+            Expr::Async(inner) => tail(&inner.block, scopes, depth + 1),
+            Expr::Block(inner) => tail(&inner.block, scopes, depth + 1),
+            Expr::Unsafe(inner) => tail(&inner.block, scopes, depth + 1),
+            Expr::Call(call) => call.args.len() == 1 && value(&call.args[0], scopes, depth + 1),
             Expr::Path(path) => path.path.get_ident().is_some_and(|name| {
-                block.stmts.iter().any(|statement| match statement {
-                    syn::Stmt::Local(local) => {
-                        matches!(&local.pat, syn::Pat::Ident(ident) if ident.ident == *name)
-                            && local.init.as_ref().is_some_and(|init| value(&init.expr, block, depth + 1))
-                    }
-                    _ => false,
+                let searched: &[&Block] = if super::pu::enabled("FORWARDS") {
+                    scopes
+                } else {
+                    &scopes[scopes.len().saturating_sub(1)..]
+                };
+                searched.iter().rev().any(|block| {
+                    block.stmts.iter().any(|statement| match statement {
+                        syn::Stmt::Local(local) => {
+                            matches!(&local.pat, syn::Pat::Ident(ident) if ident.ident == *name)
+                                && local.init.as_ref().is_some_and(|init| value(&init.expr, scopes, depth + 1))
+                        }
+                        _ => false,
+                    })
                 })
             }),
             Expr::If(branch) => {
-                tail(&branch.then_branch, depth + 1)
-                    && branch.else_branch.as_ref().is_some_and(|(_, otherwise)| value(otherwise, block, depth + 1))
+                tail(&branch.then_branch, scopes, depth + 1)
+                    && branch.else_branch.as_ref().is_some_and(|(_, otherwise)| value(otherwise, scopes, depth + 1))
             }
             Expr::Match(matched) => {
-                !matched.arms.is_empty() && matched.arms.iter().all(|arm| value(&arm.body, block, depth + 1))
+                !matched.arms.is_empty() && matched.arms.iter().all(|arm| value(&arm.body, scopes, depth + 1))
             }
             _ => false,
         }
     }
-    fn tail(block: &Block, depth: usize) -> bool {
+    fn tail(block: &Block, outer: &[&Block], depth: usize) -> bool {
+        let mut scopes: Vec<&Block> = outer.to_vec();
+        scopes.push(block);
         match block.stmts.last() {
-            Some(syn::Stmt::Expr(expr, None)) => value(expr, block, depth),
+            Some(syn::Stmt::Expr(expr, None)) => value(expr, &scopes, depth),
             _ => false,
         }
     }
-    tail(block, 0)
+    tail(block, &[], 0)
 }
 
 /// Whether a middleware body forwards a request that carries no

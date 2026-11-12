@@ -105,8 +105,8 @@ fn features(route: &Route) -> Features {
             grants.insert(value.to_string());
         } else if let Some(label) = feature.strip_prefix(super::caller_use::HANDS) {
             hands.insert(label.to_string());
-        } else if feature.starts_with(KEYED) {
-            // Bookkeeping for `public::likely_public`, not a check.
+        } else if feature.starts_with(KEYED) || feature.starts_with(super::caller_use::OPTIONAL) {
+            // Bookkeeping for `public`, not a check.
         } else if let Some(tag) = feature.strip_prefix(BINDS) {
             binds.insert(tag.to_string());
         } else if let Some(tag) = feature.strip_prefix(MENTIONS) {
@@ -1621,6 +1621,16 @@ fn unbound_parameter(
             || names.iter().flatten().any(|own_name| own_name == name)
             || !names_one_entity(name, &templates)
         {
+            continue;
+        }
+        // `name`, `username`, `email`, `title`: what a caller chooses for a
+        // record being created (an account's name at sign-up, a label's
+        // title), where `{name}` in a path addresses an existing record.
+        // The same word does not tie the body value to those records; a
+        // name that carries its entity (`shelf`, `profile_id`, `org_name`)
+        // does.
+        const CHOSEN: [&str; 6] = ["name", "username", "email", "title", "slug", "label"];
+        if super::pu::enabled("FIELDNAMES") && CHOSEN.contains(&name.to_ascii_lowercase().as_str()) {
             continue;
         }
         let having: Vec<usize> = (0..eligible.len())

@@ -14,6 +14,7 @@ mod handlers;
 mod macros;
 mod middleware;
 mod p13;
+mod pu;
 mod rc;
 mod reach;
 mod model;
@@ -316,6 +317,10 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
                 syn::FnArg::Receiver(_) => false,
             })
         });
+        route.origin.openapi = route
+            .origin
+            .definition
+            .and_then(|definition| public::openapi_security(&index.items[definition].attrs));
         // P13: whether the handler can see the request's credentials.
         route.origin.sees_request = route.origin.definition.is_some_and(|definition| {
             index.items[definition].sig.inputs.iter().any(|input| match input {

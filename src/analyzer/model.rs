@@ -249,6 +249,12 @@ pub(crate) struct RouteOrigin {
     /// Its handler has a parameter that is not the caller: the request's
     /// data, the application's state, a database handle.
     pub(crate) takes_data: bool,
+    /// The security requirement its handler's OpenAPI annotation
+    /// (`#[utoipa::path(.. security(..))]`) declares, as written without
+    /// spaces: `Some("")` for an annotation that declares none or admits a
+    /// request without one (`security(())`), `None` for a handler with no
+    /// annotation.
+    pub(crate) openapi: Option<String>,
     /// P13: registered on an `App` that is built but never served (one
     /// built only to produce the OpenAPI document).
     pub(crate) unserved: bool,

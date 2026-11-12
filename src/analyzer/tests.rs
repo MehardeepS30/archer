@@ -6047,3 +6047,121 @@ fn routes_on_the_callers_own_record_are_not_missing_the_admin_role() {
         .collect();
     assert!(flagged.is_empty(), "{flagged:?}");
 }
+
+#[test]
+fn routes_the_application_declares_public_are_kept_at_low() {
+    let report = drift_fixture(
+        "f72",
+        include_str!("../../tests/fixtures/probes/drift/f72_declared_public.rs"),
+    );
+    let found = |path: &str| {
+        report
+            .finding_details
+            .iter()
+            .find(|finding| finding.suspicious_route.path == path)
+            .unwrap_or_else(|| panic!("no finding on {path}: {:#?}", report.finding_details))
+    };
+    // Named as open to anyone.
+    let published = found("/api/v2/catalog/published/{slug}");
+    assert_eq!(published.severity, Severity::Low);
+    assert!(published.rationale.contains("named `published`"), "{}", published.rationale);
+    assert!(published.evidence.notes.iter().any(|note| note.contains("[[public]]")));
+    // No such name: reported as before.
+    assert_eq!(found("/api/v2/catalog/{item_id}/pricing").severity, Severity::High);
+    // The API document states it as open.
+    let rates = found("/api/v2/ledger/rates");
+    assert_eq!(rates.severity, Severity::Low);
+    assert!(rates.rationale.contains("OpenAPI annotation declares no security requirement"), "{}", rates.rationale);
+    // The document asks for what the handler does not enforce.
+    let totals = found("/api/v2/ledger/totals");
+    assert_eq!(totals.severity, Severity::High);
+    assert!(
+        totals.evidence.notes.iter().any(|note| note.contains("security((\"token\"=[]))")),
+        "{:?}",
+        totals.evidence.notes
+    );
+}
+
+#[test]
+fn openapi_security_is_read_from_the_annotation() {
+    let read = |item: syn::ItemFn| super::public::openapi_security(&item.attrs);
+    assert_eq!(read(syn::parse_quote! { async fn plain() {} }), None);
+    assert_eq!(
+        read(syn::parse_quote! {
+            #[utoipa::path(get, path = "/a", security(("ApiKey" = ["admin"])))]
+            async fn guarded() {}
+        })
+        .as_deref(),
+        Some("(\"ApiKey\"=[\"admin\"])")
+    );
+    // No requirement, or one that admits a request without any.
+    assert_eq!(
+        read(syn::parse_quote! { #[utoipa::path(get, path = "/a")] async fn open() {} }).as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        read(syn::parse_quote! {
+            #[utoipa::path(get, path = "/a", security((), ("ApiKey" = [])))]
+            async fn optional() {}
+        })
+        .as_deref(),
+        Some("")
+    );
+    // Behind a feature switch.
+    assert_eq!(
+        read(syn::parse_quote! {
+            #[cfg_attr(feature = "docs", utoipa::path(get, path = "/a", security(("jwt" = []))))]
+            async fn switched() {}
+        })
+        .as_deref(),
+        Some("(\"jwt\"=[])")
+    );
+}
+
+#[test]
+fn sign_in_steps_are_authentication_endpoints() {
+    for path in ["/auth/v1/users/otp_resend", "/api/account/webauthn-start", "/api/session/mfa", "/auth/sign_up", "/auth/log-out"] {
+        assert!(is_authentication_route(&route("POST", path, "", "NONE")), "{path}");
+    }
+    assert!(!is_authentication_route(&route("POST", "/api/reports/resend", "/api", "NONE")));
+}
+
+#[test]
+fn routes_that_serve_anonymous_callers_on_purpose_are_kept_at_low() {
+    let report = drift_fixture(
+        "f73",
+        include_str!("../../tests/fixtures/probes/drift/f73_anonymous_on_purpose.rs"),
+    );
+    let found = |path: &str| {
+        report
+            .finding_details
+            .iter()
+            .find(|finding| finding.suspicious_route.path == path)
+            .unwrap_or_else(|| panic!("no finding on {path}: {:#?}", report.finding_details))
+    };
+    // The failed login is kept as `None`.
+    let shelf = found("/api/v2/library/shelves/{shelf_id}");
+    assert_eq!(shelf.severity, Severity::Low);
+    assert!(shelf.rationale.contains("reads the caller optionally"), "{}", shelf.rationale);
+    // Nothing says it is open: reported as before.
+    assert_eq!(found("/api/v2/library/loans/{loan_id}").severity, Severity::High);
+    // Named for the service that calls it.
+    let provider = found("/api/v2/payments/provider");
+    assert_eq!(provider.severity, Severity::Low);
+    assert!(provider.rationale.contains("named `webhook`"), "{}", provider.rationale);
+}
+
+#[test]
+fn flows_under_the_sign_in_subtree_are_authentication_endpoints() {
+    for path in [
+        "/_internal/auth/password/reset",
+        "/v2/auth/email/verify",
+        "/v2/auth/create/validate",
+        "/api/auth/passkey/register/start",
+    ] {
+        assert!(is_authentication_route(&route("POST", path, "", "NONE")), "{path}");
+    }
+    // Not below prefixes only, or no endpoint named below it.
+    assert!(!is_authentication_route(&route("POST", "/admin/auth/providers", "", "NONE")));
+    assert!(!is_authentication_route(&route("POST", "/api/auth/keys/create", "", "NONE")));
+}
