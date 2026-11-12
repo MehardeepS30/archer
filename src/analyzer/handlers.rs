@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use std::borrow::Cow;
-use syn::{ImplItem, Item, ItemFn, Type, UseTree};
+use syn::{FnArg, Pat, ImplItem, Item, ItemFn, Type, UseTree};
 
 use super::{caller_use::block_rejects, evidence::*, model::*, routes::*};
 
@@ -44,6 +44,15 @@ pub(crate) struct ResolvedCalls {
     /// `self` in a method of one. A check a callee makes on its own caller
     /// parameter is about this request's caller only for these.
     pub(crate) passes_caller: HashSet<usize>,
+    /// Callees whose failure this function discards at every call (see
+    /// `reach`): their checks do not restrict the request here.
+    pub(crate) swallowed: HashSet<usize>,
+    /// For each callee, the argument positions every call here passes
+    /// `None` or `false` at.
+    pub(crate) absent: HashMap<usize, Vec<usize>>,
+    /// Callees called only when a parameter of this function is given,
+    /// with that parameter's position.
+    pub(crate) conditional: HashMap<usize, usize>,
 }
 
 /// Request types: the caller's credentials travel in them.
@@ -119,12 +128,39 @@ pub(crate) struct HandlerIndex<'a> {
     /// Struct fields by struct name: named fields, or `0`, `1`.. for a
     /// tuple struct.
     pub(crate) structs: HashMap<String, Vec<Vec<(String, Type)>>>,
+    /// The crate of each struct in `structs`, in the same order.
+    pub(crate) struct_crates: HashMap<String, Vec<PathBuf>>,
+    /// Type names that two or more crates of the scan define (`Service`
+    /// in `kernel` and in `files`), with the crates that do. A type of
+    /// such a name is told apart by the crate it is written in.
+    pub(crate) contested: HashMap<String, Vec<PathBuf>>,
     /// `type Name = ..;` aliases, and `Deref` targets of the crate's types.
     pub(crate) aliases: HashMap<String, Vec<Type>>,
     pub(crate) deref_targets: HashMap<String, Vec<Type>>,
+    /// The type parameters a `Deref` impl names its own type with:
+    /// `impl<T> Deref for Data<T> { type Target = Arc<T>; }` gives
+    /// `Data -> [T]`, so that `Data<Arc<Context>>` derefs to
+    /// `Arc<Arc<Context>>` and not to `Arc<T>`.
+    pub(crate) deref_params: HashMap<String, Vec<String>>,
     /// The types of each definition's named values, computed when a
     /// method call in it is resolved.
     pub(crate) local_types: std::cell::RefCell<HashMap<usize, std::rc::Rc<HashMap<String, Type>>>>,
+    /// Traits defined in the scan, and the types that implement each
+    /// trait name, for calls on `dyn Trait`, `impl Trait` and bounded
+    /// type parameters.
+    pub(crate) traits: HashSet<String>,
+    pub(crate) implementors: HashMap<String, Vec<String>>,
+    /// Copies of generic functions with a type parameter, or an `impl
+    /// Trait`/`dyn Trait` parameter, replaced by the type one call site
+    /// passes, by `(caller, generic callee)`: `execute(usecase)` with
+    /// `usecase: RenameUseCase` calls the copy of `execute<U>` whose
+    /// `usecase.run()` is `RenameUseCase::run`. `None` when one caller
+    /// passes two different types.
+    pub(crate) instances: HashMap<(usize, usize), Option<usize>>,
+    /// For a copy, the generic function it was made from.
+    pub(crate) instance_of: HashMap<usize, usize>,
+    /// Every type name that has an `impl` block in the scan.
+    pub(crate) owners: std::cell::RefCell<Option<std::rc::Rc<HashSet<String>>>>,
     /// `const NAME: &str = "..."` items, keyed by crate, module, and name.
     pub(crate) consts: HashMap<(PathBuf, Vec<String>, String), String>,
     /// Other `const` and `static` items, by the same key, with the
@@ -165,7 +201,10 @@ impl<'a> HandlerIndex<'a> {
                 .insert(file.to_path_buf(), (crate_key.clone(), module.clone()));
             index.add_items(file, &crate_key, &mut module, &syntax.items);
         }
+        index.find_contested();
+        index.instantiate_generics();
         index.add_helper_evidence();
+        index.debug_calls();
         index
     }
 
@@ -243,10 +282,104 @@ impl<'a> HandlerIndex<'a> {
                     .collect()
             })
             .collect();
+        // Calls that resolve, as a delegation note names them: the method
+        // (`share`) or the path as written (`Board::rename`). A name that
+        // also has a call that does not resolve is left out.
+        let handed: Vec<HashSet<String>> = (0..count)
+            .map(|definition| {
+                if !super::rc::enabled("READARGS") {
+                    return HashSet::new();
+                }
+                let mut resolving = HashSet::new();
+                let mut failing = HashSet::new();
+                for call in &self.definitions[definition].own.calls {
+                    let name = match &call.target {
+                        HandlerTarget::Method { method, .. } => method.clone(),
+                        HandlerTarget::Path { segments, .. } if segments.len() >= 2 => segments.join("::"),
+                        _ => continue,
+                    };
+                    if self.resolve_callee(definition, &call.target).is_some() {
+                        resolving.insert(name);
+                    } else {
+                        failing.insert(name);
+                    }
+                }
+                resolving.retain(|name| !failing.contains(name));
+                resolving
+            })
+            .collect();
+        // A parameter whose type may hold no caller (`actor: Actor`, with
+        // `Actor::None`): handing it on shows nothing until something
+        // narrows it, and Archer reads what does. A definite caller handed
+        // to read code stays a hand-over: the code may filter by it.
+        let maybe_absent = |definition: usize, binding: &str| -> bool {
+            self.items[definition].sig.inputs.iter().any(|input| match input {
+                FnArg::Typed(typed) => {
+                    matches!(&*typed.pat, Pat::Ident(ident) if ident.ident == binding)
+                        && type_name(&typed.ty).is_some_and(|name| super::structural::optional_caller(&name))
+                }
+                FnArg::Receiver(_) => false,
+            })
+        };
         let annotate = |definition: usize, evidence: &[AuthEvidence]| -> Vec<AuthEvidence> {
             evidence
                 .iter()
                 .filter_map(|found| {
+                    // `notes.share(actor, id)`: the caller handed as an
+                    // argument to a function Archer reads. What that
+                    // function does with it, a hand-over to code Archer
+                    // cannot read included, is inherited from it.
+                    if found.kind == AuthEvidenceKind::Delegated
+                        && found
+                            .symbol
+                            .as_ref()
+                            .and_then(|symbol| symbol.split_once('('))
+                            .is_some_and(|(callee, binding)| {
+                                handed[definition].contains(callee)
+                                    && maybe_absent(definition, binding.trim_end_matches(')'))
+                            })
+                    {
+                        // `fn subscribe(&self, _actor: Actor, ..)`: the
+                        // function names the caller as unused, so no
+                        // caller is needed by design.
+                        let callee = found.symbol.as_deref().and_then(|symbol| symbol.split_once('(')).map(|(callee, _)| callee);
+                        let unused = self.definitions[definition].own.calls.iter().find_map(|call| {
+                            let name = match &call.target {
+                                HandlerTarget::Method { method, .. } => method.clone(),
+                                HandlerTarget::Path { segments, .. } => segments.join("::"),
+                                HandlerTarget::Other => return None,
+                            };
+                            (Some(name.as_str()) == callee).then_some(())?;
+                            let target = self.resolve_callee(definition, &call.target)?;
+                            self.items[target].sig.inputs.iter().find_map(|input| match input {
+                                FnArg::Typed(typed) => match &*typed.pat {
+                                    Pat::Ident(ident)
+                                        if ident.ident.to_string().starts_with('_')
+                                            && type_name(&typed.ty)
+                                                .is_some_and(|name| super::structural::optional_caller(&name)) =>
+                                    {
+                                        Some(ident.ident.to_string())
+                                    }
+                                    Pat::Wild(_)
+                                        if type_name(&typed.ty)
+                                            .is_some_and(|name| super::structural::optional_caller(&name)) =>
+                                    {
+                                        Some("_".to_owned())
+                                    }
+                                    _ => None,
+                                },
+                                FnArg::Receiver(_) => None,
+                            })
+                        });
+                        return unused.map(|parameter| {
+                            let mut found = found.clone();
+                            found.mechanism = format!(
+                                "`{}` takes the caller as `{parameter}`, unused by name: no caller is needed by design",
+                                callee.unwrap_or_default()
+                            );
+                            found
+                        });
+                    }
                     let Some(note) = (found.kind == AuthEvidenceKind::Delegated)
                         .then(|| found.symbol.as_ref().and_then(|symbol| notes[definition].get(symbol)))
                         .flatten()
@@ -275,6 +408,26 @@ impl<'a> HandlerIndex<'a> {
             .map(|definition| {
                 let own_body = annotate(definition, &self.definitions[definition].own.body_evidence);
                 let mut evidence = annotate(definition, &self.definitions[definition].own.evidence);
+                // `check_access(&user, &note, None)?`: a check read by its
+                // name, whose function Archer read too and found to check
+                // only when given the argument this call leaves out.
+                if super::rc::enabled("ABSENT") {
+                    evidence.retain(|found| {
+                        !(resolved[definition].absent.iter().any(|(&callee, absent)| {
+                                let target = &self.definitions[callee];
+                                (found.mechanism == target.name || found.symbol.as_deref() == Some(target.name.as_str()))
+                                    && !body[callee].is_empty()
+                                    && body[callee].iter().all(|inner| {
+                                        inner.file == target.file
+                                            && target
+                                                .own
+                                                .reach
+                                                .condition_at(inner.line)
+                                                .is_some_and(|parameter| absent.contains(&parameter))
+                                    })
+                            }))
+                    });
+                }
                 let name = &self.definitions[definition].name;
                 for found in &body[definition] {
                     if own_body.iter().any(|own| same_evidence(own, found)) {
@@ -303,6 +456,26 @@ impl<'a> HandlerIndex<'a> {
         mut predicate: Vec<Vec<AuthEvidence>>,
     ) -> (Vec<Vec<AuthEvidence>>, Vec<Vec<AuthEvidence>>) {
         let count = body.len();
+        // Evidence a function has only when one of its parameters is
+        // given, by the evidence's location: its own checks inside `if
+        // let Some(x) = parameter { .. }`, and what it inherits through
+        // calls made only there. A caller that passes `None` or `false`
+        // for that parameter does not inherit it.
+        let mut conditions: Vec<HashMap<(PathBuf, usize), usize>> = (0..count)
+            .map(|definition| {
+                let own = &self.definitions[definition];
+                body[definition]
+                    .iter()
+                    .filter(|found| found.file == own.file)
+                    .filter_map(|found| {
+                        own.own
+                            .reach
+                            .condition_at(found.line)
+                            .map(|parameter| ((found.file.clone(), found.line), parameter))
+                    })
+                    .collect()
+            })
+            .collect();
         let mut queued: Vec<bool> = vec![false; count];
         // Functions whose summary grew: their callers are recomputed.
         let mut grown: Vec<usize> = (0..count)
@@ -323,15 +496,36 @@ impl<'a> HandlerIndex<'a> {
                 queued[caller] = false;
                 let mut added = false;
                 for &(callee, enforced) in &resolved[caller].calls {
+                    // The caller goes on when this callee fails.
+                    if resolved[caller].swallowed.contains(&callee) {
+                        continue;
+                    }
                     let passes = resolved[caller].passes_caller.contains(&callee);
+                    let absent = resolved[caller].absent.get(&callee);
+                    let via = resolved[caller].conditional.get(&callee).copied();
                     let inherited: Vec<AuthEvidence> = body[callee]
                         .iter()
                         .chain(enforced.then_some(predicate[callee].iter()).into_iter().flatten())
                         .filter(|found| passes || !is_about_passed_caller(found))
+                        .filter(|found| {
+                            match conditions[callee].get(&(found.file.clone(), found.line)) {
+                                Some(parameter) => !absent.is_some_and(|absent| absent.contains(parameter)),
+                                None => true,
+                            }
+                        })
                         .map(|found| self.through(callee, found))
                         .collect();
                     for found in inherited {
-                        added |= merge_evidence(&mut body[caller], found);
+                        let key = (found.file.clone(), found.line);
+                        if merge_evidence(&mut body[caller], found) {
+                            added = true;
+                            if let Some(parameter) = via {
+                                conditions[caller].insert(key, parameter);
+                            }
+                        } else if via.is_none() && conditions[caller].remove(&key).is_some() {
+                            // Also reached without the condition.
+                            added = true;
+                        }
                     }
                 }
                 for &callee in &resolved[caller].predicate_calls {
@@ -428,11 +622,29 @@ impl<'a> HandlerIndex<'a> {
             }
         }
         let types = self.local_types(definition);
-        for (target, roots) in &caller.own.call_roots {
-            if roots
+        // A parameter that holds the caller, by its declared type: a name
+        // bound again with another type (`let actor =
+        // self.current_user(actor)?`) has no one type in `types`.
+        let parameters: HashSet<String> = if super::rc::enabled("NARROWS") {
+            self.items[definition]
+                .sig
+                .inputs
                 .iter()
-                .any(|root| types.get(root).is_some_and(|ty| self.holds_caller(ty)))
-                && let Some(callee) = self.resolve_callee(definition, target)
+                .filter_map(|input| match input {
+                    syn::FnArg::Typed(typed) => match &*typed.pat {
+                        syn::Pat::Ident(ident) if self.holds_caller(&typed.ty) => Some(ident.ident.to_string()),
+                        _ => None,
+                    },
+                    syn::FnArg::Receiver(_) => None,
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        for (target, roots) in &caller.own.call_roots {
+            if roots.iter().any(|root| {
+                parameters.contains(root) || types.get(root).is_some_and(|ty| self.holds_caller(ty))
+            }) && let Some(callee) = self.resolve_callee(definition, target)
             {
                 resolved.passes_caller.insert(callee);
             }
@@ -444,7 +656,45 @@ impl<'a> HandlerIndex<'a> {
                 resolved.predicate_calls.push(callee);
             }
         }
+        // What every call site of a callee agrees on.
+        let mut sites: HashMap<usize, Vec<&super::reach::CallShape>> = HashMap::new();
+        for shape in &caller.own.reach.shapes {
+            if let Some(callee) = self.resolve_callee(definition, &shape.target) {
+                sites.entry(callee).or_default().push(shape);
+            }
+        }
+        for (callee, shapes) in sites {
+            let enforced = resolved
+                .calls
+                .iter()
+                .any(|(called, enforced)| *called == callee && *enforced);
+            if !enforced && shapes.iter().all(|shape| shape.swallowed) && self.fallible(callee) {
+                resolved.swallowed.insert(callee);
+            }
+            let absent: Vec<usize> = shapes[0]
+                .absent
+                .iter()
+                .copied()
+                .filter(|position| shapes.iter().all(|shape| shape.absent.contains(position)))
+                .collect();
+            if !absent.is_empty() {
+                resolved.absent.insert(callee, absent);
+            }
+            if let Some(parameter) = shapes[0].condition
+                && shapes.iter().all(|shape| shape.condition == Some(parameter))
+            {
+                resolved.conditional.insert(callee, parameter);
+            }
+        }
         resolved
+    }
+
+    /// Whether a function reports failure in its returned value: a
+    /// `Result` or an `Option`.
+    fn fallible(&self, definition: usize) -> bool {
+        returned_type(&self.items[definition].sig.output)
+            .and_then(|ty| type_name(&ty))
+            .is_some_and(|name| name.ends_with("Result") || name == "Option")
     }
 
     #[cfg(test)]
@@ -490,13 +740,32 @@ impl<'a> HandlerIndex<'a> {
                     let is_deref = implementation.trait_.as_ref().is_some_and(|(path, _)| {
                         path.segments.last().is_some_and(|segment| segment.ident == "Deref")
                     });
+                    if let Some((path, _)) = &implementation.trait_
+                        && let Some(segment) = path.segments.last()
+                    {
+                        let implementors = self.implementors.entry(segment.ident.to_string()).or_default();
+                        if !implementors.contains(&owner) {
+                            implementors.push(owner.clone());
+                        }
+                    }
                     for impl_item in &implementation.items {
                         match impl_item {
                             ImplItem::Type(target) if is_deref && target.ident == "Target" => {
-                                self.deref_targets
-                                    .entry(owner.clone())
-                                    .or_default()
-                                    .push(target.ty.clone());
+                                let targets = self.deref_targets.entry(owner.clone()).or_default();
+                                // The same impl seen twice (a vendored
+                                // copy of a crate) is one target.
+                                if !targets.iter().any(|known| {
+                                    quote::ToTokens::to_token_stream(known).to_string() == quote::ToTokens::to_token_stream(&target.ty).to_string()
+                                }) {
+                                    targets.push(target.ty.clone());
+                                }
+                                self.deref_params.insert(
+                                    owner.clone(),
+                                    type_arguments(&implementation.self_ty)
+                                        .iter()
+                                        .filter_map(|argument| type_name(argument))
+                                        .collect(),
+                                );
                             }
                             ImplItem::Fn(method) => {
                                 let function = ItemFn {
@@ -530,6 +799,46 @@ impl<'a> HandlerIndex<'a> {
                         }
                     }
                 }
+                Item::Trait(item_trait) if super::rc::enabled("TRAITS") => {
+                    // A trait's provided methods are reached through the
+                    // trait's name when no implementor overrides them.
+                    let owner = item_trait.ident.to_string();
+                    self.traits.insert(owner.clone());
+                    for trait_item in &item_trait.items {
+                        let syn::TraitItem::Fn(method) = trait_item else {
+                            continue;
+                        };
+                        let Some(block) = &method.default else {
+                            continue;
+                        };
+                        let function = ItemFn {
+                            attrs: method.attrs.clone(),
+                            vis: syn::Visibility::Inherited,
+                            modifiers: method.modifiers.clone(),
+                            sig: method.sig.clone(),
+                            block: Box::new(block.clone()),
+                        };
+                        let name = method.sig.ident.to_string();
+                        self.methods
+                            .entry((owner.clone(), name.clone()))
+                            .or_default()
+                            .push(self.definitions.len());
+                        let mut attrs = cfg_attributes(&item_trait.attrs);
+                        attrs.extend(cfg_attributes(&method.attrs));
+                        self.definitions.push(HandlerDefinition {
+                            file: file.to_path_buf(),
+                            crate_key: crate_key.to_path_buf(),
+                            module: module.clone(),
+                            name,
+                            evidence: Vec::new(),
+                            own: function_evidence_in(file, &function, Some(&owner)),
+                            cfg: attrs,
+                            stub: is_stub_body(&function.block),
+                            owner: Some(owner.clone()),
+                        });
+                        self.items.push(Cow::Owned(function));
+                    }
+                }
                 Item::Struct(item_struct) => {
                     let fields = item_struct
                         .fields
@@ -547,6 +856,10 @@ impl<'a> HandlerIndex<'a> {
                         .entry(item_struct.ident.to_string())
                         .or_default()
                         .push(fields);
+                    self.struct_crates
+                        .entry(item_struct.ident.to_string())
+                        .or_default()
+                        .push(crate_key.to_path_buf());
                 }
                 Item::Type(alias) => {
                     self.aliases
@@ -1363,6 +1676,10 @@ fn type_arguments(ty: &Type) -> Vec<&Type> {
     }
 }
 
+/// Marks a contested type name with its crate: `__archer_crate_1::Service`
+/// is the `Service` of the second crate listed for that name.
+const CRATE_PREFIX: &str = "__archer_crate_";
+
 /// How deep type aliases, `Deref` targets and wrappers are followed.
 const MAX_TYPE_DEPTH: usize = 8;
 
@@ -1381,7 +1698,21 @@ impl HandlerIndex<'_> {
             let next = if let Some([alias]) = self.aliases.get(&name).map(Vec::as_slice) {
                 alias.clone()
             } else if let Some([target]) = self.deref_targets.get(&name).map(Vec::as_slice) {
-                target.clone()
+                let mut target = target.clone();
+                let arguments = type_arguments(&current);
+                if super::rc::enabled("TYPES")
+                    && let Some(parameters) = self.deref_params.get(&name)
+                    && parameters.len() == arguments.len()
+                    && !parameters.is_empty()
+                {
+                    let named: HashMap<String, String> = parameters
+                        .iter()
+                        .zip(&arguments)
+                        .map(|(parameter, argument)| (parameter.clone(), quote::ToTokens::to_token_stream(argument).to_string()))
+                        .collect();
+                    syn::visit_mut::VisitMut::visit_type_mut(&mut Substitute { named: &named }, &mut target);
+                }
+                target
             } else if let [inner] = type_arguments(&current).as_slice() {
                 (*inner).clone()
             } else {
@@ -1398,12 +1729,212 @@ impl HandlerIndex<'_> {
     fn methods_of(&self, ty: &Type, method: &str) -> Vec<usize> {
         for candidate in self.deref_chain(ty) {
             if let Some(name) = type_name(&candidate)
-                && let Some(found) = self.methods.get(&(name, method.to_owned()))
+                && let Some(found) = self.methods.get(&(name.clone(), method.to_owned()))
             {
+                // `Service::find_trash` of the crate the type is written
+                // for, where several crates have a `Service`.
+                if found.len() > 1
+                    && let Some(wanted) = self.crate_of_type(&candidate)
+                {
+                    let narrowed: Vec<usize> = found
+                        .iter()
+                        .copied()
+                        .filter(|&definition| self.definitions[definition].crate_key == wanted)
+                        .collect();
+                    if !narrowed.is_empty() {
+                        return narrowed;
+                    }
+                }
                 return found.clone();
+            }
+            // A method the type does not define itself: one a trait of
+            // the scan provides to its implementors.
+            if let Some(name) = type_name(&candidate) {
+                let mut provided: Vec<usize> = Vec::new();
+                for (trait_name, implementors) in &self.implementors {
+                    if implementors.contains(&name)
+                        && let Some(methods) = self.methods.get(&(trait_name.clone(), method.to_owned()))
+                    {
+                        provided.extend(methods.iter().copied());
+                    }
+                }
+                if !provided.is_empty() {
+                    provided.sort_unstable();
+                    return provided;
+                }
+            }
+            // `dyn Trait`, `impl Trait`, or the trait named as a type
+            // (`Trait::method(..)`): the method of the trait's one
+            // implementor in the scan, or the trait's provided method.
+            let trait_name = trait_of(&candidate)
+                .or_else(|| type_name(&candidate))
+                .filter(|name| self.traits.contains(name));
+            if let Some(trait_name) = trait_name {
+                let mut found: Vec<usize> = Vec::new();
+                for implementor in self.implementors.get(&trait_name).into_iter().flatten() {
+                    if let Some(methods) = self.methods.get(&(implementor.clone(), method.to_owned())) {
+                        found.extend(methods.iter().copied());
+                    }
+                }
+                if found.is_empty()
+                    && let Some(provided) = self.methods.get(&(trait_name, method.to_owned()))
+                {
+                    found.extend(provided.iter().copied());
+                }
+                if !found.is_empty() {
+                    return found;
+                }
             }
         }
         Vec::new()
+    }
+
+    /// The trait a provided method's `self` stands for, seen from one
+    /// implementor: a call `self.check()` inside trait `T`'s provided
+    /// method resolves like a call on `dyn T`.
+    fn known_type(&self, name: &str) -> bool {
+        self.structs.contains_key(name) || self.method_owners().contains(name)
+    }
+
+    fn method_owners(&self) -> std::rc::Rc<HashSet<String>> {
+        if let Some(found) = self.owners.borrow().as_ref() {
+            return found.clone();
+        }
+        let owners: HashSet<String> = self.methods.keys().map(|(owner, _)| owner.clone()).collect();
+        let owners = std::rc::Rc::new(owners);
+        *self.owners.borrow_mut() = Some(owners.clone());
+        owners
+    }
+
+    /// Records the type names more than one crate defines.
+    fn find_contested(&mut self) {
+        if !super::rc::enabled("CRATES") {
+            return;
+        }
+        let mut crates: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut add = |name: &str, key: &Path| {
+            let known = crates.entry(name.to_owned()).or_default();
+            if !known.iter().any(|existing| existing == key) {
+                known.push(key.to_path_buf());
+            }
+        };
+        for (name, keys) in &self.struct_crates {
+            for key in keys {
+                add(name, key);
+            }
+        }
+        for definition in &self.definitions {
+            if let Some(owner) = &definition.owner {
+                add(owner, &definition.crate_key);
+            }
+        }
+        crates.retain(|_, keys| keys.len() > 1);
+        self.contested = crates;
+    }
+
+    /// The crate a type is written for: `kernel::Service` names it, and
+    /// `qualify` writes it into a contested name.
+    fn crate_of_type(&self, ty: &Type) -> Option<PathBuf> {
+        let Type::Path(path) = strip_reference(ty) else {
+            return None;
+        };
+        let [first, _, ..] = path.path.segments.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let first = first.ident.to_string();
+        if let Some(position) = first.strip_prefix(CRATE_PREFIX) {
+            let name = type_name(ty)?;
+            return self.contested.get(&name)?.get(position.parse::<usize>().ok()?).cloned();
+        }
+        self.crates.get(&first).cloned()
+    }
+
+    /// `ty` as written in crate `context`, with each contested type name
+    /// marked with the crate it means there: the crate's own type of that
+    /// name, else the one the crate imports (`use kernel::Service`). A
+    /// path that names a crate already (`kernel::Service`) is left alone.
+    pub(crate) fn qualify(&self, ty: &Type, context: &Path) -> Type {
+        if self.contested.is_empty() {
+            return ty.clone();
+        }
+        struct Qualify<'i, 'a> {
+            index: &'i HandlerIndex<'a>,
+            context: &'i Path,
+        }
+        impl syn::visit_mut::VisitMut for Qualify<'_, '_> {
+            fn visit_type_path_mut(&mut self, node: &mut syn::TypePath) {
+                syn::visit_mut::visit_type_path_mut(self, node);
+                if node.qself.is_some() {
+                    return;
+                }
+                let Some(last) = node.path.segments.last() else {
+                    return;
+                };
+                let name = last.ident.to_string();
+                let Some(crates) = self.index.contested.get(&name) else {
+                    return;
+                };
+                if node.path.segments.len() >= 2 {
+                    let first = node.path.segments[0].ident.to_string();
+                    if first.starts_with(CRATE_PREFIX) || self.index.crates.contains_key(&first) {
+                        return;
+                    }
+                }
+                let position = crates
+                    .iter()
+                    .position(|key| key == self.context)
+                    .or_else(|| self.index.imported_from(self.context, &name, crates));
+                if let Some(position) = position {
+                    let last = node.path.segments.last().cloned();
+                    let marker = syn::Ident::new(&format!("{CRATE_PREFIX}{position}"), proc_macro2::Span::call_site());
+                    let mut segments = syn::punctuated::Punctuated::new();
+                    segments.push(syn::PathSegment::from(marker));
+                    segments.extend(last);
+                    node.path = syn::Path {
+                        leading_colon: None,
+                        segments,
+                    };
+                }
+            }
+        }
+        let mut ty = ty.clone();
+        syn::visit_mut::VisitMut::visit_type_mut(&mut Qualify { index: self, context }, &mut ty);
+        ty
+    }
+
+    /// Which of `crates` the modules of crate `context` import `name`
+    /// from, if they all import it from one.
+    fn imported_from(&self, context: &Path, name: &str, crates: &[PathBuf]) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        for ((crate_key, _), scope) in &self.scopes {
+            if crate_key != context {
+                continue;
+            }
+            for import in scope.imports.get(name).into_iter().flatten() {
+                let from = import
+                    .segments
+                    .first()
+                    .and_then(|first| self.crates.get(first))
+                    .and_then(|key| crates.iter().position(|known| known == key));
+                match (found, from) {
+                    (_, None) => {}
+                    (None, Some(position)) => found = Some(position),
+                    (Some(existing), Some(position)) if existing != position => return None,
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    /// The type a call of `callee` returns, as written in its crate.
+    fn returned(&self, callee: usize, self_type: Option<&str>) -> Option<Type> {
+        let returned = returned_type(&self.items[callee].sig.output)?;
+        let returned = match self_type.or(self.definitions[callee].owner.as_deref()) {
+            Some(owner) => replace_self(&returned, owner),
+            None => returned,
+        };
+        Some(self.qualify(&returned, &self.definitions[callee].crate_key))
     }
 
     /// The type of field `field` (a name, or a tuple index) of a value of
@@ -1413,11 +1944,29 @@ impl HandlerIndex<'_> {
             let Some(name) = type_name(&candidate) else {
                 continue;
             };
-            if let Some([fields]) = self.structs.get(&name).map(Vec::as_slice) {
-                return fields
+            let Some(structs) = self.structs.get(&name) else {
+                continue;
+            };
+            // The one struct of that name, or the one in the crate the
+            // type is written for.
+            let position = match structs.as_slice() {
+                [_] => Some(0),
+                _ => self.crate_of_type(&candidate).and_then(|wanted| {
+                    let crates = self.struct_crates.get(&name)?;
+                    let mut found = crates.iter().enumerate().filter(|(_, key)| **key == wanted);
+                    let first = found.next()?;
+                    found.next().is_none().then_some(first.0)
+                }),
+            };
+            if let Some(position) = position {
+                let context = self.struct_crates.get(&name).and_then(|crates| crates.get(position));
+                return structs[position]
                     .iter()
                     .find(|(name, _)| name == field)
-                    .map(|(_, ty)| ty.clone());
+                    .map(|(_, ty)| match context {
+                        Some(context) => self.qualify(ty, context),
+                        None => ty.clone(),
+                    });
             }
         }
         None
@@ -1431,13 +1980,16 @@ impl HandlerIndex<'_> {
         if let Some(found) = self.local_types.borrow().get(&definition) {
             return found.clone();
         }
+        let item = &self.items[definition];
         let mut collector = LocalTypes {
             index: self,
+            definition,
             owner: self.definitions[definition].owner.clone(),
             types: HashMap::new(),
             conflicted: HashSet::new(),
+            bounds: self.trait_bounds(&item.sig),
+            inferring: super::rc::enabled("TYPES"),
         };
-        let item = &self.items[definition];
         for input in &item.sig.inputs {
             match input {
                 syn::FnArg::Receiver(_) => {
@@ -1481,6 +2033,13 @@ impl HandlerIndex<'_> {
         let mut parts = receiver.split('.');
         let mut ty = self.local_types(definition).get(parts.next()?)?.clone();
         for field in parts {
+            if std::env::var("ARCHER_DEBUG_TYPES").is_ok() {
+                eprintln!(
+                    "   chain {receiver} .{field}: {:?} structs {:?}",
+                    self.deref_chain(&ty).iter().map(|ty| quote::ToTokens::to_token_stream(ty).to_string()).collect::<Vec<_>>(),
+                    self.deref_chain(&ty).iter().map(|ty| type_name(ty).and_then(|name| self.structs.get(&name).map(Vec::len))).collect::<Vec<_>>()
+                );
+            }
             ty = self.field_type(&ty, field)?;
         }
         Some(ty)
@@ -1502,6 +2061,17 @@ impl HandlerIndex<'_> {
     /// and `value.method()` by the type of `value`. Anything else stays
     /// unresolved.
     pub(crate) fn resolve_callee(&self, caller: usize, target: &HandlerTarget) -> Option<usize> {
+        let found = self.resolve_generic(caller, target)?;
+        // The copy made for the type this caller passes, if it passes one.
+        Some(match self.instances.get(&(caller, found)) {
+            Some(Some(instance)) => *instance,
+            _ => found,
+        })
+    }
+
+    /// `resolve_callee` before a generic function is exchanged for the
+    /// copy made for this caller.
+    fn resolve_generic(&self, caller: usize, target: &HandlerTarget) -> Option<usize> {
         let found = match target {
             HandlerTarget::Method { receiver, method } => {
                 let ty = self.receiver_type(caller, receiver)?;
@@ -1524,22 +2094,30 @@ impl HandlerIndex<'_> {
                             return None;
                         };
                         let ty = syn::parse_str::<Type>(&owner).ok()?;
+                        let ty = self.qualify(&ty, &self.definitions[caller].crate_key);
                         self.single(&self.methods_of(&ty, name), caller)
                     }
                 }
             }
             HandlerTarget::Other => None,
         };
-        found.filter(|&callee| callee != caller)
+        found.filter(|&callee| callee != caller && self.instance_of.get(&caller) != Some(&callee))
     }
 }
 
 /// Collects the declared types of a function's named values.
 struct LocalTypes<'i, 'a> {
     index: &'i HandlerIndex<'a>,
+    definition: usize,
     owner: Option<String>,
     types: HashMap<String, Type>,
     conflicted: HashSet<String>,
+    /// The function's type parameters bounded by a trait of the scan, as
+    /// `impl Trait`: a value of type `U: UseCase` is used as the trait.
+    bounds: HashMap<String, Type>,
+    /// Whether types are read off calls, fields and patterns (the
+    /// root-cause round), or only off struct literals and `Type::f(..)`.
+    inferring: bool,
 }
 
 impl LocalTypes<'_, '_> {
@@ -1547,11 +2125,34 @@ impl LocalTypes<'_, '_> {
         if self.conflicted.contains(&name) {
             return;
         }
+        // A value of a bounded type parameter is used as its trait.
+        let ty = match type_name(&ty).and_then(|name| self.bounds.get(&name)) {
+            Some(bound) => bound.clone(),
+            None => ty,
+        };
+        let ty = self.index.qualify(&ty, &self.index.definitions[self.definition].crate_key);
+        let written = |ty: &Type| quote::ToTokens::to_token_stream(strip_reference(ty)).to_string();
         match self.types.get(&name) {
-            Some(existing)
-                if quote::ToTokens::to_token_stream(existing).to_string()
-                    != quote::ToTokens::to_token_stream(&ty).to_string() =>
-            {
+            Some(existing) if written(existing) != written(&ty) => {
+                // `let user = find(id).await; let user = user.ok_or(..)?;`:
+                // one value, wrapped and unwrapped. Method calls reach the
+                // inner type from either; the inner one is kept.
+                if self.inferring {
+                    let inside = |outer: &Type, inner: &Type| {
+                        self.index
+                            .deref_chain(outer)
+                            .iter()
+                            .skip(1)
+                            .any(|link| written(link) == written(inner))
+                    };
+                    if inside(existing, &ty) {
+                        self.types.insert(name, ty);
+                        return;
+                    }
+                    if inside(&ty, existing) {
+                        return;
+                    }
+                }
                 self.types.remove(&name);
                 self.conflicted.insert(name);
             }
@@ -1576,11 +2177,37 @@ impl LocalTypes<'_, '_> {
             syn::Pat::Reference(reference) => self.bind(&reference.pat, ty),
             syn::Pat::Paren(paren) => self.bind(&paren.pat, ty),
             syn::Pat::Type(typed) => self.bind(&typed.pat, &typed.ty),
+            syn::Pat::Guard(guarded) => self.bind(&guarded.pat, ty),
+            syn::Pat::TupleStruct(tuple)
+                if self.inferring
+                    && tuple.path.segments.last().is_some_and(|segment| {
+                        segment.ident == "Some" || segment.ident == "Ok"
+                    }) =>
+            {
+                // `Some(user)` or `Ok(user)` against `Option<User>`.
+                if let Some(element) = tuple.elems.first()
+                    && let Some(inner) = carried(ty)
+                {
+                    self.bind(element, &inner);
+                }
+            }
             syn::Pat::TupleStruct(tuple) => {
                 for (position, element) in tuple.elems.iter().enumerate() {
                     if let Some(field) = self.index.field_type(ty, &position.to_string()) {
                         self.bind(element, &field);
                     }
+                }
+            }
+            syn::Pat::Tuple(tuple) if self.inferring => {
+                if let Type::Tuple(types) = strip_reference(ty) {
+                    for (element, ty) in tuple.elems.iter().zip(&types.elems) {
+                        self.bind(element, ty);
+                    }
+                }
+            }
+            syn::Pat::Or(cases) if self.inferring => {
+                if let Some(first) = cases.cases.first() {
+                    self.bind(first, ty);
                 }
             }
             syn::Pat::Struct(structure) => {
@@ -1596,10 +2223,15 @@ impl LocalTypes<'_, '_> {
         }
     }
 
-    /// The type of an initializer Archer can read without inference: a
-    /// struct literal, or `Type::f(..)` with `f`'s declared return type,
-    /// through `?` and `.await`.
+    /// The type of an initializer: a struct literal or `Type::f(..)` with
+    /// `f`'s declared return type, through `?` and `.await`; and, in the
+    /// root-cause round, whatever `HandlerIndex::expr_type` reads.
     fn initializer_type(&self, expr: &syn::Expr) -> Option<Type> {
+        if self.inferring {
+            return self
+                .index
+                .expr_type(self.definition, self.owner.as_deref(), &self.types, expr, 0);
+        }
         match expr {
             syn::Expr::Struct(literal) if literal.qself.is_none() => {
                 let name = literal.path.segments.last()?.ident.to_string();
@@ -1659,18 +2291,45 @@ fn replace_self(ty: &Type, owner: &str) -> Type {
 
 impl<'ast> syn::visit::Visit<'ast> for LocalTypes<'_, '_> {
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        if self.inferring {
+            // The initializer first: `let user = match found { Some(u) =>
+            // u, .. }` has the type its arm's binding has.
+            syn::visit::visit_local(self, node);
+        }
         match &node.pat {
             syn::Pat::Type(typed) => self.bind(&typed.pat, &typed.ty),
             pattern => {
                 if let Some(init) = &node.init
-                    && init.diverge.is_none()
+                    && (init.diverge.is_none() || self.inferring)
                     && let Some(ty) = self.initializer_type(&init.expr)
                 {
                     self.bind(pattern, &ty);
                 }
             }
         }
-        syn::visit::visit_local(self, node);
+        if !self.inferring {
+            syn::visit::visit_local(self, node);
+        }
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        if self.inferring
+            && let Some(ty) = self.initializer_type(&node.expr)
+        {
+            self.bind(&node.pat, &ty);
+        }
+        syn::visit::visit_expr_let(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if self.inferring
+            && let Some(ty) = self.initializer_type(&node.expr)
+        {
+            for arm in &node.arms {
+                self.bind(&arm.pat, &ty);
+            }
+        }
+        syn::visit::visit_expr_match(self, node);
     }
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
@@ -1698,4 +2357,558 @@ fn merge_evidence(evidence: &mut Vec<AuthEvidence>, found: AuthEvidence) -> bool
     }
     evidence.push(found);
     true
+}
+
+/// A type without its references and parentheses.
+pub(crate) fn strip_reference(ty: &Type) -> &Type {
+    match ty {
+        Type::Reference(reference) => strip_reference(&reference.elem),
+        Type::Paren(paren) => strip_reference(&paren.elem),
+        Type::Group(group) => strip_reference(&group.elem),
+        _ => ty,
+    }
+}
+
+/// The trait of `dyn Trait` or `impl Trait`: its first bound that is not a
+/// marker (`Send`, `Sync`, `Debug`..).
+fn trait_of(ty: &Type) -> Option<String> {
+    let bounds = match strip_reference(ty) {
+        Type::TraitObject(object) => &object.bounds,
+        Type::ImplTrait(implemented) => &implemented.bounds,
+        _ => return None,
+    };
+    bounds.iter().find_map(|bound| match bound {
+        syn::TypeParamBound::Trait(found) => found
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .filter(|name| !MARKER_TRAITS.contains(&name.as_str())),
+        _ => None,
+    })
+}
+
+/// Traits that say nothing about which methods a value has.
+const MARKER_TRAITS: &[&str] = &[
+    "Send", "Sync", "Sized", "Unpin", "Debug", "Clone", "Copy", "Default", "Serialize", "Deserialize",
+    "DeserializeOwned", "Display", "PartialEq", "Eq", "Hash",
+];
+
+/// What `?`, `.unwrap()`, `Some(x)` or `Ok(x)` take out of a value of type
+/// `ty`: the first type argument of an `Option` or a `..Result`.
+fn carried(ty: &Type) -> Option<Type> {
+    let ty = strip_reference(ty);
+    match type_name(ty).as_deref() {
+        Some(name) if name.ends_with("Result") || name == "Option" => {
+            type_arguments(ty).first().map(|inner| (*inner).clone())
+        }
+        _ => None,
+    }
+}
+
+/// The value type of a function's declared return type: `T` for `-> T`,
+/// and for `-> impl Future<Output = T>`.
+fn returned_type(output: &syn::ReturnType) -> Option<Type> {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    if let Type::ImplTrait(implemented) = &**ty {
+        for bound in &implemented.bounds {
+            if let syn::TypeParamBound::Trait(found) = bound
+                && let Some(segment) = found.path.segments.last()
+                && segment.ident == "Future"
+                && let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+            {
+                for argument in &arguments.args {
+                    if let syn::GenericArgument::AssocType(output) = argument
+                        && output.ident == "Output"
+                    {
+                        return Some(output.ty.clone());
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    Some((**ty).clone())
+}
+
+/// Methods and functions whose result is the value they are given, perhaps
+/// wrapped or unwrapped: its type reaches the same methods.
+const SAME_VALUE: &[&str] = &[
+    "clone", "cloned", "copied", "to_owned", "as_ref", "as_mut", "as_deref", "as_deref_mut", "borrow",
+    "borrow_mut", "deref", "deref_mut", "into_inner", "get_ref", "get_mut", "map_err", "ok", "ok_or",
+    "ok_or_else", "or_else", "context", "with_context", "inspect_err", "inspect", "unwrap_or",
+    "unwrap_or_else", "unwrap_or_default", "lock", "read", "write", "take", "into", "iter", "into_iter",
+    "first", "last", "next", "pop", "get", "peekable", "as_slice", "to_vec",
+];
+const UNWRAPS: &[&str] = &["unwrap", "expect", "unwrap_unchecked"];
+/// Functions that wrap or move their one argument.
+const WRAPPERS: &[&str] = &["Some", "Ok", "new", "from", "take", "replace", "pin"];
+const WRAPPER_TYPES: &[&str] = &["Box", "Arc", "Rc", "Data", "Json", "Mutex", "RwLock", "RefCell", "Cell", "mem", "Pin"];
+
+/// How deep an expression's type is read.
+const MAX_EXPR_DEPTH: usize = 24;
+
+impl HandlerIndex<'_> {
+    /// A function's type parameters bounded by a trait defined in the scan,
+    /// as `impl Trait`.
+    fn trait_bounds(&self, signature: &syn::Signature) -> HashMap<String, Type> {
+        let mut bounds: HashMap<String, Type> = HashMap::new();
+        if self.traits.is_empty() {
+            return bounds;
+        }
+        let mut bound = |name: String, found: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>| {
+            for candidate in found {
+                if let syn::TypeParamBound::Trait(candidate) = candidate
+                    && let Some(segment) = candidate.path.segments.last()
+                    && self.traits.contains(&segment.ident.to_string())
+                    && let Ok(ty) = syn::parse_str::<Type>(&format!("impl {}", segment.ident))
+                {
+                    bounds.entry(name).or_insert(ty);
+                    return;
+                }
+            }
+        };
+        for parameter in &signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter {
+                bound(parameter.ident.to_string(), &parameter.bounds);
+            }
+        }
+        if let Some(clause) = &signature.generics.where_clause {
+            for predicate in &clause.predicates {
+                if let syn::WherePredicate::Type(predicate) = predicate
+                    && let Type::Path(path) = &predicate.bounded_ty
+                    && let Some(ident) = path.path.get_ident()
+                    && signature.generics.params.iter().any(|parameter| {
+                        matches!(parameter, syn::GenericParam::Type(parameter) if parameter.ident == *ident)
+                    })
+                {
+                    bound(ident.to_string(), &predicate.bounds);
+                }
+            }
+        }
+        bounds
+    }
+
+    /// The type of an expression in `definition`'s body, read without
+    /// solving anything: a named value's type, a field's declared type, a
+    /// call's declared return type, through `?`, `.await`, references and
+    /// calls that hand their value on. `None` where that is not enough.
+    pub(crate) fn expr_type(
+        &self,
+        definition: usize,
+        owner: Option<&str>,
+        types: &HashMap<String, Type>,
+        expr: &syn::Expr,
+        depth: usize,
+    ) -> Option<Type> {
+        use syn::Expr;
+        if depth > MAX_EXPR_DEPTH {
+            return None;
+        }
+        let of = |inner: &Expr| self.expr_type(definition, owner, types, inner, depth + 1);
+        match expr {
+            Expr::Struct(literal) if literal.qself.is_none() => {
+                let name = literal.path.segments.last()?.ident.to_string();
+                let written = if name == "Self" {
+                    syn::parse_str::<Type>(owner?).ok()?
+                } else {
+                    Type::Path(syn::TypePath {
+                        attrs: Vec::new(),
+                        qself: None,
+                        path: literal.path.clone(),
+                    })
+                };
+                Some(self.qualify(&written, &self.definitions[definition].crate_key))
+            }
+            Expr::Await(inner) => of(&inner.base),
+            Expr::Try(inner) => {
+                let ty = of(&inner.expr)?;
+                match type_name(&ty).as_deref() {
+                    Some(name) if name.ends_with("Result") || name == "Option" => carried(&ty),
+                    _ => Some(ty),
+                }
+            }
+            Expr::Paren(inner) => of(&inner.expr),
+            Expr::Group(inner) => of(&inner.expr),
+            Expr::Reference(inner) => of(&inner.expr),
+            Expr::Unary(inner) if matches!(inner.op, syn::UnOp::Deref(_)) => of(&inner.expr),
+            Expr::Cast(cast) => Some(self.qualify(&cast.ty, &self.definitions[definition].crate_key)),
+            Expr::Path(path) if path.qself.is_none() => {
+                let ident = path.path.get_ident()?;
+                types.get(&ident.to_string()).cloned()
+            }
+            Expr::Field(field) => {
+                let base = of(&field.base)?;
+                let member = match &field.member {
+                    syn::Member::Named(name) => name.to_string(),
+                    syn::Member::Unnamed(index) => index.index.to_string(),
+                };
+                self.field_type(&base, &member)
+            }
+            Expr::Block(block) => match block.block.stmts.last() {
+                Some(syn::Stmt::Expr(tail, None)) => of(tail),
+                _ => None,
+            },
+            Expr::Match(matched) => matched.arms.iter().find_map(|arm| of(&arm.body)),
+            Expr::If(branch) => match branch.then_branch.stmts.last() {
+                Some(syn::Stmt::Expr(tail, None)) => of(tail),
+                _ => None,
+            },
+            Expr::Call(call) => {
+                let Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                let target = HandlerTarget::Path {
+                    segments: segments.clone(),
+                    leading_colon: path.path.leading_colon.is_some(),
+                };
+                if let Some(callee) = self.resolve_generic(definition, &target) {
+                    return self.returned(callee, None);
+                }
+                // `Some(user)`, `Arc::new(service)`, `mem::take(&mut id)`.
+                let wraps = match segments.as_slice() {
+                    [name] => name == "Some" || name == "Ok",
+                    [.., qualifier, name] => {
+                        WRAPPER_TYPES.contains(&qualifier.as_str()) && WRAPPERS.contains(&name.as_str())
+                    }
+                    [] => false,
+                };
+                if wraps {
+                    return call.args.first().and_then(of);
+                }
+                None
+            }
+            Expr::MethodCall(call) => {
+                let method = call.method.to_string();
+                let receiver = of(&call.receiver);
+                if let Some(receiver) = &receiver
+                    && let Some(callee) = self.single(&self.methods_of(receiver, &method), definition)
+                {
+                    // A provided method's `Self` is the receiver.
+                    let provided = self.definitions[callee]
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| self.traits.contains(owner));
+                    let receiver_written = provided
+                        .then(|| quote::ToTokens::to_token_stream(strip_reference(receiver)).to_string());
+                    return self.returned(callee, receiver_written.as_deref());
+                }
+                if UNWRAPS.contains(&method.as_str()) {
+                    let receiver = receiver?;
+                    return carried(&receiver).or(Some(receiver));
+                }
+                if SAME_VALUE.contains(&method.as_str()) {
+                    return receiver;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The type a call site passes for a parameter, as a type of the scan:
+    /// the first type in the argument's deref chain that has a struct or an
+    /// `impl` block here.
+    fn concrete(&self, ty: &Type, generic: &HashSet<String>) -> Option<String> {
+        self.deref_chain(strip_reference(ty)).iter().find_map(|link| {
+            let name =
+                type_name(strip_reference(link)).filter(|name| !generic.contains(name) && self.known_type(name))?;
+            // A contested name keeps the crate it is written for.
+            if self.contested.contains_key(&name)
+                && self.crate_of_type(link).is_some()
+                && let Type::Path(path) = strip_reference(link)
+                && let Some(first) = path.path.segments.first()
+            {
+                return Some(format!("{}::{name}", first.ident));
+            }
+            Some(name)
+        })
+    }
+
+    /// Makes a copy of each generic function for each type its callers
+    /// pass, however deep (`execute(usecase)` -> `run(usecase)` ->
+    /// `usecase.execute()`), so that both the evidence and the caller-use
+    /// layers read the method the call reaches. A parameter is replaced
+    /// when its declared type is a type parameter (`U`, `&U`), `impl
+    /// Trait`, or a trait object, and the argument's type is a type of the
+    /// scan.
+    fn instantiate_generics(&mut self) {
+        if !super::rc::enabled("GENERICS") {
+            return;
+        }
+        let originals = self.definitions.len();
+        let limit = originals + originals.max(4000);
+        let mut made: HashMap<(usize, Vec<(String, String)>), usize> = HashMap::new();
+        let mut pending: Vec<(usize, usize)> = (0..originals).rev().map(|definition| (definition, 0)).collect();
+        while let Some((caller, depth)) = pending.pop() {
+            let types = self.local_types(caller);
+            let owner = self.definitions[caller].owner.clone();
+            let generic: HashSet<String> = self.items[caller]
+                .sig
+                .generics
+                .params
+                .iter()
+                .filter_map(|parameter| match parameter {
+                    syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let mut sites = CallSites::default();
+            syn::visit::Visit::visit_block(&mut sites, &self.items[caller].block);
+            for (target, arguments) in sites.found {
+                let Some(callee) = self.resolve_generic(caller, &target) else {
+                    continue;
+                };
+                let passed: Vec<Option<String>> = arguments
+                    .iter()
+                    .map(|argument| {
+                        self.expr_type(caller, owner.as_deref(), &types, argument, 0)
+                            .and_then(|ty| self.concrete(&ty, &generic))
+                    })
+                    .collect();
+                let replaced = self.replacements(callee, &passed);
+                if replaced.is_empty() {
+                    continue;
+                }
+                let key = (callee, replaced.clone());
+                let instance = match made.get(&key) {
+                    Some(instance) => *instance,
+                    None => {
+                        if self.definitions.len() >= limit || depth >= MAX_INSTANCE_DEPTH {
+                            continue;
+                        }
+                        let instance = self.instantiate(callee, &replaced);
+                        made.insert(key, instance);
+                        pending.push((instance, depth + 1));
+                        instance
+                    }
+                };
+                match self.instances.get(&(caller, callee)) {
+                    None => {
+                        self.instances.insert((caller, callee), Some(instance));
+                    }
+                    Some(Some(existing)) if *existing != instance => {
+                        self.instances.insert((caller, callee), None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Which of `callee`'s parameters a call replaces, given the scan type
+    /// each argument has: `("U", "RenameUseCase")` for a type parameter,
+    /// `("#2", "JwtAuth")` for the `impl Trait` or `dyn Trait` parameter at
+    /// position 2.
+    fn replacements(&self, callee: usize, passed: &[Option<String>]) -> Vec<(String, String)> {
+        let item = &self.items[callee];
+        let generic: HashSet<String> = item
+            .sig
+            .generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        let mut replaced: Vec<(String, String)> = Vec::new();
+        for (position, input) in item.sig.inputs.iter().enumerate() {
+            let syn::FnArg::Typed(typed) = input else {
+                continue;
+            };
+            let Some(Some(concrete)) = passed.get(position) else {
+                continue;
+            };
+            let declared = strip_reference(&typed.ty);
+            let key = match declared {
+                Type::Path(path) => match path.path.get_ident() {
+                    Some(ident) if generic.contains(&ident.to_string()) => ident.to_string(),
+                    // `Box<dyn Policy>`, `Arc<dyn Policy>`.
+                    _ => match type_arguments(declared).as_slice() {
+                        [inner] if trait_of(inner).is_some() => format!("#{position}"),
+                        _ => continue,
+                    },
+                },
+                Type::ImplTrait(_) | Type::TraitObject(_) => {
+                    // Closures are not types of the scan; a trait of the
+                    // scan, or one whose implementor is, is.
+                    if trait_of(declared).is_none() {
+                        continue;
+                    }
+                    format!("#{position}")
+                }
+                _ => continue,
+            };
+            if !replaced.iter().any(|(existing, _)| *existing == key) {
+                replaced.push((key, concrete.clone()));
+            }
+        }
+        replaced
+    }
+
+    /// A copy of `callee` with `replaced` applied; returns its index.
+    fn instantiate(&mut self, callee: usize, replaced: &[(String, String)]) -> usize {
+        let mut item: ItemFn = self.items[callee].clone().into_owned();
+        let named: HashMap<String, String> = replaced
+            .iter()
+            .filter(|(key, _)| !key.starts_with('#'))
+            .cloned()
+            .collect();
+        for (key, concrete) in replaced {
+            if let Some(position) = key.strip_prefix('#').and_then(|position| position.parse::<usize>().ok())
+                && let Some(syn::FnArg::Typed(typed)) = item.sig.inputs.iter_mut().nth(position)
+                && let Ok(ty) = syn::parse_str::<Type>(concrete)
+            {
+                *typed.ty = ty;
+            }
+        }
+        if !named.is_empty() {
+            let mut substitute = Substitute { named: &named };
+            syn::visit_mut::VisitMut::visit_item_fn_mut(&mut substitute, &mut item);
+            item.sig.generics.params = item
+                .sig
+                .generics
+                .params
+                .iter()
+                .filter(|parameter| {
+                    !matches!(parameter, syn::GenericParam::Type(parameter) if named.contains_key(&parameter.ident.to_string()) || named.values().any(|concrete| parameter.ident == concrete))
+                })
+                .cloned()
+                .collect();
+        }
+        let mut definition = self.definitions[callee].clone();
+        definition.evidence = Vec::new();
+        definition.own = function_evidence_in(&definition.file, &item, definition.owner.as_deref());
+        let instance = self.definitions.len();
+        self.definitions.push(definition);
+        self.items.push(Cow::Owned(item));
+        self.instance_of.insert(instance, callee);
+        instance
+    }
+
+    /// `ARCHER_DEBUG_CALLS=name`: prints, for each function of that name,
+    /// the types Archer read for its values and where each call resolves.
+    fn debug_calls(&self) {
+        let Ok(wanted) = std::env::var("ARCHER_DEBUG_CALLS") else {
+            return;
+        };
+        for (definition, found) in self.definitions.iter().enumerate() {
+            if found.name != wanted {
+                continue;
+            }
+            eprintln!(
+                "== #{definition} {} ({}){}",
+                found.rust_path(),
+                found.file.display(),
+                self.instance_of
+                    .get(&definition)
+                    .map(|generic| format!(" copy of #{generic}"))
+                    .unwrap_or_default()
+            );
+            let types = self.local_types(definition);
+            let mut names: Vec<&String> = types.keys().collect();
+            names.sort();
+            for name in names {
+                eprintln!("   {name}: {}", quote::ToTokens::to_token_stream(&types[name]));
+            }
+            let mut sites = CallSites::default();
+            syn::visit::Visit::visit_block(&mut sites, &self.items[definition].block);
+            for (target, _) in sites.found {
+                let written = target.written().unwrap_or_default();
+                match self.resolve_callee(definition, &target) {
+                    Some(callee) => eprintln!(
+                        "   call {written} -> #{callee} {}{}",
+                        self.definitions[callee].rust_path(),
+                        if self.instance_of.contains_key(&callee) { " (copy)" } else { "" }
+                    ),
+                    None => eprintln!("   call {written} -> ?"),
+                }
+            }
+            for found in &found.evidence {
+                eprintln!("   evidence {:?} {} {:?}", found.kind, found.mechanism, found.symbol);
+            }
+        }
+    }
+}
+
+/// How deep copies of generic functions call further copies.
+const MAX_INSTANCE_DEPTH: usize = 6;
+
+/// The calls in a body with their argument expressions; a method call's
+/// receiver is argument 0, as the method's `self` is its first input.
+#[derive(Default)]
+struct CallSites {
+    found: Vec<(HandlerTarget, Vec<syn::Expr>)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for CallSites {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Some(target @ HandlerTarget::Path { .. }) = handler_target(&node.func) {
+            self.found.push((target, node.args.iter().cloned().collect()));
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if let Some(receiver) = receiver_path(&node.receiver) {
+            self.found.push((
+                HandlerTarget::Method {
+                    receiver,
+                    method: node.method.to_string(),
+                },
+                std::iter::once((*node.receiver).clone())
+                    .chain(node.args.iter().cloned())
+                    .collect(),
+            ));
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _: &'ast ItemFn) {}
+    fn visit_item_impl(&mut self, _: &'ast syn::ItemImpl) {}
+}
+
+/// Writes a concrete type for a type parameter: `U` becomes the type, and
+/// `U::Response`, `U::subscribers()` name it.
+struct Substitute<'n> {
+    named: &'n HashMap<String, String>,
+}
+
+impl syn::visit_mut::VisitMut for Substitute<'_> {
+    fn visit_type_mut(&mut self, node: &mut Type) {
+        if let Type::Path(path) = node
+            && path.qself.is_none()
+            && let Some(ident) = path.path.get_ident()
+            && let Some(concrete) = self.named.get(&ident.to_string())
+            && let Ok(ty) = syn::parse_str::<Type>(concrete)
+        {
+            *node = ty;
+            return;
+        }
+        syn::visit_mut::visit_type_mut(self, node);
+    }
+
+    fn visit_path_mut(&mut self, node: &mut syn::Path) {
+        if node.segments.len() >= 2
+            && let Some(first) = node.segments.first_mut()
+            && first.arguments.is_none()
+            && let Some(concrete) = self.named.get(&first.ident.to_string())
+            && let Ok(written) = syn::parse_str::<syn::Path>(concrete)
+            && written.segments.iter().all(|segment| segment.arguments.is_none())
+        {
+            // `U::run()` for `U = kernel::Service`: `kernel::Service::run()`.
+            let rest: Vec<syn::PathSegment> = node.segments.iter().skip(1).cloned().collect();
+            node.segments = written.segments.into_iter().chain(rest).collect();
+        }
+        syn::visit_mut::visit_path_mut(self, node);
+    }
 }

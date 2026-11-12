@@ -62,6 +62,11 @@ const UNRESOLVED_METHODS: [&str; 24] = [
 #[derive(Default)]
 struct State {
     caller_types: HashSet<String>,
+    /// Caller types that only middleware which forwards a request without
+    /// a credential puts into the extensions: a value of one may be "no
+    /// caller" (`Actor::None`), so holding it proves nothing. The code
+    /// that narrows it does.
+    optional_callers: HashSet<String>,
     /// Extractor types whose `from_request` takes a caller type out of the
     /// request extensions.
     caller_extractors: HashSet<String>,
@@ -87,6 +92,43 @@ thread_local! {
 
 pub(crate) fn caller_type(name: &str) -> bool {
     enabled() && STATE.with(|state| state.borrow().caller_types.contains(name))
+}
+
+/// A caller type that may hold no caller: see `State::optional_callers`.
+pub(crate) fn optional_caller(name: &str) -> bool {
+    enabled() && STATE.with(|state| state.borrow().optional_callers.contains(name))
+}
+
+thread_local! {
+    /// String constants of the scanned code that name a credential header
+    /// (`const AUTHORIZATION_HEADER: &str = "authorization";`).
+    static CREDENTIAL_CONSTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+fn credential_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.len() < 40 && CREDENTIAL_HEADER_TEXT.iter().any(|word| text.contains(word))
+}
+
+fn credential_consts(items: &[Item], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            Item::Const(constant) => {
+                if let Expr::Lit(literal) = &*constant.expr
+                    && let syn::Lit::Str(text) = &literal.lit
+                    && credential_text(&text.value())
+                {
+                    out.insert(constant.ident.to_string());
+                }
+            }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    credential_consts(items, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn caller_extractor(name: &str) -> bool {
@@ -135,6 +177,7 @@ pub(crate) fn forbidding_variant(path: &str) -> bool {
 struct FnInfo<'a> {
     owner: Option<String>,
     name: String,
+    sig: &'a syn::Signature,
     block: &'a syn::Block,
     output: Option<&'a Type>,
 }
@@ -269,7 +312,11 @@ impl<'ast> Visit<'ast> for Facts {
         if node
             .segments
             .last()
-            .is_some_and(|segment| CREDENTIAL_HEADERS.contains(&segment.ident.to_string().as_str()))
+            .is_some_and(|segment| {
+                let name = segment.ident.to_string();
+                CREDENTIAL_HEADERS.contains(&name.as_str())
+                    || CREDENTIAL_CONSTS.with(|consts| consts.borrow().contains(&name))
+            })
         {
             self.names_credential_header = true;
         }
@@ -303,6 +350,7 @@ fn collect<'a>(items: &'a [Item], out: &mut Vec<(FnInfo<'a>, Option<String>)>, i
                 FnInfo {
                     owner: None,
                     name: function.sig.ident.to_string(),
+                    sig: &function.sig,
                     block: &function.block,
                     output: match &function.sig.output {
                         ReturnType::Type(_, ty) => Some(ty),
@@ -324,6 +372,7 @@ fn collect<'a>(items: &'a [Item], out: &mut Vec<(FnInfo<'a>, Option<String>)>, i
                             FnInfo {
                                 owner: owner.clone(),
                                 name: function.sig.ident.to_string(),
+                                sig: &function.sig,
                                 block: &function.block,
                                 output: match &function.sig.output {
                                     ReturnType::Type(_, ty) => Some(ty),
@@ -459,9 +508,14 @@ pub(crate) fn index<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File
     }
     let mut fns = Vec::new();
     let mut impls = Vec::new();
+    let mut consts = HashSet::new();
     for file in files.iter().copied().chain(embedded.iter()) {
         collect(&file.items, &mut fns, &mut impls);
+        if super::rc::enabled("OPTIONAL") {
+            credential_consts(&file.items, &mut consts);
+        }
     }
+    CREDENTIAL_CONSTS.with(|known| *known.borrow_mut() = consts);
     let facts: Vec<Facts> = fns
         .iter()
         .map(|(info, _)| {
@@ -593,16 +647,38 @@ pub(crate) fn index<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File
     };
 
     let mut caller_types = HashSet::new();
+    // Per caller type: whether every function that stores it forwards a
+    // request that has no credential.
+    let mut stored_optionally: HashMap<String, bool> = HashMap::new();
     for (i, (info, _)) in fns.iter().enumerate() {
         if !credential[i] {
             continue;
         }
         for inserted in &facts[i].inserted {
             if let Some(ty) = expr_type(inserted, info.block, &returns, 0) {
+                let optional = super::middleware::forwards_without_credential(
+                    super::middleware::request_parameter(info.sig).as_deref(),
+                    info.block,
+                );
+                let all = stored_optionally.entry(ty.clone()).or_insert(true);
+                *all = *all && optional;
                 caller_types.insert(ty);
             }
         }
     }
+    // A type whose own extractor reads the credential and can fail
+    // authenticates by itself when no middleware stored it: a handler
+    // that takes it has a caller.
+    let optional_callers: HashSet<String> = stored_optionally
+        .into_iter()
+        .filter(|(_, optional)| *optional)
+        .map(|(ty, _)| ty)
+        .filter(|ty| {
+            !extractor_fns.iter().any(|(name, ids)| {
+                name == ty && ids.iter().any(|&i| credential[i] && facts[i].builds_error)
+            })
+        })
+        .collect();
 
     // Extractors that take a caller type out of the extensions, themselves
     // or through what they call.
@@ -712,6 +788,9 @@ pub(crate) fn index<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File
         let mut sorted: Vec<_> = caller_types.iter().collect();
         sorted.sort();
         eprintln!("caller types: {sorted:?}");
+        let mut sorted: Vec<_> = optional_callers.iter().collect();
+        sorted.sort();
+        eprintln!("optional callers: {sorted:?}");
         let mut sorted: Vec<_> = caller_extractors.iter().collect();
         sorted.sort();
         eprintln!("caller extractors: {sorted:?}");
@@ -724,6 +803,7 @@ pub(crate) fn index<'a>(files: impl IntoIterator<Item = (&'a Path, &'a syn::File
     STATE.with(|state| {
         *state.borrow_mut() = State {
             caller_types,
+            optional_callers,
             caller_extractors,
             credential_extractors,
             components,
@@ -760,6 +840,12 @@ fn expr_type(expr: &Expr, block: &syn::Block, returns: &HashMap<String, String>,
             }
         }
         Expr::Struct(literal) => literal.path.segments.last().map(|s| s.ident.to_string()),
+        // `Actor::None`: a variant or associated constant of the type.
+        Expr::Path(path) if path.path.segments.len() >= 2 && super::rc::enabled("OPTIONAL") => {
+            let owner = &path.path.segments[path.path.segments.len() - 2].ident;
+            let owner = owner.to_string();
+            owner.starts_with(|c: char| c.is_ascii_uppercase()).then_some(owner)
+        }
         Expr::Path(path) if path.path.segments.len() == 1 => {
             let name = path.path.segments[0].ident.to_string();
             if name.starts_with(|c: char| c.is_ascii_uppercase()) {

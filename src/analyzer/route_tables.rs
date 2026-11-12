@@ -361,6 +361,8 @@ fn expand(
                     called: Vec::new(),
                     takes_credentials: false,
                     sees_request: false,
+                    takes_nothing: false,
+                    takes_data: false,
                     unserved: false,
                     app: None,
                 },

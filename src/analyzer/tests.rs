@@ -3677,10 +3677,13 @@ fn f16_wrap_fn_closures_are_unknown_and_routing_guards_are_ignored() {
         "f16",
         include_str!("../../tests/fixtures/probes/drift/f16_wrap_fn_and_guards.rs"),
     );
+    // The closure reads a header and forwards every request: it cannot
+    // answer one itself, so it protects nothing (it used to count as
+    // protection Archer could not read).
     assert_eq!(
         reported(&report),
         [
-            finding(UnverifiedProtection, "GET", "/admin/hook"),
+            finding(MissingAuthorization, "GET", "/admin/hook"),
             finding(MissingAuthorization, "GET", "/admin/json"),
         ]
     );
@@ -5923,14 +5926,26 @@ fn a_stale_revision_error_is_not_a_check_of_the_caller() {
     // `write_setting` only fails with a variant answered with 412, so the
     // handlers calling it make no check with the caller.
     for route in &report.routes {
+        // `get_setting` matches on `read_setting(&account, &key)`, a load
+        // by the caller and the key: that holds the key to the caller,
+        // whatever the writes fail with.
+        let scoped_read = route.method == "GET";
         assert!(
-            route.caller_use.iter().all(|feature| !feature.starts_with("checks:") && !feature.starts_with("binds:")),
+            route.caller_use.iter().all(|feature| {
+                !feature.starts_with("checks:") && (scoped_read || !feature.starts_with("binds:"))
+            }),
             "{} {:?}",
             route.method,
             route.caller_use
         );
     }
-    assert!(report.finding_details.is_empty(), "{:?}", p13_lines(&report));
+    // The read loads by the caller and the key; the writes filter by the
+    // key alone. That difference is reported at Low, to be dismissed if
+    // intended: it is not the stale-revision error that raises it.
+    assert_eq!(
+        p13_lines(&report),
+        ["Low SkipsPeerCheck DELETE /settings/{key}", "Low SkipsPeerCheck PUT /settings/{key}"]
+    );
 }
 
 #[test]
@@ -5947,4 +5962,88 @@ fn a_write_without_the_caller_every_other_write_takes_is_medium() {
             "Medium SkipsPeerCheck POST /imports/rules",
         ]
     );
+}
+
+/// The variation matrix: one small notes app per way of writing an
+/// authorization check, by where the caller comes from (a), where the
+/// check lives (b), how it is written (c), and what looks like a check
+/// and is not (d). In each, five routes make the check and `POST
+/// /notes/{id}/share` does not, and exactly that route is reported at
+/// High or Medium.
+#[test]
+fn every_variation_of_a_check_flags_only_the_route_without_it() {
+    let variations: [(&str, &str); 25] = [
+        ("a2_option_extractor_with_ok_or", include_str!("../../tests/fixtures/variations/a2_option_extractor_with_ok_or.rs")),
+        ("a3_option_extractor_never_required", include_str!("../../tests/fixtures/variations/a3_option_extractor_never_required.rs")),
+        ("a4_caller_from_request_extensions", include_str!("../../tests/fixtures/variations/a4_caller_from_request_extensions.rs")),
+        ("a5_caller_never_required", include_str!("../../tests/fixtures/variations/a5_caller_never_required.rs")),
+        ("a6_maybe_caller_narrowed_in_service", include_str!("../../tests/fixtures/variations/a6_maybe_caller_narrowed_in_service.rs")),
+        ("a7_maybe_caller_never_narrowed", include_str!("../../tests/fixtures/variations/a7_maybe_caller_never_narrowed.rs")),
+        ("a8_route_outside_the_wrapped_scope", include_str!("../../tests/fixtures/variations/a8_route_outside_the_wrapped_scope.rs")),
+        ("b2_helper_function", include_str!("../../tests/fixtures/variations/b2_helper_function.rs")),
+        ("b3_service_method", include_str!("../../tests/fixtures/variations/b3_service_method.rs")),
+        ("b4_generic_use_case", include_str!("../../tests/fixtures/variations/b4_generic_use_case.rs")),
+        ("b5_trait_object", include_str!("../../tests/fixtures/variations/b5_trait_object.rs")),
+        ("c1_compare_and_return", include_str!("../../tests/fixtures/variations/c1_compare_and_return.rs")),
+        ("c2_match_guard", include_str!("../../tests/fixtures/variations/c2_match_guard.rs")),
+        ("c3_scoped_load", include_str!("../../tests/fixtures/variations/c3_scoped_load.rs")),
+        ("c4_check_function", include_str!("../../tests/fixtures/variations/c4_check_function.rs")),
+        ("c5_let_else", include_str!("../../tests/fixtures/variations/c5_let_else.rs")),
+        ("c6_ok_or", include_str!("../../tests/fixtures/variations/c6_ok_or.rs")),
+        ("c7_role", include_str!("../../tests/fixtures/variations/c7_role.rs")),
+        ("c8_compound_condition", include_str!("../../tests/fixtures/variations/c8_compound_condition.rs")),
+        ("d1_result_dropped_with_ok", include_str!("../../tests/fixtures/variations/d1_result_dropped_with_ok.rs")),
+        ("d2_result_bound_to_underscore", include_str!("../../tests/fixtures/variations/d2_result_bound_to_underscore.rs")),
+        ("d3_only_logs", include_str!("../../tests/fixtures/variations/d3_only_logs.rs")),
+        ("d4_if_let_ok_without_else", include_str!("../../tests/fixtures/variations/d4_if_let_ok_without_else.rs")),
+        ("d5_match_with_empty_error_arm", include_str!("../../tests/fixtures/variations/d5_match_with_empty_error_arm.rs")),
+        ("d6_check_switched_off_by_argument", include_str!("../../tests/fixtures/variations/d6_check_switched_off_by_argument.rs")),
+    ];
+    let mut wrong = Vec::new();
+    for (name, source) in variations {
+        let report = drift_fixture(name, source);
+        let mut flagged: Vec<String> = report
+            .finding_details
+            .iter()
+            .filter(|finding| finding.severity != Severity::Low)
+            .map(|finding| format!("{} {}", finding.suspicious_route.method, finding.suspicious_route.path))
+            .collect();
+        flagged.sort();
+        flagged.dedup();
+        if flagged != ["POST /notes/{id}/share"] {
+            wrong.push(format!("{name}: {flagged:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn routes_on_the_callers_own_record_are_not_missing_the_admin_role() {
+    let report = drift_fixture(
+        "e1",
+        include_str!("../../tests/fixtures/variations/e1_own_record_routes.rs"),
+    );
+    // The extractor authenticates by itself when the pass-through
+    // middleware stored no caller, so every route that takes it has one.
+    for path in ["/users/me", "/auth/logout"] {
+        for route in report.routes.iter().filter(|route| route.path == path) {
+            assert!(
+                route
+                    .authorization
+                    .iter()
+                    .any(|evidence| evidence.kind == AuthEvidenceKind::IdentityExtraction),
+                "{} {}: {:?}",
+                route.method,
+                route.path,
+                route.authorization
+            );
+        }
+    }
+    let flagged: Vec<String> = report
+        .finding_details
+        .iter()
+        .filter(|finding| finding.severity != Severity::Low)
+        .map(|finding| format!("{} {}", finding.suspicious_route.method, finding.suspicious_route.path))
+        .collect();
+    assert!(flagged.is_empty(), "{flagged:?}");
 }

@@ -14,6 +14,8 @@ mod handlers;
 mod macros;
 mod middleware;
 mod p13;
+mod rc;
+mod reach;
 mod model;
 mod peer_checks;
 mod public;
@@ -50,6 +52,11 @@ fn is_skipped_directory(root: &Path, entry: &walkdir::DirEntry, options: &Analys
     }
     let name = entry.file_name().to_string_lossy();
     if name.starts_with('.') {
+        return true;
+    }
+    // A crate copied in by `cargo vendor` (it writes a checksum file
+    // into each): a dependency, like the ones outside the repository.
+    if rc::enabled("VENDORED") && entry.path().join(".cargo-checksum.json").is_file() {
         return true;
     }
     let crate_level = entry
@@ -299,6 +306,16 @@ fn analyze_on_current_thread(root: &Path, options: &AnalysisOptions) -> Result<R
         route.resource_keys = keys;
         route.origin.called = called;
         route.origin.takes_credentials = credentials;
+        route.origin.takes_nothing = route
+            .origin
+            .definition
+            .is_some_and(|definition| index.items[definition].sig.inputs.is_empty());
+        route.origin.takes_data = route.origin.definition.is_some_and(|definition| {
+            index.items[definition].sig.inputs.iter().any(|input| match input {
+                syn::FnArg::Typed(typed) => !evidence::identity_type(&typed.ty),
+                syn::FnArg::Receiver(_) => false,
+            })
+        });
         // P13: whether the handler can see the request's credentials.
         route.origin.sees_request = route.origin.definition.is_some_and(|definition| {
             index.items[definition].sig.inputs.iter().any(|input| match input {

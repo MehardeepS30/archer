@@ -73,6 +73,8 @@ struct Features {
     mentions: BTreeSet<String>,
     /// Constants its auth objects are built with (`caller_use::GRANTS`).
     grants: BTreeSet<String>,
+    /// Identity labels it hands whole to a call (`caller_use::HANDS`).
+    hands: BTreeSet<String>,
 }
 
 impl Features {
@@ -97,9 +99,12 @@ fn features(route: &Route) -> Features {
     let mut binds = BTreeSet::new();
     let mut mentions = BTreeSet::new();
     let mut grants = BTreeSet::new();
+    let mut hands = BTreeSet::new();
     for feature in &route.caller_use {
         if let Some(value) = feature.strip_prefix(GRANTS) {
             grants.insert(value.to_string());
+        } else if let Some(label) = feature.strip_prefix(super::caller_use::HANDS) {
+            hands.insert(label.to_string());
         } else if feature.starts_with(KEYED) {
             // Bookkeeping for `public::likely_public`, not a check.
         } else if let Some(tag) = feature.strip_prefix(BINDS) {
@@ -149,6 +154,7 @@ fn features(route: &Route) -> Features {
         binds,
         mentions,
         grants,
+        hands,
     }
 }
 
@@ -247,6 +253,10 @@ fn unguarded_record(
                 .filter(|&&other| direct(&featured[other], key))
                 .count();
             let share = having.len() as f64 / population.len().max(1) as f64;
+            // With comparisons read inside check functions too, one
+            // comparison among many policy checks (moderator, banned) is
+            // not an ownership rule: most of the guards must compare.
+            let compared = if super::rc::enabled("INNER") && compared * 2 < having.len() { 0 } else { compared };
             let enough = (population.len() >= MIN_POPULATION
                 && ((share + 1e-9 >= CONSENSUS && compared > 0) || having.len() == population.len()))
                 || (population.len() == 2 && having.len() == 2);
@@ -330,7 +340,15 @@ fn unguarded_record(
         return Some(Finding {
             peer_group_id: id,
             category: FindingCategory::SkipsPeerCheck,
-            severity: if population.len() >= MIN_POPULATION && compared > 0 && !other_scheme && !across {
+            // A route that checks a role or permission (an admin's purge
+            // beside a user's own delete) acts on any record by design
+            // more often than it forgets whose record it is.
+            severity: if population.len() >= MIN_POPULATION
+                && compared > 0
+                && !other_scheme
+                && !across
+                && !(super::rc::enabled("INNER") && route.best_tier() == EvidenceTier::Privilege)
+            {
                 Severity::Medium
             } else {
                 Severity::Low
@@ -1128,7 +1146,30 @@ pub(crate) fn skipped_peer_checks(
                     // route's own checks; a call to a variant of the check
                     // (`validate_x_or_init` for `validate_x`) makes it.
                     None => {
-                        !own.uses.contains(feature)
+                        // A comparison of the caller with a request value
+                        // or a record needs one: a route that takes no
+                        // path parameter, reads no body field and loads
+                        // no record answers with the caller's own data.
+                        let no_object = super::rc::enabled("NOOBJECT")
+                            && feature.starts_with("compares:")
+                            && path_parameters(&route.path).is_empty()
+                            && own.loads.is_empty()
+                            && own.mentions.is_empty();
+                        // A route that hands the caller whole to a call
+                        // uses it, whichever fields that call reads.
+                        let handed = feature
+                            .strip_prefix("reads:")
+                            .and_then(|rest| rest.split_once(':'))
+                            .is_some_and(|(label, _)| own.hands.contains(label));
+                        // A load scoped to the caller compares the
+                        // record's owner with the caller, in the query.
+                        let scoped = super::rc::enabled("SCOPEDCOMPARE")
+                            && feature.starts_with("compares:")
+                            && own.guards.values().flatten().any(|how| how == SCOPED_LOAD);
+                        !no_object
+                            && !scoped
+                            && !handed
+                            && !own.uses.contains(feature)
                             && (own_checks.is_empty()
                                 || (!own_policy(scope, *total, having)
                                     && feature.starts_with("checks:")
@@ -1887,10 +1928,20 @@ type GrantSupport = (String, (String, String), Vec<usize>, usize);
 /// route beneath it (`/notes/{id}`) that holds a record it loads to the
 /// caller makes an object-level check the create cannot make.
 fn acts_on_existing_record(route: &Route, own: &Features, other: &Route, theirs: &Features) -> bool {
+    let beneath = other.path.starts_with(&format!("{}/{{", route.path.trim_end_matches('/')));
+    // Any route that addresses a record by a path parameter the create
+    // does not take, not only an item route right beneath it
+    // (`/user/calendar/{calendar_id}` beside `POST /user`).
+    let addressed = super::rc::enabled("CREATES") && {
+        let own_parameters = path_parameters(&route.path);
+        path_parameters(&other.path)
+            .iter()
+            .any(|parameter| !own_parameters.contains(parameter))
+    };
     super::public::rule_on("S3")
         && route.method == "POST"
         && !route.path.ends_with('}')
-        && other.path.starts_with(&format!("{}/{{", route.path.trim_end_matches('/')))
+        && (beneath || addressed)
         && theirs.guards.keys().any(|key| !own.loads.contains(key))
 }
 

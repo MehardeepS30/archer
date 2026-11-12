@@ -59,6 +59,70 @@ fn anonymous_scopes(routes: &[Route]) -> Vec<(String, String)> {
     scopes
 }
 
+/// A route whose handler is a function with no parameters and no auth
+/// evidence, in an application whose handlers mostly take the request's
+/// data or the application's state (not only the caller): it can
+/// read nothing of the request, the application state or a database
+/// handle, so every caller gets the same fixed answer (a status, the
+/// build version, a "not found"). Where most handlers take nothing (a
+/// sketch of an app), this says nothing about one of them.
+fn fixed_answer(route: &Route, routes: &[Route]) -> Option<String> {
+    if !super::rc::enabled("FIXED")
+        || !route.origin.takes_nothing
+        || route.best_tier() != EvidenceTier::None
+        || route.requirement.authenticated
+    {
+        return None;
+    }
+    let resolved = routes.iter().filter(|other| other.origin.definition.is_some()).count();
+    let taking = routes
+        .iter()
+        .filter(|other| other.origin.definition.is_some() && other.origin.takes_data)
+        .count();
+    (taking * 2 > resolved).then(|| {
+        "Likely public by design: its handler takes no parameters, unlike most handlers here, so it reads neither the request nor the application's state and answers every caller alike.".to_string()
+    })
+}
+
+/// A route that acts on the caller's own record (`GET /users/me` beside
+/// `GET /users/{user_id}`): it authenticates, its path names no record
+/// where a sibling takes one by id, and its handler works from a field
+/// of the caller, loading nothing by an id the request chose. The caller
+/// can reach only their own data, so the role the id-addressed siblings
+/// require is not missing here.
+fn own_record(route: &Route, finding: &Finding, routes: &[Route]) -> Option<String> {
+    if !super::rc::enabled("SELF")
+        || finding.suspicious_route_tier != EvidenceTier::Identity
+        || finding.expected_tier <= EvidenceTier::Identity
+        || has_unresolved_segment(&route.path)
+    {
+        return None;
+    }
+    let (parent, last) = route.path.rsplit_once('/')?;
+    if last.is_empty() || last.contains('{') {
+        return None;
+    }
+    let addressed = format!("{parent}/{{");
+    let sibling = routes
+        .iter()
+        .find(|other| other.path.starts_with(&addressed) && other.path != route.path)?;
+    let field = route
+        .caller_use
+        .iter()
+        .find_map(|feature| feature.strip_prefix("reads:").and_then(|rest| rest.split_once(':')).map(|(_, field)| field))?;
+    let unguarded = route.caller_use.iter().filter_map(|feature| feature.strip_prefix(LOADS)).any(|key| {
+        let guard = format!("{GUARDS}{key}:");
+        !route.caller_use.iter().any(|feature| feature.starts_with(&guard))
+    });
+    if unguarded {
+        return None;
+    }
+    Some(format!(
+        "Likely the caller's own record: the path names no record where {} {} takes one by id, and the handler works from the caller's own `{field}`, so it can reach only the caller's data. Dismiss if so.",
+        sibling.method, sibling.path
+    ))
+}
+
 /// Why a route looks public by design, if it does.
 pub(crate) fn likely_public(route: &Route, scopes: &[(String, String)]) -> Option<String> {
     if has_unresolved_segment(&route.path) || !takes_no_caller(route) {
@@ -101,7 +165,13 @@ pub(crate) fn demote_likely_public(routes: &[Route], findings: &mut [Finding]) {
         }) else {
             continue;
         };
-        let Some(reason) = likely_public(route, &scopes) else {
+        if let Some(reason) = own_record(route, finding, routes) {
+            finding.severity = Severity::Low;
+            finding.rationale.push(' ');
+            finding.rationale.push_str(&reason);
+            continue;
+        }
+        let Some(reason) = fixed_answer(route, routes).or_else(|| likely_public(route, &scopes)) else {
             continue;
         };
         finding.severity = Severity::Low;

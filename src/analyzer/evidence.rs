@@ -65,6 +65,9 @@ pub(crate) struct FunctionEvidence {
     /// Every repository call with the bindings its receiver and arguments
     /// are read from (`check(&user.person)` reads `user`).
     pub(crate) call_roots: Vec<(HandlerTarget, Vec<String>)>,
+    /// What the body says about whether its checks' rejections reach the
+    /// response (see `reach`).
+    pub(crate) reach: super::reach::Reach,
 }
 
 /// Mechanism of a check read from a function's structure: a branch on a
@@ -104,6 +107,10 @@ pub(crate) fn function_evidence_in(file: &Path, item: &ItemFn, owner: Option<&st
     let mut evidence = signature_evidence(file, &handler, &item.attrs, &item.sig.inputs);
     let mut visitor = AuthEvidenceVisitor::new(file, &handler);
     visitor.returns_bool = returns_bool(&item.sig.output);
+    visitor.identities = identity_bindings(item.sig.inputs.iter().filter_map(|input| match input {
+        FnArg::Typed(typed) => Some((&*typed.pat, &*typed.ty)),
+        FnArg::Receiver(_) => None,
+    }));
     // A `Result` returned as the body's value is the caller's to propagate:
     // `fn h() -> Result<..> { user.has_role("admin") }` rejects on `Err`.
     let tail = if returns_result(&item.sig.output) {
@@ -164,6 +171,7 @@ pub(crate) fn function_evidence_in(file: &Path, item: &ItemFn, owner: Option<&st
         calls: visitor.calls,
         predicate_calls: visitor.predicate_calls,
         call_roots: visitor.call_roots,
+        reach: super::reach::reach(item),
     }
 }
 
@@ -893,6 +901,16 @@ fn extractor_evidence(ty: &Type, file: &Path, handler: &str, evidence: &mut Vec<
                 return;
             };
             let name = segment.ident.to_string();
+            // A caller value that may be "no caller" (set by middleware
+            // that lets a request through without a credential): taking
+            // it proves nothing. The code that narrows it does.
+            if super::structural::optional_caller(&name)
+                || (name == "ReqData"
+                    && first_type_argument_name(&segment.arguments)
+                        .is_some_and(|inner| super::structural::optional_caller(&inner)))
+            {
+                return;
+            }
             // `web::ReqData<Claims>`: what authentication middleware stored
             // for the request. Present only once that middleware ran.
             if name == "ReqData"
@@ -1212,6 +1230,11 @@ pub(crate) struct AuthEvidenceVisitor {
     /// Bindings that hold the requesting caller's identity, read from a call
     /// named for it (`let username = get_username_from_session(&s)`).
     callers: HashSet<String>,
+    /// Visiting a call whose failure the code discards (see `reach`): a
+    /// check read from its name does not restrict the request.
+    swallowing: bool,
+    /// Parameters that hold the caller, by their type.
+    identities: HashSet<String>,
 }
 
 /// Words of a call's name that make its result the caller's identity.
@@ -1271,7 +1294,61 @@ impl AuthEvidenceVisitor {
             capture: None,
             bound: HashMap::new(),
             callers: HashSet::new(),
+            swallowing: false,
+            identities: HashSet::new(),
         }
+    }
+
+    /// A value that is the caller or nothing: a parameter of an identity
+    /// type (`actor: Actor`, `user: Option<User>`), or what the request's
+    /// extensions hold for one (`req.extensions().get::<Session>()`),
+    /// through `.cloned()`, `&`, `.await`.
+    fn caller_value(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(inner) => self.caller_value(&inner.expr),
+            Expr::Group(inner) => self.caller_value(&inner.expr),
+            Expr::Reference(inner) => self.caller_value(&inner.expr),
+            Expr::Await(inner) => self.caller_value(&inner.base),
+            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| {
+                let name = ident.to_string();
+                self.identities.contains(&name) || self.callers.contains(&name)
+            }),
+            Expr::MethodCall(call) => {
+                let method = call.method.to_string();
+                if ["cloned", "clone", "as_ref", "copied", "as_deref", "take"].contains(&method.as_str()) {
+                    return self.caller_value(&call.receiver);
+                }
+                let from_extensions = matches!(&*call.receiver, Expr::MethodCall(receiver)
+                    if receiver.method == "extensions" || receiver.method == "extensions_mut");
+                from_extensions
+                    && ["get", "remove", "get_mut"].contains(&method.as_str())
+                    && call.turbofish.as_ref().is_some_and(|turbofish| {
+                        turbofish.args.iter().any(|argument| {
+                            matches!(argument, GenericArgument::Type(ty) if identity_type(ty)
+                                || super::handlers::type_name(ty).is_some_and(|name| super::extractors::names_caller(&name)))
+                        })
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Code that goes on only with a caller: `match actor { Actor::User {
+    /// user, .. } => Ok(user), _ => Err(..) }`, `let Some(session) =
+    /// req.extensions().get::<Session>() else { return Err(..) }`. The
+    /// request is rejected when there is none, which authenticates it.
+    fn narrowed(&mut self, scrutinee: &Expr) {
+        if !super::rc::enabled("NARROWS") || !self.caller_value(scrutinee) {
+            return;
+        }
+        let written = scrutinee.to_token_stream().to_string().replace(' ', "");
+        let evidence = self.evidence(
+            AuthEvidenceKind::IdentityExtraction,
+            written,
+            scrutinee.span().start().line,
+            AuthStrength::Weak,
+        );
+        self.with_use(Use::Enforcing, |visitor| visitor.record(evidence, false));
     }
 
     /// A binding that holds the caller's identity.
@@ -1327,16 +1404,17 @@ impl AuthEvidenceVisitor {
     /// extraction bound to a variable (`let user = current_user(&req);`)
     /// counts: that is how an extracted identity is used.
     fn record(&mut self, evidence: AuthEvidence, imperative: bool) {
-        let enforced = match self.use_ {
+        let enforced = !self.swallowing
+            && match self.use_ {
             Use::Enforcing => true,
             Use::Statement => imperative,
             Use::Scoping => evidence.kind == AuthEvidenceKind::OwnershipCheck,
-            Use::Value => {
-                imperative
-                    && evidence.kind == AuthEvidenceKind::IdentityExtraction
-                    && self.capture.is_some()
-            }
-        };
+                Use::Value => {
+                    imperative
+                        && evidence.kind == AuthEvidenceKind::IdentityExtraction
+                        && self.capture.is_some()
+                }
+            };
         if enforced {
             if self.in_returned_value {
                 self.predicate_evidence.push(evidence);
@@ -1413,6 +1491,9 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         };
         // `let Some(user) = current_user(&req) else { return ... };`
         if let Some((_, diverge)) = &init.diverge {
+            if expr_rejects(diverge) {
+                self.narrowed(&init.expr);
+            }
             self.with_use(Use::Enforcing, |visitor| visitor.visit_expr(&init.expr));
             self.with_use(Use::Statement, |visitor| visitor.visit_expr(diverge));
             return;
@@ -1431,6 +1512,12 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
     }
 
     fn visit_expr_try(&mut self, node: &'ast ExprTry) {
+        // `user.ok_or(Error::Unauthorized)?`
+        if let Expr::MethodCall(call) = &*node.expr
+            && (call.method == "ok_or" || call.method == "ok_or_else")
+        {
+            self.narrowed(&call.receiver);
+        }
         self.with_use(Use::Enforcing, |visitor| visitor.visit_expr(&node.expr));
     }
 
@@ -1445,7 +1532,16 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         } else {
             Use::Value
         };
+        let swallowing = self.swallowing;
+        self.swallowing = self.swallowing || super::reach::swallows_if(node);
         self.with_use(condition, |visitor| visitor.visit_expr(&node.cond));
+        self.swallowing = swallowing;
+        // `if let Some(user) = user { .. } else { return Err(..) }`
+        if let Expr::Let(binding) = &*node.cond
+            && node.else_branch.as_ref().is_some_and(|(_, branch)| expr_rejects(branch))
+        {
+            self.narrowed(&binding.expr);
+        }
         self.visit_block(&node.then_branch);
         if let Some((_, branch)) = &node.else_branch {
             self.with_use(Use::Statement, |visitor| visitor.visit_expr(branch));
@@ -1468,7 +1564,7 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         let rejecting: Vec<bool> = node
             .arms
             .iter()
-            .map(|arm| expr_rejects(&arm.body))
+            .map(|arm| expr_rejects(&arm.body) || hands_error_on(arm))
             .collect();
         let enforcing = rejecting.iter().any(|rejects| *rejects);
         let condition = if enforcing {
@@ -1476,7 +1572,13 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
         } else {
             Use::Value
         };
+        let swallowing = self.swallowing;
+        self.swallowing = self.swallowing || (!enforcing && super::reach::swallows_match(node));
         self.with_use(condition, |visitor| visitor.visit_expr(&node.expr));
+        self.swallowing = swallowing;
+        if enforcing && rejecting.iter().any(|rejects| !*rejects) {
+            self.narrowed(&node.expr);
+        }
         if enforcing && let Some(kind) = authorization_operand(&node.expr) {
             let admitting: Vec<&syn::Arm> = node
                 .arms
@@ -1527,11 +1629,13 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             self.call_roots.push((target.clone(), roots));
             self.record_call(target);
         }
+        let swallowing = std::mem::replace(&mut self.swallowing, false);
         self.with_use(Use::Value, |visitor| {
             for argument in &node.args {
                 visitor.visit_expr(argument);
             }
         });
+        self.swallowing = swallowing;
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
@@ -1569,7 +1673,10 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
             self.call_roots.push((target.clone(), roots));
             self.record_call(target);
         }
+        let swallowing = self.swallowing;
+        self.swallowing = self.swallowing || (self.use_ != Use::Enforcing && super::reach::swallows_method(node));
         self.visit_expr(&node.receiver);
+        self.swallowing = false;
         // A filter whose result decides a rejection (`let Some(a) =
         // users.find(|u| is_admin(u)) else { return .. }`) enforces its
         // predicate; otherwise it scopes the records returned.
@@ -1583,6 +1690,7 @@ impl<'ast> Visit<'ast> for AuthEvidenceVisitor {
                 visitor.visit_expr(argument);
             }
         });
+        self.swallowing = swallowing;
     }
 
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
@@ -1984,6 +2092,39 @@ pub(crate) fn sql_scopes_to_caller(text: &str) -> bool {
                 .starts_with(['$', '?', ':', '@'])
         })
     })
+}
+
+/// `Err(err) => err.into()`: the arm's value is the error itself, turned
+/// into the response (`.into()`, `.error_response()`, a call given it),
+/// so the failure answers the request.
+fn hands_error_on(arm: &syn::Arm) -> bool {
+    if !super::rc::enabled("ERRARM") {
+        return false;
+    }
+    let Pat::TupleStruct(pattern) = &arm.pat else {
+        return false;
+    };
+    if !pattern.path.segments.last().is_some_and(|segment| segment.ident == "Err") {
+        return false;
+    }
+    let Some(Pat::Ident(bound)) = pattern.elems.first() else {
+        return false;
+    };
+    fn is_error(expr: &Expr, name: &syn::Ident) -> bool {
+        match expr {
+            Expr::Path(path) => path.path.is_ident(name),
+            Expr::Reference(inner) => is_error(&inner.expr, name),
+            Expr::Paren(inner) => is_error(&inner.expr, name),
+            Expr::MethodCall(call) => is_error(&call.receiver, name),
+            Expr::Call(call) => call.args.iter().any(|argument| is_error(argument, name)),
+            Expr::Block(block) => match block.block.stmts.as_slice() {
+                [syn::Stmt::Expr(only, None)] => is_error(only, name),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    is_error(&arm.body, &bound.ident)
 }
 
 /// Whether a value's rejecting branch exists: an early `return`, `?`, an
@@ -3689,6 +3830,16 @@ fn secret_checks(file: &Path, handler: &str, block: &Block) -> Vec<AuthEvidence>
             Expr::Try(inner) => secret_lookup(&inner.expr),
             Expr::Await(inner) => secret_lookup(&inner.base),
             Expr::Call(call) => call.args.iter().any(names_secret),
+            // A statement that stores the value (`.bind(&user.totp_secret)
+            // .execute(db)`, `map.insert(token, ..)`) looks nothing up.
+            Expr::MethodCall(call)
+                if super::rc::enabled("WRITES")
+                    && ["execute", "exec", "insert", "update", "save", "push"]
+                        .iter()
+                        .any(|method| call.method == method) =>
+            {
+                false
+            }
             Expr::MethodCall(call) => call.args.iter().any(names_secret) || secret_lookup(&call.receiver),
             _ => false,
         }

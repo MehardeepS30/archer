@@ -111,6 +111,7 @@ pub(crate) fn caller_use<'f>(
     routes: &[Route],
 ) -> Vec<Vec<String>> {
     let files: Vec<&syn::File> = files.into_iter().collect();
+    NARROWERS.with(|known| *known.borrow_mut() = narrowers(index));
     let mut walker = Walker {
         index,
         shapes: return_shapes(files.iter().copied()),
@@ -168,6 +169,11 @@ pub(crate) fn caller_use<'f>(
 /// with none only answers with flags and counts (`handle_taken`), which
 /// `public::likely_public` uses.
 pub(crate) const KEYED: &str = "keyed:";
+
+/// Feature prefix: the route hands the caller whole to a call, as
+/// `hands:Label`. Not compared; `peer_checks` does not report such a
+/// route for not reading a field its peers read.
+pub(crate) const HANDS: &str = "hands:";
 
 /// Feature prefix: a constant the route builds an authentication object
 /// with, as `grants:Type::Variant`. Compared by `peer_checks::same_grant`.
@@ -413,7 +419,7 @@ impl Walker<'_, '_> {
         };
         for candidate in &analysis.checks {
             let (check, resolved) = self.is_check(definition, candidate);
-            if check {
+            if check && !candidate.idle {
                 summary.features.insert(candidate.feature.clone());
                 // A record handed with the caller to a call under `?` is
                 // held to the caller only by a check Archer read; a call it
@@ -463,13 +469,41 @@ impl Walker<'_, '_> {
             }
         }
         let mut callees: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
+        let debug = std::env::var("ARCHER_DEBUG_FLOWS")
+            .is_ok_and(|wanted| wanted == self.index.definitions[definition].name);
+        if debug {
+            eprintln!(
+                "== flows of #{definition} {} bound {:?}\n   features {:?}",
+                self.index.definitions[definition].rust_path(),
+                bound,
+                analysis.features
+            );
+        }
         for (target, bound) in &analysis.flows {
-            if let Some(callee) = self.index.resolve_callee(definition, target) {
+            let callee = self.index.resolve_callee(definition, target);
+            if debug {
+                eprintln!("   flow {:?} {:?} -> {:?}", target.written(), bound, callee);
+            }
+            if let Some(callee) = callee {
                 callees.push((callee, bound.clone()));
             }
         }
+        // A callee the caller is handed to is read as that call runs it;
+        // reading it again on its parameter types alone would bring back
+        // the code the call switches off.
+        let flowed: HashSet<usize> = if super::rc::enabled("ABSENT") {
+            callees
+                .iter()
+                .filter(|(_, bound)| bound.iter().any(|(_, label)| label == ABSENT_LABEL || label == DROPPED_LABEL))
+                .map(|(callee, _)| *callee)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for (callee, _) in self.index.resolved_calls(definition).calls {
-            callees.push((callee, Vec::new()));
+            if !flowed.contains(&callee) {
+                callees.push((callee, Vec::new()));
+            }
         }
         // An identity source's own checks are compared through what its
         // callers pass it (`calls:`, `requires:`), not credited to every
@@ -480,8 +514,35 @@ impl Walker<'_, '_> {
             if !seen.insert((callee, bound.clone())) {
                 continue;
             }
+            // A call whose value is thrown away: what the callee checks
+            // cannot end the request, so only what it reads and loads is
+            // the handler's doing.
+            let dropped = bound.iter().any(|(_, label)| label == DROPPED_LABEL);
+            let bound: Vec<(usize, String)> =
+                bound.into_iter().filter(|(_, label)| label != DROPPED_LABEL).collect();
             let helper = self.summary(callee, &bound);
             let name = &self.index.definitions[callee].name;
+            if dropped {
+                for feature in &helper.features {
+                    if let Some(label) = feature
+                        .strip_prefix("checks:")
+                        .or_else(|| feature.strip_prefix("compares:"))
+                        .map(|rest| rest.split(':').next().unwrap_or(rest))
+                    {
+                        summary.features.insert(format!("acts:{label}"));
+                    } else if !feature.starts_with("takes:")
+                        && !feature.starts_with("scheme:")
+                        && !feature.starts_with(GRANTS)
+                        && !feature.starts_with("auths:")
+                        && !feature.starts_with(GUARDS)
+                        && !feature.starts_with(BINDS)
+                        && !feature.starts_with(SITE)
+                    {
+                        summary.features.insert(feature.clone());
+                    }
+                }
+                continue;
+            }
             for (feature, site) in &helper.sites {
                 summary
                     .sites
@@ -512,6 +573,17 @@ impl Walker<'_, '_> {
                     })
                     .map(|feature| {
                         match feature.strip_prefix(GUARDS).and_then(super::peer_checks::split_guard) {
+                            // The helper's own comparison of the record
+                            // with the caller is as direct as the
+                            // handler's.
+                            Some((key, how))
+                                if handed.contains(key)
+                                    && caller_too
+                                    && how.starts_with("compares ")
+                                    && super::rc::enabled("INNER") =>
+                            {
+                                format!("{GUARDS}{key}:{how} (in `{name}`)")
+                            }
                             Some((key, how))
                                 if handed.contains(key) && caller_too && how != "loaded with the caller" =>
                             {
@@ -521,6 +593,37 @@ impl Walker<'_, '_> {
                         }
                     }),
             );
+        }
+        // Records tied by a comparison are held to the caller together.
+        for _ in 0..2 {
+            for (one, other) in &analysis.links {
+                for (from, to) in [(one, other), (other, one)] {
+                    let held: Vec<String> = summary
+                        .features
+                        .iter()
+                        .filter_map(|feature| feature.strip_prefix(GUARDS).and_then(super::peer_checks::split_guard))
+                        .filter(|(key, _)| key == from)
+                        .map(|(_, how)| format!("{GUARDS}{to}:{how}"))
+                        .collect();
+                    summary.features.extend(held);
+                }
+            }
+        }
+        // A record held to the caller holds the path values it was loaded
+        // with: `Some(s) if s.account_id == account.id` after
+        // `find(&path.service_id)` binds `service_id`.
+        for (record, paths) in &analysis.record_origins {
+            let guarded = summary.features.iter().any(|feature| {
+                feature
+                    .strip_prefix(GUARDS)
+                    .and_then(super::peer_checks::split_guard)
+                    .is_some_and(|(guarded, _)| guarded == record)
+            });
+            if guarded {
+                for path in paths {
+                    summary.features.insert(format!("{BINDS}{path}"));
+                }
+            }
         }
         self.in_progress.remove(&key);
         self.summaries.insert(key, summary.clone());
@@ -550,6 +653,138 @@ struct CheckCandidate {
     /// Named request values the call also receives, as `K:p`: a check of
     /// the caller against them binds them (`ensure_self(&user, &id)?`).
     requested: Vec<String>,
+    /// The call's outcome reaches nothing: its value is dropped
+    /// (`cache.insert(user.id, ..);`) or it is the condition of an `if`
+    /// that goes on either way. The handler still acts on the caller; it
+    /// does not check it here.
+    idle: bool,
+}
+
+/// A statement's expression whose value is thrown away: a call, with no
+/// `?` and no `unwrap`/`expect` on the way out.
+fn discarded(expr: &Expr) -> bool {
+    let mut top = expr;
+    loop {
+        top = match top {
+            Expr::Await(inner) => &inner.base,
+            Expr::Paren(inner) => &inner.expr,
+            _ => break,
+        };
+    }
+    if !matches!(top, Expr::Call(_) | Expr::MethodCall(_)) {
+        return false;
+    }
+    struct Leaves(bool);
+    impl<'ast> Visit<'ast> for Leaves {
+        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+            self.0 = true;
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == "unwrap" || node.method == "expect" {
+                self.0 = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_block(&mut self, _: &'ast syn::Block) {}
+    }
+    let mut leaves = Leaves(false);
+    leaves.visit_expr(expr);
+    !leaves.0
+}
+
+/// Macros that only report: a branch made of them changes nothing.
+const REPORTING_MACROS: [&str; 12] = [
+    "trace", "debug", "info", "warn", "error", "log", "println", "eprintln", "print", "eprint",
+    "event", "dbg",
+];
+
+fn reporting(mac: &syn::Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .is_some_and(|segment| REPORTING_MACROS.iter().any(|name| segment.ident == name))
+}
+
+/// A block that does nothing the request depends on: empty, or only
+/// logging.
+fn inert_block(block: &syn::Block) -> bool {
+    block.stmts.iter().all(|stmt| match stmt {
+        syn::Stmt::Macro(stmt) => reporting(&stmt.mac),
+        syn::Stmt::Expr(expr, _) => inert_expr(expr),
+        _ => false,
+    })
+}
+
+fn inert_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Block(block) => inert_block(&block.block),
+        Expr::Tuple(tuple) => tuple.elems.is_empty(),
+        Expr::Macro(mac) => reporting(&mac.mac),
+        Expr::Paren(inner) => inert_expr(&inner.expr),
+        _ => false,
+    }
+}
+
+/// Removes the code a call does not run because it passes `None` or
+/// `false` for a parameter: the body of `if let Some(x) = parameter`, of
+/// `if parameter`, and the `Some`/`true` arms of a `match` on it.
+struct Prune<'a> {
+    absent: &'a HashSet<String>,
+}
+
+impl Prune<'_> {
+    fn names(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| self.absent.contains(&ident.to_string())),
+            Expr::Reference(inner) => self.names(&inner.expr),
+            Expr::Paren(inner) => self.names(&inner.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => self.names(&unary.expr),
+            Expr::MethodCall(call)
+                if call.args.is_empty()
+                    && ["as_ref", "as_deref", "clone", "is_some", "as_mut", "take", "cloned", "copied"]
+                        .iter()
+                        .any(|name| call.method == name) =>
+            {
+                self.names(&call.receiver)
+            }
+            _ => false,
+        }
+    }
+
+    fn given(pat: &Pat) -> bool {
+        match pat {
+            Pat::TupleStruct(tuple) => tuple.path.segments.last().is_some_and(|segment| segment.ident == "Some"),
+            Pat::Lit(lit) => matches!(&lit.lit, syn::Lit::Bool(value) if value.value),
+            Pat::Reference(inner) => Self::given(&inner.pat),
+            Pat::Paren(inner) => Self::given(&inner.pat),
+            _ => false,
+        }
+    }
+}
+
+impl syn::visit_mut::VisitMut for Prune<'_> {
+    fn visit_expr_if_mut(&mut self, node: &mut syn::ExprIf) {
+        let tests = match &*node.cond {
+            Expr::Let(binding) => Self::given(&binding.pat) && self.names(&binding.expr),
+            other => self.names(other),
+        };
+        if tests {
+            node.then_branch.stmts.clear();
+        }
+        syn::visit_mut::visit_expr_if_mut(self, node);
+    }
+
+    fn visit_expr_match_mut(&mut self, node: &mut syn::ExprMatch) {
+        if self.names(&node.expr) {
+            for arm in &mut node.arms {
+                if Self::given(&arm.pat) {
+                    arm.body = Box::new(syn::parse_quote!(()));
+                }
+            }
+        }
+        syn::visit_mut::visit_expr_match_mut(self, node);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -564,6 +799,12 @@ struct Analysis {
     wrapper_calls: Vec<WrapperCall>,
     /// Calls handed request data, by target and name (see `KEYED`).
     keyed: Vec<(Option<HandlerTarget>, String)>,
+    /// The path values each record was loaded with, by record key, as
+    /// `path:p`: a record held to the caller holds them too.
+    record_origins: BTreeMap<String, BTreeSet<String>>,
+    /// Records a rejecting comparison ties together (`destination.team_id
+    /// != folder.team_id`): holding one to the caller holds the other.
+    links: BTreeSet<(String, String)>,
 }
 
 /// A call such as `wrap(flow, &req, payload, |state, auth, req| ..)`,
@@ -607,6 +848,83 @@ pub(crate) fn rule_on(name: &str) -> bool {
 const REQUEST_LABEL: &str = "\u{1}request:";
 const RECORD_LABEL: &str = "\u{1}record:";
 
+/// A callee parameter that is a struct the caller filled in, as
+/// `\u{1}fields:` and one `field\u{1d}label` per field that carries the
+/// caller, request data or a loaded record, joined by `\u{1e}`:
+/// `RenameUseCase { account, board_id: path.board_id }` handed to
+/// `execute(usecase)` is read there as `self.account` (the caller) and
+/// `self.board_id` (the path's `board_id`).
+const FIELDS_LABEL: &str = "\u{1}fields:";
+/// A call whose value the caller throws away (`check(&user, &note).ok();`,
+/// `let _ = check(..);`, a condition whose branches do nothing): whatever
+/// the callee checks cannot end the request.
+const DROPPED_LABEL: &str = "\u{1}dropped";
+/// A callee parameter the caller passes `None` or `false`: the callee's
+/// code that runs only when it is given does not run for this call.
+const ABSENT_LABEL: &str = "\u{1}absent";
+const FIELD_SEPARATOR: char = '\u{1e}';
+const FIELD_ASSIGN: char = '\u{1d}';
+/// `usecase.account` of such a parameter is read as the one name
+/// `usecase__ARCHERFIELD__account`, bound like a local.
+const FIELD_NAME: &str = "__ARCHERFIELD__";
+
+fn fields_label(fields: &[(String, String)]) -> String {
+    let mut fields: Vec<String> = fields
+        .iter()
+        .map(|(field, label)| format!("{field}{FIELD_ASSIGN}{label}"))
+        .collect();
+    fields.sort();
+    format!("{FIELDS_LABEL}{}", fields.join(&FIELD_SEPARATOR.to_string()))
+}
+
+fn label_fields(label: &str) -> Vec<(String, String)> {
+    label
+        .strip_prefix(FIELDS_LABEL)
+        .into_iter()
+        .flat_map(|fields| fields.split(FIELD_SEPARATOR))
+        .filter_map(|field| field.split_once(FIELD_ASSIGN))
+        .map(|(field, label)| (field.to_owned(), label.to_owned()))
+        .collect()
+}
+
+/// `receiver_path`, with a field name read as one name written back as
+/// the field it is, so that the receiver's type can be looked up.
+fn receiver_of(expr: &Expr) -> Option<String> {
+    receiver_path(expr).map(|receiver| receiver.replace(FIELD_NAME, "."))
+}
+
+/// Rewrites `parameter.field` into one name, for the fields a caller
+/// filled in.
+struct FieldNames<'f> {
+    fields: &'f HashSet<(String, String)>,
+}
+
+impl syn::visit_mut::VisitMut for FieldNames<'_> {
+    fn visit_expr_mut(&mut self, node: &mut Expr) {
+        if let Expr::Field(field) = node
+            && let Expr::Path(base) = &*field.base
+            && base.qself.is_none()
+            && let Some(parameter) = base.path.get_ident()
+            && let syn::Member::Named(member) = &field.member
+            && self.fields.contains(&(parameter.to_string(), member.to_string()))
+        {
+            // `file.r#type`: the raw marker is not part of the name.
+            let written = member.to_string();
+            let written = written.trim_start_matches("r#");
+            let parameter = parameter.to_string();
+            let parameter = parameter.trim_start_matches("r#");
+            let name = syn::Ident::new(&format!("{parameter}{FIELD_NAME}{written}"), member.span());
+            *node = Expr::Path(syn::ExprPath {
+                attrs: Vec::new(),
+                qself: None,
+                path: syn::Path::from(name),
+            });
+            return;
+        }
+        syn::visit_mut::visit_expr_mut(self, node);
+    }
+}
+
 fn request_label(origin: &Option<Origin>) -> String {
     match origin {
         Some((kind, name)) => format!("{REQUEST_LABEL}{kind}:{name}"),
@@ -627,6 +945,75 @@ fn analyze_function(
         closure_inputs: closure_inputs.clone(),
         ..CallerUseVisitor::default()
     };
+    // Parameters that are structs the caller filled in: each field that
+    // carries something is bound under one name, and the body is read
+    // with `parameter.field` written as that name.
+    let mut filled: HashSet<(String, String)> = HashSet::new();
+    for (position, input) in item.sig.inputs.iter().enumerate() {
+        let Some((_, label)) = bound
+            .iter()
+            .find(|(index, label)| *index == position && label.starts_with(FIELDS_LABEL))
+        else {
+            continue;
+        };
+        let parameter = match input {
+            FnArg::Receiver(_) => "self".to_owned(),
+            FnArg::Typed(typed) => match &*typed.pat {
+                Pat::Ident(ident) => ident.ident.to_string(),
+                _ => continue,
+            },
+        };
+        let fields = label_fields(label);
+        for (field, label) in &fields {
+            let name = format!(
+                "{}{FIELD_NAME}{}",
+                parameter.trim_start_matches("r#"),
+                field.trim_start_matches("r#")
+            );
+            if let Some(origin) = label.strip_prefix(REQUEST_LABEL) {
+                let (kind, given) = origin.split_once(':').unwrap_or(("body", ""));
+                let kind = if kind == "path" { "path" } else { "body" };
+                visitor.origins.insert(name.clone(), (kind, given.to_string()));
+                visitor.requested.insert(name);
+            } else if let Some(key) = label.strip_prefix(RECORD_LABEL) {
+                visitor.records.insert(name, key.to_string());
+            } else if !label.starts_with('\u{1}') {
+                visitor.bindings.insert(name, label.clone());
+            } else {
+                continue;
+            }
+            filled.insert((parameter.clone(), field.clone()));
+        }
+        visitor.carried.insert(parameter, fields);
+    }
+    let absent: HashSet<String> = item
+        .sig
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| bound.iter().any(|(index, label)| index == position && label == ABSENT_LABEL))
+        .filter_map(|(_, input)| match input {
+            FnArg::Typed(typed) => match &*typed.pat {
+                Pat::Ident(ident) => Some(ident.ident.to_string()),
+                _ => None,
+            },
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let rewritten;
+    let block: &syn::Block = if filled.is_empty() && absent.is_empty() {
+        &item.block
+    } else {
+        let mut copy = (*item.block).clone();
+        if !filled.is_empty() {
+            syn::visit_mut::VisitMut::visit_block_mut(&mut FieldNames { fields: &filled }, &mut copy);
+        }
+        if !absent.is_empty() {
+            syn::visit_mut::VisitMut::visit_block_mut(&mut Prune { absent: &absent }, &mut copy);
+        }
+        rewritten = copy;
+        &rewritten
+    };
     for (position, input) in item.sig.inputs.iter().enumerate() {
         let typed = match input {
             FnArg::Typed(typed) => typed,
@@ -641,6 +1028,8 @@ fn analyze_function(
             }
         };
         match bound.iter().find(|(index, _)| *index == position) {
+            Some((_, label)) if label.starts_with(FIELDS_LABEL) => {}
+            Some((_, label)) if label == ABSENT_LABEL => visitor.bind_parameter(&typed.pat, &typed.ty),
             Some((_, label)) if label.starts_with(REQUEST_LABEL) => {
                 let (kind, name) = label[REQUEST_LABEL.len()..].split_once(':').unwrap_or(("body", ""));
                 let kind = if kind == "path" { "path" } else { "body" };
@@ -659,7 +1048,7 @@ fn analyze_function(
             None => visitor.bind_parameter(&typed.pat, &typed.ty),
         }
     }
-    visitor.visit_block(&item.block);
+    visitor.visit_block(block);
     let loaded: BTreeSet<String> = visitor.records.values().cloned().collect();
     for key in loaded {
         let guarded = visitor
@@ -675,11 +1064,13 @@ fn analyze_function(
     // decides with the caller like `ensure_owner(..)?;` does.
     if let syn::ReturnType::Type(_, ty) = &item.sig.output
         && super::handlers::type_name(ty).is_some_and(|name| name.ends_with("Result"))
-        && let Some(syn::Stmt::Expr(tail, None)) = item.block.stmts.last()
+        && let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last()
     {
         visitor.decides(tail);
     }
     Analysis {
+        record_origins: visitor.record_origins,
+        links: visitor.links,
         features: visitor.features,
         checks: visitor.checks,
         flows: visitor.flows,
@@ -712,6 +1103,12 @@ struct CallerUseVisitor {
     used_records: HashSet<String>,
     /// Visiting a branch condition.
     in_condition: bool,
+    /// Visiting a call whose outcome reaches nothing (see
+    /// `CheckCandidate::idle`).
+    idle: bool,
+    /// Inside an expression whose value is thrown away (see
+    /// `DROPPED_LABEL`).
+    dropped: bool,
 
     /// Where each request-data name comes from (see `Origin`).
     origins: HashMap<String, Origin>,
@@ -720,9 +1117,251 @@ struct CallerUseVisitor {
     wrapper_calls: Vec<WrapperCall>,
     /// Calls handed request data, by target and name (see `KEYED`).
     keyed: Vec<(Option<HandlerTarget>, String)>,
+    /// Names bound to a struct this function filled in or was handed,
+    /// with what each field carries (see `FIELDS_LABEL`).
+    carried: HashMap<String, Vec<(String, String)>>,
+    /// The path values each record was loaded with (see `Analysis`).
+    record_origins: BTreeMap<String, BTreeSet<String>>,
+    /// Records a rejecting comparison ties together (`destination.team_id
+    /// != folder.team_id`): holding one to the caller holds the other.
+    links: BTreeSet<(String, String)>,
 }
 
 impl CallerUseVisitor {
+    /// What each field of a struct literal carries: the caller, a loaded
+    /// record, or request data.
+    fn literal_fields(&self, literal: &syn::ExprStruct) -> Vec<(String, String)> {
+        let mut fields = Vec::new();
+        for field in &literal.fields {
+            let syn::Member::Named(name) = &field.member else {
+                continue;
+            };
+            let label = if let Some(label) = self.derived(&field.expr) {
+                label
+            } else if let Some(key) = self.record_of(&field.expr) {
+                format!("{RECORD_LABEL}{key}")
+            } else {
+                let whole = strip_transparent(&field.expr);
+                if matches!(whole, Expr::Path(_) | Expr::Field(_) | Expr::MethodCall(_))
+                    && self.origin_of(whole).is_some()
+                {
+                    request_label(&self.origin_of(whole))
+                } else {
+                    // `mem::take(&mut path.board_id)`, `body.0.name.trim()`.
+                    match self.request_names(&field.expr).as_slice() {
+                        [only] => request_label(&Some(only.clone())),
+                        [] if self.mentions_requested(&field.expr) => request_label(&None),
+                        _ => continue,
+                    }
+                }
+            };
+            fields.push((name.to_string(), label));
+        }
+        fields
+    }
+
+    /// The label of an argument that is a filled-in struct: a name bound
+    /// to one, or a literal.
+    fn carried_label(&self, expr: &Expr) -> Option<String> {
+        self.carried_fields(expr).map(|fields| fields_label(&fields))
+    }
+
+    /// The caller handed whole to a call that is not a conversion
+    /// (`Json(Profile::of(user))`, `store.list_for(&user)`): the route
+    /// uses the caller, whichever of its fields that call reads.
+    fn hands<'e>(&mut self, callee: &str, arguments: impl Iterator<Item = &'e Expr>) {
+        if !super::rc::enabled("HANDS") || TRANSPARENT_CALLS.contains(&callee) || PROBES.contains(&callee) {
+            return;
+        }
+        for argument in arguments {
+            if let Expr::Path(path) = strip_transparent(argument)
+                && let Some(ident) = path.path.get_ident()
+                && let Some(label) = self.bindings.get(&ident.to_string())
+            {
+                self.features.insert(format!("{HANDS}{label}"));
+            }
+        }
+    }
+
+    /// Adds the filled-in structs among a call's arguments to `bound`.
+    /// What the call site says about reach: arguments that are literally
+    /// `None` or `false`, and a value that is thrown away.
+    fn site_marks<'e>(&self, arguments: impl Iterator<Item = &'e Expr>, bound: &mut Vec<(usize, String)>) {
+        if super::rc::enabled("ABSENT") {
+            for (position, argument) in arguments.enumerate() {
+                if matches!(argument, Expr::Path(path) if path.path.is_ident("None"))
+                    || matches!(argument, Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+                {
+                    bound.push((position, ABSENT_LABEL.to_owned()));
+                }
+            }
+        }
+        if self.dropped {
+            bound.push((usize::MAX, DROPPED_LABEL.to_owned()));
+        }
+    }
+
+    fn carried_bound<'e>(&self, arguments: impl Iterator<Item = &'e Expr>, bound: &mut Vec<(usize, String)>) {
+        for (position, argument) in arguments.enumerate() {
+            if bound.iter().any(|(taken, _)| *taken == position) {
+                continue;
+            }
+            if let Some(label) = self.carried_label(argument) {
+                bound.push((position, label));
+            }
+        }
+    }
+
+    /// Binds the names of `pattern` to the record a load yields, with the
+    /// path values it was loaded by.
+    fn bind_record(&mut self, pattern: &Pat, loaded: &Expr, key: &str, scoped: bool) {
+        let mut names = HashSet::new();
+        super::routes::pattern_bindings(pattern, &mut names);
+        self.bind_loaded(names, loaded, key, scoped);
+    }
+
+    fn bind_loaded(&mut self, names: HashSet<String>, loaded: &Expr, key: &str, scoped: bool) {
+        let named: Vec<Origin> = self.request_names(loaded);
+        let paths: Vec<&Origin> = named.iter().filter(|(kind, _)| *kind == "path").collect();
+        if scoped {
+            self.features.insert(format!("{GUARDS}{key}:loaded with the caller"));
+            for (kind, name) in &named {
+                // A body field is held to the caller like a path value
+                // when the load it keys is scoped to the caller.
+                if *kind == "path" || (super::rc::enabled("BODYSCOPE") && !name.is_empty()) {
+                    self.features.insert(format!("{BINDS}{kind}:{name}"));
+                }
+            }
+        }
+        if super::rc::enabled("GUARDBINDS") {
+            let origins = self.record_origins.entry(key.to_string()).or_default();
+            origins.extend(paths.iter().map(|(kind, name)| format!("{kind}:{name}")));
+            if super::rc::enabled("BODYSCOPE") {
+                origins.extend(
+                    named
+                        .iter()
+                        .filter(|(kind, name)| *kind != "path" && !name.is_empty())
+                        .map(|(kind, name)| format!("{kind}:{name}")),
+                );
+            }
+        }
+        for name in names.into_iter().filter(|name| !name.starts_with('_')) {
+            self.records.insert(name, key.to_string());
+        }
+    }
+
+    /// The fields of an argument that is a filled-in struct.
+    fn carried_fields(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
+        if !super::rc::enabled("FIELDS") {
+            return None;
+        }
+        let fields = match strip_transparent(expr) {
+            Expr::Path(path) if path.qself.is_none() => self.carried.get(&path.path.get_ident()?.to_string())?.clone(),
+            Expr::Struct(literal) => self.literal_fields(literal),
+            _ => return None,
+        };
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    /// A record an expression yields whole: `res`, `res?`, `res.await`,
+    /// `res.ok_or(..)?`.
+    /// The record a value comes from: a field of it (`files[0].team_id`),
+    /// or what a call fetches by one (`repo.find_list(&db,
+    /// message.list_id)`). Holding that value to the caller holds the
+    /// record. Also whether the call is given the caller.
+    fn lineage(&self, expr: &Expr) -> Option<(String, bool)> {
+        match expr {
+            Expr::Try(inner) => self.lineage(&inner.expr),
+            Expr::Await(inner) => self.lineage(&inner.base),
+            Expr::Paren(inner) => self.lineage(&inner.expr),
+            Expr::Reference(inner) => self.lineage(&inner.expr),
+            Expr::MethodCall(call) if !TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) => {
+                // `repo.find(..).await.map_err(..)`: the adapter wraps the call.
+                if let Some(found) = self.lineage(&call.receiver) {
+                    return Some(found);
+                }
+                if NOT_LOADERS.contains(&call.method.to_string().as_str()) || PROBES.contains(&call.method.to_string().as_str()) {
+                    return None;
+                }
+                let key = call.args.iter().find_map(|argument| self.record_of(argument))?;
+                Some((key, call.args.iter().any(|argument| self.derived(argument).is_some())))
+            }
+            Expr::Call(call) => {
+                let Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let name = path.path.segments.last()?.ident.to_string();
+                if TRANSPARENT_CALLS.contains(&name.as_str()) {
+                    return call.args.first().and_then(|argument| self.lineage(argument));
+                }
+                if NOT_LOADERS.contains(&name.as_str()) {
+                    return None;
+                }
+                let key = call.args.iter().find_map(|argument| self.record_of(argument))?;
+                Some((key, call.args.iter().any(|argument| self.derived(argument).is_some())))
+            }
+            other => self.record_of(other).map(|key| (key, false)),
+        }
+    }
+
+    fn record_whole(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Try(inner) => self.record_whole(&inner.expr),
+            Expr::Await(inner) => self.record_whole(&inner.base),
+            Expr::Paren(inner) => self.record_whole(&inner.expr),
+            Expr::Reference(inner) => self.record_whole(&inner.expr),
+            Expr::MethodCall(call) if TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) => {
+                self.record_whole(&call.receiver)
+            }
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.records.get(&ident.to_string()).cloned()),
+            _ => None,
+        }
+    }
+
+    /// A call handed a loaded record and a path value together
+    /// (`members.remove(&team.id, &path.user_id)`): the path value is used
+    /// within that record, so holding the record to the caller holds it.
+    fn used_with_record<'e>(&mut self, callee: &str, arguments: impl Iterator<Item = &'e Expr>) {
+        if !super::rc::enabled("GUARDBINDS")
+            || TRANSPARENT_CALLS.contains(&callee)
+            || NOT_LOADERS.contains(&callee)
+            || PROBES.contains(&callee)
+        {
+            return;
+        }
+        let arguments: Vec<&Expr> = arguments.collect();
+        let mut records: Vec<String> = arguments.iter().filter_map(|argument| self.record_of(argument)).collect();
+        let mut paths: Vec<String> = arguments
+            .iter()
+            .filter(|argument| self.record_of(argument).is_none())
+            .flat_map(|argument| self.request_names(argument))
+            .filter(|(kind, _)| *kind == "path")
+            .map(|(kind, name)| format!("{kind}:{name}"))
+            .collect();
+        // The two in one filled-in struct: `exists(Key { team_id:
+        // team.id, user_id: path.user_id })`.
+        for argument in &arguments {
+            for (_, label) in self.carried_fields(argument).unwrap_or_default() {
+                if let Some(key) = label.strip_prefix(RECORD_LABEL) {
+                    records.push(key.to_string());
+                } else if let Some(origin) = label.strip_prefix(REQUEST_LABEL)
+                    && origin.starts_with("path:")
+                {
+                    paths.push(origin.to_string());
+                }
+            }
+        }
+        if records.is_empty() || paths.is_empty() {
+            return;
+        }
+        for key in records {
+            self.record_origins.entry(key).or_default().extend(paths.iter().cloned());
+        }
+    }
+
     fn bind_parameter(&mut self, pattern: &Pat, ty: &Type) {
         if let Some(kind) = request_kind(ty) {
             self.bind_request(pattern, Some((kind, String::new())));
@@ -898,6 +1537,9 @@ impl CallerUseVisitor {
                 if self.sources.contains(&method) {
                     return Some(format!("{method}()"));
                 }
+                if let Some(label) = self.narrowed(&method, std::iter::once(&*call.receiver).chain(call.args.iter())) {
+                    return Some(label);
+                }
                 self.derived(&call.receiver)
             }
             // `match authorize_session(&req) { Ok(session) => session.id(), .. }`
@@ -919,12 +1561,25 @@ impl CallerUseVisitor {
                 }
                 Expr::Path(path) => {
                     let name = path.path.segments.last()?.ident.to_string();
-                    self.sources.contains(&name).then(|| format!("{name}()"))
+                    if self.sources.contains(&name) {
+                        return Some(format!("{name}()"));
+                    }
+                    self.narrowed(&name, call.args.iter())
                 }
                 _ => None,
             },
             _ => None,
         }
+    }
+
+    /// The caller as a function that hands its argument back returns it:
+    /// `current_user(actor)?`, `self.require_login(&actor)?`.
+    fn narrowed<'e>(&self, name: &str, arguments: impl Iterator<Item = &'e Expr>) -> Option<String> {
+        let positions = NARROWERS.with(|known| known.borrow().get(name).cloned())?;
+        arguments
+            .enumerate()
+            .filter(|(position, _)| positions.contains(position))
+            .find_map(|(_, argument)| self.derived(argument))
     }
 
     /// The first field read on an identity binding: `auth.profile` in
@@ -983,7 +1638,7 @@ impl CallerUseVisitor {
                     self.decides(&call.receiver);
                     return;
                 }
-                let target = receiver_path(&call.receiver).map(|receiver| HandlerTarget::Method {
+                let target = receiver_of(&call.receiver).map(|receiver| HandlerTarget::Method {
                     receiver,
                     method: method.clone(),
                 });
@@ -1033,8 +1688,20 @@ impl CallerUseVisitor {
             .flat_map(|argument| self.request_names(argument))
             .map(|(kind, name)| format!("{kind}:{name}"))
             .collect();
-        let mut labels: Vec<&String> = bound.iter().map(|(_, label)| label).collect();
+        let mut labels: Vec<String> = bound.iter().map(|(_, label)| label.clone()).collect();
         labels.dedup();
+        // The callee is read as this call runs it: without the code an
+        // argument of `None` or `false` switches off.
+        let mut bound = bound;
+        if super::rc::enabled("ABSENT") {
+            for (position, argument) in arguments.iter().enumerate() {
+                if matches!(argument, Expr::Path(path) if path.path.is_ident("None"))
+                    || matches!(argument, Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+                {
+                    bound.push((position, ABSENT_LABEL.to_owned()));
+                }
+            }
+        }
         for label in labels {
             self.checks.push(CheckCandidate {
                 target: target.clone(),
@@ -1045,6 +1712,7 @@ impl CallerUseVisitor {
                 records: records.clone(),
                 requested: requested.clone(),
                 condition: self.in_condition,
+                idle: self.idle || self.dropped,
             });
         }
     }
@@ -1074,8 +1742,17 @@ impl CallerUseVisitor {
             Expr::Reference(inner) => self.record_of(&inner.expr),
             Expr::Paren(inner) => self.record_of(&inner.expr),
             Expr::Field(field) => self.record_of(&field.base),
+            Expr::Index(index) if super::rc::enabled("LINEAGE") => self.record_of(&index.expr),
             Expr::MethodCall(call) if TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) => {
                 self.record_of(&call.receiver)
+            }
+            // `Some(note.owner_id)`: the record's value, given.
+            Expr::Call(call)
+                if call.args.len() == 1
+                    && matches!(&*call.func, Expr::Path(path) if path.path.is_ident("Some"))
+                    && super::rc::enabled("ABSENT") =>
+            {
+                self.record_of(&call.args[0])
             }
             Expr::Path(path) => path
                 .path
@@ -1091,6 +1768,9 @@ impl CallerUseVisitor {
     /// load to the caller (`find_note(id, user.id)`).
     fn loader(&self, expr: &Expr) -> Option<(String, bool)> {
         match expr {
+            // `match repo.find(&id).await { Some(note) => note, None =>
+            // return Err(..) }`: the load is what is matched.
+            Expr::Match(matched) if super::rc::enabled("MATCHLOAD") => self.loader(&matched.expr),
             Expr::Try(inner) => self.loader(&inner.expr),
             Expr::Await(inner) => self.loader(&inner.base),
             Expr::Paren(inner) => self.loader(&inner.expr),
@@ -1104,8 +1784,7 @@ impl CallerUseVisitor {
                 if TRANSPARENT_CALLS.contains(&last.as_str()) || NOT_LOADERS.contains(&last.as_str()) {
                     return None;
                 }
-                let requested = call.args.iter().any(|argument| self.mentions_requested(argument));
-                let scoped = call.args.iter().any(|argument| self.derived(argument).is_some());
+                let (requested, scoped) = self.loads_with(&call.args);
                 requested.then_some((key, scoped))
             }
             Expr::MethodCall(call) => {
@@ -1121,12 +1800,26 @@ impl CallerUseVisitor {
                 {
                     return None;
                 }
-                let requested = call.args.iter().any(|argument| self.mentions_requested(argument));
-                let scoped = call.args.iter().any(|argument| self.derived(argument).is_some());
+                let (requested, scoped) = self.loads_with(&call.args);
                 requested.then_some((method, scoped))
             }
             _ => None,
         }
+    }
+
+    /// Whether a call's arguments carry request data, and the caller: as
+    /// values, or in a filled-in struct (`find(Query { account_id:
+    /// account.id, key: query.key })`).
+    fn loads_with(&self, arguments: &syn::punctuated::Punctuated<Expr, syn::Token![,]>) -> (bool, bool) {
+        let mut requested = arguments.iter().any(|argument| self.mentions_requested(argument));
+        let mut scoped = arguments.iter().any(|argument| self.derived(argument).is_some());
+        for argument in arguments {
+            for (_, label) in self.carried_fields(argument).unwrap_or_default() {
+                requested |= label.starts_with(REQUEST_LABEL);
+                scoped |= !label.starts_with('\u{1}');
+            }
+        }
+        (requested, scoped)
     }
 
     /// Whether an expression reads a name bound to the caller.
@@ -1351,7 +2044,9 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                 _ => {}
             }
         }
+        let dropped = std::mem::replace(&mut self.dropped, false);
         visit::visit_expr_closure(self, node);
+        self.dropped = dropped;
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
@@ -1372,15 +2067,45 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             let mut names = HashSet::new();
             super::routes::pattern_bindings(&node.pat, &mut names);
             names.retain(|name| !name.starts_with('_'));
-            if let Some((key, scoped)) = self.loader(&init.expr) {
-                if scoped {
-                    self.features.insert(format!("{GUARDS}{key}:loaded with the caller"));
-                    for (kind, name) in self.request_names(&init.expr).into_iter().filter(|(kind, _)| *kind == "path") {
-                        self.features.insert(format!("{BINDS}{kind}:{name}"));
+            let mut filled = false;
+            if let Expr::Struct(literal) = &*init.expr
+                && super::rc::enabled("FIELDS")
+            {
+                // `let usecase = RenameUseCase { account, board_id }`:
+                // what each field carries, not one lump of request data.
+                let fields = self.literal_fields(literal);
+                if !fields.is_empty() {
+                    for name in &names {
+                        self.carried.insert(name.clone(), fields.clone());
                     }
+                    filled = true;
                 }
+            }
+            if filled {
+            } else if let Some((key, scoped)) = self.loader(&init.expr) {
+                let loaded = match &*init.expr {
+                    Expr::Match(matched) => &*matched.expr,
+                    other => other,
+                };
+                self.bind_record(&node.pat, loaded, &key, scoped);
+            } else if super::rc::enabled("MATCHLOAD")
+                && let Some(key) = self.record_whole(&init.expr)
+            {
+                // `let note = found.ok_or(Error::NotFound)?;`
                 for name in names {
                     self.records.insert(name, key.clone());
+                }
+            } else if super::rc::enabled("LINEAGE")
+                && let Some((key, with_caller)) = self.lineage(&init.expr)
+            {
+                // `let list = repo.find_list(&db, message.list_id).await?;`
+                for name in names {
+                    self.records.insert(name, key.clone());
+                }
+                // `repo.find_membership(&db, user.id, note.team_id).await?`:
+                // a lookup by the caller and the record that can fail.
+                if with_caller && (matches!(&*init.expr, Expr::Try(_)) || init.diverge.is_some()) {
+                    self.features.insert(format!("{GUARDS}{key}:loaded with the caller"));
                 }
             } else if self.mentions_requested(&init.expr) {
                 // `let id = path.into_inner();`, `let note_id = data.note_id;`
@@ -1414,10 +2139,53 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        // `match check(&user, &note) { Ok(()) => {}, Err(_) => {} }`
+        if super::rc::enabled("DROPPED")
+            && !node.arms.is_empty()
+            && node.arms.iter().all(|arm| inert_expr(&arm.body))
+        {
+            let dropped = std::mem::replace(&mut self.dropped, true);
+            self.visit_expr(&node.expr);
+            self.dropped = dropped;
+            return;
+        }
         if let Some(label) = self.derived(&node.expr) {
             for arm in &node.arms {
                 self.bind_success(&arm.pat, &label);
             }
+        } else if super::rc::enabled("MATCHLOAD")
+            && let Some((key, scoped)) = self.loader(&node.expr)
+        {
+            // `match repo.find(&id).await { Some(note) if note.owner ==
+            // user.id => .., _ => return Err(..) }`
+            for arm in &node.arms {
+                self.bind_record(&arm.pat, &node.expr, &key, scoped);
+            }
+        } else if super::rc::enabled("MATCHLOAD")
+            && let Some(key) = self.record_whole(&node.expr)
+        {
+            // `match found { Some(note) if note.owner == user.id => .. }`
+            for arm in &node.arms {
+                let mut names = HashSet::new();
+                super::routes::pattern_bindings(&arm.pat, &mut names);
+                for name in names.into_iter().filter(|name| !name.starts_with('_')) {
+                    self.records.insert(name, key.clone());
+                }
+            }
+        }
+        // A guard on the caller (`Some(n) if n.owner == user.id`) with an
+        // arm that rejects decides like `if` does.
+        if super::rc::enabled("MATCHLOAD")
+            && node.arms.iter().any(|arm| {
+                matches!(&arm.pat, Pat::Guard(guarded) if self.mentions_caller(&guarded.guard))
+            })
+            && rejects(|found| {
+                for arm in &node.arms {
+                    found.visit_expr(&arm.body);
+                }
+            })
+        {
+            self.rejects = true;
         }
         if self.mentions_caller(&node.expr)
             && rejects(|found| {
@@ -1434,6 +2202,19 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
         if let Some(label) = self.derived(&node.expr) {
             self.bind_success(&node.pat, &label);
+        } else if super::rc::enabled("MATCHLOAD")
+            && let Some((key, scoped)) = self.loader(&node.expr)
+        {
+            // `if let Some(note) = repo.find(&id).await { .. }`
+            self.bind_record(&node.pat, &node.expr, &key, scoped);
+        } else if super::rc::enabled("MATCHLOAD")
+            && let Some(key) = self.record_whole(&node.expr)
+        {
+            let mut names = HashSet::new();
+            super::routes::pattern_bindings(&node.pat, &mut names);
+            for name in names.into_iter().filter(|name| !name.starts_with('_')) {
+                self.records.insert(name, key.clone());
+            }
         }
         visit::visit_expr_let(self, node);
     }
@@ -1462,6 +2243,12 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
         {
             self.path_passed(&last.ident.to_string(), node.args.iter());
             self.keys(handler_target(&node.func), &last.ident.to_string(), false, node.args.iter());
+        }
+        if let Expr::Path(path) = &*node.func
+            && let Some(last) = path.path.segments.last()
+        {
+            self.used_with_record(&last.ident.to_string(), node.args.iter());
+            self.hands(&last.ident.to_string(), node.args.iter());
         }
         // `constant_time_eq(invite.stored.as_bytes(), given.as_bytes())`
         if let Expr::Path(path) = &*node.func
@@ -1504,7 +2291,8 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                 }
                 let mut written = quote::ToTokens::to_token_stream(argument)
                     .to_string()
-                    .replace(' ', "");
+                    .replace(' ', "")
+                    .replace(FIELD_NAME, ".");
                 if written.len() > 60 {
                     written.truncate(written.floor_char_boundary(57));
                     written.push_str("...");
@@ -1522,11 +2310,13 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             })
             .collect();
         let mut bound = bound;
+        self.carried_bound(node.args.iter(), &mut bound);
         let data = self.data_bound(node.args.iter(), &bound);
         bound.extend(data);
         if !bound.is_empty()
             && let Some(target) = handler_target(&node.func)
         {
+            self.site_marks(node.args.iter(), &mut bound);
             self.flows.push((target, bound));
         }
         // `wrap(.., payload, |state, auth, req| ..)`: the wrapper may hand
@@ -1566,15 +2356,76 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
 
     fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
         if let syn::Stmt::Expr(expr, Some(_)) = node {
+            // `check(&user)?;` decides. `cache.insert(user.id, ..);` cannot
+            // end the request: its value, an error included, is dropped.
+            let propagated = {
+                struct Tries(bool);
+                impl<'ast> Visit<'ast> for Tries {
+                    fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+                        self.0 = true;
+                    }
+                    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+                    fn visit_block(&mut self, _: &'ast syn::Block) {}
+                }
+                let mut tries = Tries(false);
+                tries.visit_expr(expr);
+                tries.0
+            };
+            let idle = std::mem::replace(&mut self.idle, !propagated && super::rc::enabled("DECIDES"));
             self.decides(expr);
+            self.idle = idle;
         }
+        let thrown_away = super::rc::enabled("DROPPED")
+            && match node {
+                syn::Stmt::Expr(expr, Some(_)) => discarded(expr),
+                syn::Stmt::Local(local) => {
+                    matches!(local.pat, Pat::Wild(_))
+                        && local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| init.diverge.is_none() && discarded(&init.expr))
+                }
+                _ => false,
+            };
+        let dropped = std::mem::replace(&mut self.dropped, thrown_away);
         visit::visit_stmt(self, node);
+        self.dropped = dropped;
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let dropped = std::mem::replace(&mut self.dropped, false);
+        visit::visit_block(self, node);
+        self.dropped = dropped;
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        // An `if` with no `else` whose body does not reject decides
+        // nothing: `if let Some(hit) = cache.get(&user.id) { return Ok(hit) }`
+        // goes on either way.
+        // Branches that only log decide nothing either, and what the
+        // condition calls or compares is thrown away.
+        let inert = super::rc::enabled("DROPPED")
+            && inert_block(&node.then_branch)
+            && node.else_branch.as_ref().is_none_or(|(_, otherwise)| inert_expr(otherwise));
+        let decides = !inert
+            && (!super::rc::enabled("DECIDES")
+                || node.else_branch.is_some()
+                || rejects(|found| found.visit_block(&node.then_branch)));
+        let idle = std::mem::replace(&mut self.idle, !decides);
         self.in_condition = true;
         self.decides(&node.cond);
         self.in_condition = false;
+        self.idle = idle;
+        if inert {
+            let dropped = std::mem::replace(&mut self.dropped, true);
+            self.visit_expr(&node.cond);
+            self.dropped = dropped;
+            self.visit_block(&node.then_branch);
+            if let Some((_, otherwise)) = &node.else_branch {
+                self.visit_expr(otherwise);
+            }
+            return;
+        }
         if self.mentions_caller(&node.cond)
             && rejects(|found| {
                 found.visit_block(&node.then_branch);
@@ -1591,7 +2442,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         self.path_passed(&node.method.to_string(), node.args.iter());
         self.keys(
-            receiver_path(&node.receiver).map(|receiver| HandlerTarget::Method {
+            receiver_of(&node.receiver).map(|receiver| HandlerTarget::Method {
                 receiver,
                 method: node.method.to_string(),
             }),
@@ -1600,6 +2451,19 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             node.args.iter(),
         );
 
+        // `if repo.find_for(&id, &user.id).await.is_none() { return Err(..) }`
+        if super::rc::enabled("MATCHLOAD")
+            && PROBES.contains(&node.method.to_string().as_str())
+            && self.derived(&node.receiver).is_none()
+            && let Some((key, true)) = self.loader(&node.receiver)
+        {
+            self.bind_loaded(HashSet::new(), &node.receiver, &key, true);
+        }
+        self.used_with_record(
+            &node.method.to_string(),
+            std::iter::once(&*node.receiver).chain(node.args.iter()),
+        );
+        self.hands(&node.method.to_string(), node.args.iter());
         // `note.readers.contains(&user.id)`: the caller in a loaded record.
         if self.derived(&node.receiver).is_none()
             && node.args.iter().any(|argument| self.derived(argument).is_some())
@@ -1609,7 +2473,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             self.features.insert(format!("{GUARDS}{key}:checks `{written}`"));
         }
         // `principal.validate()` hands the caller to the method as `self`.
-        if let Some(receiver) = receiver_path(&node.receiver) {
+        if let Some(receiver) = receiver_of(&node.receiver) {
             let mut bound: Vec<(usize, String)> = std::iter::once(&*node.receiver)
                 .chain(node.args.iter())
                 .enumerate()
@@ -1617,6 +2481,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                     self.derived(argument).map(|label| (position, label))
                 })
                 .collect();
+            self.carried_bound(std::iter::once(&*node.receiver).chain(node.args.iter()), &mut bound);
             // Request data and records as arguments; a receiver that is
             // request data is converted, not handed over.
             let data: Vec<(usize, String)> = self
@@ -1626,6 +2491,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
                 .collect();
             bound.extend(data);
             if !bound.is_empty() {
+                self.site_marks(std::iter::once(&*node.receiver).chain(node.args.iter()), &mut bound);
                 self.flows.push((
                     HandlerTarget::Method {
                         receiver,
@@ -1639,7 +2505,7 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-        if matches!(node.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+        if matches!(node.op, BinOp::Eq(_) | BinOp::Ne(_)) && !self.dropped {
             let left = self.derived(&node.left);
             let right = self.derived(&node.right);
             let literal = |expr: &Expr| matches!(expr, Expr::Lit(_));
@@ -1675,6 +2541,14 @@ impl<'ast> Visit<'ast> for CallerUseVisitor {
             {
                 let written = short_written(side);
                 self.features.insert(format!("{GUARDS}{key}:compares `{written}` with the caller"));
+            }
+            if left.is_none()
+                && right.is_none()
+                && super::rc::enabled("LINEAGE")
+                && let (Some(one), Some(other)) = (self.record_of(&node.left), self.record_of(&node.right))
+                && one != other
+            {
+                self.links.insert((one, other));
             }
             // `invite.join_secret != query.secret`: the stored secret of a
             // loaded record matched with one the request presents.
@@ -1822,6 +2696,15 @@ fn answer_type(ty: &Type) -> bool {
     match ty {
         Type::Paren(paren) => answer_type(&paren.elem),
         Type::Group(group) => answer_type(&group.elem),
+        // `AccountCheckResp { exists: bool }`: flags and numbers, named.
+        Type::Path(path)
+            if path.path.segments.last().is_some_and(|segment| {
+                segment.arguments.is_none()
+                    && FLAG_STRUCTS.with(|structs| structs.borrow().contains(&segment.ident.to_string()))
+            }) =>
+        {
+            true
+        }
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {
                 return false;
@@ -1864,11 +2747,177 @@ fn answer_shapes<'f>(files: impl IntoIterator<Item = &'f syn::File>) -> HashMap<
             visit::visit_signature(self, node);
         }
     }
+    let files: Vec<&syn::File> = files.into_iter().collect();
+    // Structs that only hold flags and numbers, by name; a name that some
+    // other struct of the scan also has does not count.
+    #[derive(Default)]
+    struct Structs(HashMap<String, Vec<bool>>);
+    impl<'ast> Visit<'ast> for Structs {
+        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+            let flags = !node.fields.is_empty() && node.fields.iter().all(|field| answer_type(&field.ty));
+            self.0.entry(node.ident.to_string()).or_default().push(flags);
+        }
+    }
+    FLAG_STRUCTS.with(|known| known.borrow_mut().clear());
+    if super::rc::enabled("FLAGS") {
+        let mut structs = Structs::default();
+        for file in &files {
+            structs.visit_file(file);
+        }
+        let flags: HashSet<String> = structs
+            .0
+            .into_iter()
+            .filter(|(_, all)| all.iter().all(|flags| *flags))
+            .map(|(name, _)| name)
+            .collect();
+        FLAG_STRUCTS.with(|known| *known.borrow_mut() = flags);
+    }
     let mut shapes = Shapes::default();
     for file in files {
         shapes.visit_file(file);
     }
     shapes.0
+}
+
+/// Functions that hand a parameter back as their value (`fn
+/// current_user(&self, actor: Actor) -> Result<User, Error> { match actor {
+/// Actor::User(user) => Ok(user), _ => Err(..) } }`), by name, with the
+/// positions of those parameters. Every definition of the name in the scan
+/// must agree on a position.
+fn narrowers(index: &HandlerIndex) -> HashMap<String, HashSet<usize>> {
+    if !super::rc::enabled("NARROWERS") {
+        return HashMap::new();
+    }
+    fn root(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Path(path) if path.qself.is_none() => path.path.get_ident().map(|ident| ident.to_string()),
+            Expr::Field(field) => root(&field.base),
+            Expr::Reference(inner) => root(&inner.expr),
+            Expr::Paren(inner) => root(&inner.expr),
+            Expr::Try(inner) => root(&inner.expr),
+            Expr::Await(inner) => root(&inner.base),
+            Expr::Unary(inner) => root(&inner.expr),
+            Expr::MethodCall(call) if TRANSPARENT_CALLS.contains(&call.method.to_string().as_str()) => {
+                root(&call.receiver)
+            }
+            _ => None,
+        }
+    }
+    /// Names bound from a parameter: `let Some(user) = actor.user`, `match
+    /// actor { Actor::User(user) => .. }`.
+    struct Origins(HashMap<String, usize>);
+    impl Origins {
+        fn bind(&mut self, pattern: &Pat, from: &Expr) {
+            if let Some(position) = root(from).and_then(|name| self.0.get(&name).copied()) {
+                let mut names = HashSet::new();
+                super::routes::pattern_bindings(pattern, &mut names);
+                for name in names {
+                    self.0.entry(name).or_insert(position);
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Origins {
+        fn visit_local(&mut self, node: &'ast syn::Local) {
+            if let Some(init) = &node.init {
+                self.bind(&node.pat, &init.expr);
+            }
+            visit::visit_local(self, node);
+        }
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            for arm in &node.arms {
+                self.bind(&arm.pat, &node.expr);
+            }
+            visit::visit_expr_match(self, node);
+        }
+        fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+            self.bind(&node.pat, &node.expr);
+            visit::visit_expr_let(self, node);
+        }
+        fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+    }
+    /// The parameter positions a value expression hands back.
+    fn yields(expr: &Expr, origins: &HashMap<String, usize>, found: &mut HashSet<usize>) {
+        match expr {
+            Expr::Block(block) => yields_block(&block.block, origins, found),
+            Expr::If(branch) => {
+                yields_block(&branch.then_branch, origins, found);
+                if let Some((_, otherwise)) = &branch.else_branch {
+                    yields(otherwise, origins, found);
+                }
+            }
+            Expr::Match(matched) => {
+                for arm in &matched.arms {
+                    yields(&arm.body, origins, found);
+                }
+            }
+            Expr::Return(returned) => {
+                if let Some(value) = &returned.expr {
+                    yields(value, origins, found);
+                }
+            }
+            Expr::Call(call)
+                if call.args.len() == 1
+                    && matches!(&*call.func, Expr::Path(path) if path.path.is_ident("Ok") || path.path.is_ident("Some")) =>
+            {
+                yields(&call.args[0], origins, found);
+            }
+            other => {
+                if let Some(position) = root(other).and_then(|name| origins.get(&name).copied()) {
+                    found.insert(position);
+                }
+            }
+        }
+    }
+    fn yields_block(block: &syn::Block, origins: &HashMap<String, usize>, found: &mut HashSet<usize>) {
+        struct Returns<'o> {
+            origins: &'o HashMap<String, usize>,
+            found: &'o mut HashSet<usize>,
+        }
+        impl<'ast> Visit<'ast> for Returns<'_> {
+            fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+                if let Some(value) = &node.expr {
+                    yields(value, self.origins, self.found);
+                }
+            }
+            fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+        }
+        Returns { origins, found: &mut *found }.visit_block(block);
+        if let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last() {
+            yields(tail, origins, found);
+        }
+    }
+    let mut known: HashMap<String, Option<HashSet<usize>>> = HashMap::new();
+    for (definition, item) in index.items.iter().enumerate() {
+        let name = index.definitions[definition].name.clone();
+        let mut positions = HashSet::new();
+        if matches!(item.sig.output, syn::ReturnType::Type(..)) && !returns_bool(&item.sig.output) {
+            let mut origins = Origins(HashMap::new());
+            for (position, input) in item.sig.inputs.iter().enumerate() {
+                if let FnArg::Typed(typed) = input
+                    && let Pat::Ident(ident) = &*typed.pat
+                {
+                    origins.0.insert(ident.ident.to_string(), position);
+                }
+            }
+            origins.visit_block(&item.block);
+            yields_block(&item.block, &origins.0, &mut positions);
+        }
+        match known.entry(name).or_insert(None) {
+            entry @ None => *entry = Some(positions),
+            Some(agreed) => agreed.retain(|position| positions.contains(position)),
+        }
+    }
+    known
+        .into_iter()
+        .filter_map(|(name, positions)| positions.filter(|positions| !positions.is_empty()).map(|positions| (name, positions)))
+        .collect()
+}
+
+thread_local! {
+    static NARROWERS: std::cell::RefCell<HashMap<String, HashSet<usize>>> = std::cell::RefCell::new(HashMap::new());
+    /// Structs of the scan whose fields are all flags or numbers.
+    static FLAG_STRUCTS: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
 }
 
 /// For every function and method name in the scanned files, whether each
@@ -2031,6 +3080,10 @@ fn strip_transparent(expr: &Expr) -> &Expr {
         Expr::Reference(inner) => strip_transparent(&inner.expr),
         Expr::Paren(inner) => strip_transparent(&inner.expr),
         Expr::Group(inner) => strip_transparent(&inner.expr),
+        // `*id` of a `web::Path<u64>` is the path's value.
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) && super::rc::enabled("DEREF") => {
+            strip_transparent(&unary.expr)
+        }
         Expr::MethodCall(call)
             if call.args.is_empty()
                 && (TRANSPARENT_CALLS.contains(&call.method.to_string().as_str())
@@ -2125,7 +3178,8 @@ fn mentions_any(expr: &Expr, mut accept: impl FnMut(&str) -> bool) -> bool {
 fn short_written(expr: &Expr) -> String {
     let mut written = quote::ToTokens::to_token_stream(expr)
         .to_string()
-        .replace(' ', "");
+        .replace(' ', "")
+        .replace(FIELD_NAME, ".");
     if written.len() > 60 {
         written.truncate(written.floor_char_boundary(57));
         written.push_str("...");

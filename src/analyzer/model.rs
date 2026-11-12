@@ -243,6 +243,12 @@ pub(crate) struct RouteOrigin {
     /// P13: its handler takes the raw request or a header, cookie or
     /// session extractor, so it can read a credential by itself.
     pub(crate) sees_request: bool,
+    /// Its handler is a function with no parameters: it reads neither the
+    /// request nor the application's state.
+    pub(crate) takes_nothing: bool,
+    /// Its handler has a parameter that is not the caller: the request's
+    /// data, the application's state, a database handle.
+    pub(crate) takes_data: bool,
     /// P13: registered on an `App` that is built but never served (one
     /// built only to produce the OpenAPI document).
     pub(crate) unserved: bool,

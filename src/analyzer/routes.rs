@@ -617,6 +617,8 @@ impl<'a> RouteVisitor<'a> {
                     called: Vec::new(),
                     takes_credentials: false,
                     sees_request: false,
+                    takes_nothing: false,
+                    takes_data: false,
                     unserved: self.unserved > 0,
                     app: self.app.clone(),
                 },
@@ -1169,6 +1171,8 @@ impl RouteVisitor<'_> {
                     called: Vec::new(),
                     takes_credentials: false,
                     sees_request: false,
+                    takes_nothing: false,
+                    takes_data: false,
                     unserved: false,
                     app: None,
                 },
@@ -1659,6 +1663,12 @@ pub(crate) fn configuration_call_evidence(
                 });
                 continue;
             }
+        }
+        // Middleware defined in the crate that forwards a request with no
+        // credential: it sets the caller when there is one, and protects
+        // nothing. What the handlers do with the caller decides.
+        if method.method != "guard" && super::middleware::optional_component(arg).is_some() {
+            continue;
         }
         // `.wrap(get_middleware())` with `fn get_middleware() -> .. {
         // Authentication::with_identity(ROUTES) }`: read as what it returns.

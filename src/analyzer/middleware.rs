@@ -36,6 +36,329 @@ thread_local! {
     /// defined twice with different values maps to `None`.
     static STRING_CONSTS: RefCell<std::collections::HashMap<String, Option<Vec<String>>>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Components of the crate under analysis that forward a request
+    /// that carries no credential (see `forwards_without_credential`).
+    static OPTIONAL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// The inner service called with the request: `srv.call(req)`,
+/// `self.service.call(req)`, `next.call(req)`.
+fn forwards(expr: &Expr) -> bool {
+    struct Forwards(bool);
+    impl<'ast> Visit<'ast> for Forwards {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == "call" && node.args.len() == 1 {
+                self.0 = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut found = Forwards(false);
+    found.visit_expr(expr);
+    found.0
+}
+
+/// Whether code can answer the request itself instead of forwarding it:
+/// it builds an error or a response (`Err(..)`, `?`,
+/// `req.into_response(..)`, `HttpResponse::Unauthorized()`), in closures
+/// and `async` blocks too.
+fn answers(visit: impl FnOnce(&mut Answers)) -> bool {
+    let mut found = Answers(false);
+    visit(&mut found);
+    found.0
+}
+
+struct Answers(bool);
+
+impl<'ast> Visit<'ast> for Answers {
+    fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+        self.0 = true;
+    }
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Expr::Path(path) = &*node.func
+            && path.path.segments.last().is_some_and(|segment| segment.ident == "Err")
+        {
+            self.0 = true;
+        }
+        visit::visit_expr_call(self, node);
+    }
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if node.method == "into_response" || node.method == "error_response" {
+            self.0 = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if node.segments.iter().any(|segment| {
+            ["Unauthorized", "Forbidden", "ErrorUnauthorized", "ErrorForbidden", "HttpResponse"]
+                .iter()
+                .any(|name| segment.ident == name)
+        }) {
+            self.0 = true;
+        }
+        visit::visit_path(self, node);
+    }
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.segments.last().is_some_and(|segment| segment.ident == "bail") {
+            self.0 = true;
+        }
+    }
+}
+
+/// Whether a block has a `return`, outside nested closures.
+fn returns(block: &Block) -> bool {
+    struct Returns(bool);
+    impl<'ast> Visit<'ast> for Returns {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.0 = true;
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    }
+    let mut found = Returns(false);
+    found.visit_block(block);
+    found.0
+}
+
+/// Whether an expression has a `return`.
+fn leaves(expr: &Expr) -> bool {
+    struct Returns(bool);
+    impl<'ast> Visit<'ast> for Returns {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.0 = true;
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    }
+    let mut found = Returns(false);
+    found.visit_expr(expr);
+    found.0
+}
+
+/// Whether a block's value is the forwarded call: `srv.call(req)` as its
+/// last expression, through `Box::pin(async move { .. })`, `.await`,
+/// adapters, a local bound to the call, and branches that all forward.
+fn tail_forwards(block: &Block) -> bool {
+    fn value(expr: &Expr, block: &Block, depth: usize) -> bool {
+        if depth > 12 {
+            return false;
+        }
+        match expr {
+            Expr::MethodCall(call) => {
+                (call.method == "call" && call.args.len() == 1) || value(&call.receiver, block, depth + 1)
+            }
+            Expr::Await(inner) => value(&inner.base, block, depth + 1),
+            Expr::Paren(inner) => value(&inner.expr, block, depth + 1),
+            Expr::Group(inner) => value(&inner.expr, block, depth + 1),
+            Expr::Async(inner) => tail(&inner.block, depth + 1),
+            Expr::Block(inner) => tail(&inner.block, depth + 1),
+            Expr::Unsafe(inner) => tail(&inner.block, depth + 1),
+            Expr::Call(call) => call.args.len() == 1 && value(&call.args[0], block, depth + 1),
+            Expr::Path(path) => path.path.get_ident().is_some_and(|name| {
+                block.stmts.iter().any(|statement| match statement {
+                    syn::Stmt::Local(local) => {
+                        matches!(&local.pat, syn::Pat::Ident(ident) if ident.ident == *name)
+                            && local.init.as_ref().is_some_and(|init| value(&init.expr, block, depth + 1))
+                    }
+                    _ => false,
+                })
+            }),
+            Expr::If(branch) => {
+                tail(&branch.then_branch, depth + 1)
+                    && branch.else_branch.as_ref().is_some_and(|(_, otherwise)| value(otherwise, block, depth + 1))
+            }
+            Expr::Match(matched) => {
+                !matched.arms.is_empty() && matched.arms.iter().all(|arm| value(&arm.body, block, depth + 1))
+            }
+            _ => false,
+        }
+    }
+    fn tail(block: &Block, depth: usize) -> bool {
+        match block.stmts.last() {
+            Some(syn::Stmt::Expr(expr, None)) => value(expr, block, depth),
+            _ => false,
+        }
+    }
+    tail(block, 0)
+}
+
+/// Whether a middleware body forwards a request that carries no
+/// credential, so that it authenticates optionally: the handlers behind
+/// it run with or without a caller. Read from the body's structure:
+/// - it forwards and never answers the request itself;
+/// - a `None` or `Err(_)` arm of a `match` on something read from the
+///   request forwards (`None => return srv.call(req)`);
+/// - an `if let Some(..) = <read from the request> { .. }` without a
+///   rejecting `else` holds every answer the body can give, and the
+///   request is forwarded after it.
+pub(crate) fn forwards_without_credential(request: Option<&str>, block: &Block) -> bool {
+    if !super::rc::enabled("OPTIONAL") {
+        return false;
+    }
+    let whole = Expr::Block(syn::ExprBlock {
+        attrs: Vec::new(),
+        label: None,
+        block: block.clone(),
+    });
+    if !forwards(&whole) {
+        return false;
+    }
+    // Every way out of the body is the inner service: no `return`, and
+    // the value of the body is the forwarded call. A `return reject(req)`
+    // answers the request in code this does not read.
+    if !answers(|found| found.visit_block(block)) && !returns(block) && tail_forwards(block) {
+        return true;
+    }
+    let Some(request) = request else {
+        return false;
+    };
+    let reads_request = |expr: &Expr| {
+        struct Reads<'r>(&'r str, bool);
+        impl<'ast> Visit<'ast> for Reads<'_> {
+            fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+                if node.path.is_ident(self.0) {
+                    self.1 = true;
+                }
+            }
+        }
+        let mut found = Reads(request, false);
+        found.visit_expr(expr);
+        found.1
+    };
+    struct Shapes<'r> {
+        reads_request: &'r dyn Fn(&Expr) -> bool,
+        optional: bool,
+    }
+    impl<'ast> Visit<'ast> for Shapes<'_> {
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if (self.reads_request)(&node.expr)
+                && node.arms.iter().any(|arm| {
+                    let absent = match &arm.pat {
+                        syn::Pat::Ident(ident) => ident.ident == "None",
+                        syn::Pat::Path(path) => path.path.is_ident("None"),
+                        syn::Pat::TupleStruct(tuple) => {
+                            tuple.path.segments.last().is_some_and(|segment| segment.ident == "Err")
+                        }
+                        _ => false,
+                    };
+                    absent && forwards(&arm.body) && !answers(|found| found.visit_expr(&arm.body))
+                })
+            {
+                self.optional = true;
+            }
+            visit::visit_expr_match(self, node);
+        }
+        fn visit_block(&mut self, node: &'ast Block) {
+            for (position, statement) in node.stmts.iter().enumerate() {
+                let syn::Stmt::Expr(Expr::If(branch), _) = statement else {
+                    continue;
+                };
+                let Expr::Let(binding) = &*branch.cond else {
+                    continue;
+                };
+                let present = matches!(&*binding.pat, syn::Pat::TupleStruct(tuple)
+                    if tuple.path.segments.last().is_some_and(|segment| segment.ident == "Some" || segment.ident == "Ok"));
+                if !present || !(self.reads_request)(&binding.expr) {
+                    continue;
+                }
+                if branch.else_branch.as_ref().is_some_and(|(_, otherwise)| {
+                    answers(|found| found.visit_expr(otherwise)) || !forwards(otherwise) && leaves(otherwise)
+                }) {
+                    continue;
+                }
+                let rest = &node.stmts[position + 1..];
+                let forwarded = rest.iter().any(|statement| match statement {
+                    syn::Stmt::Expr(expr, _) => forwards(expr),
+                    syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|init| forwards(&init.expr)),
+                    _ => false,
+                });
+                let answered = rest.iter().any(|statement| answers(|found| found.visit_stmt(statement)))
+                    || node.stmts[..position]
+                        .iter()
+                        .any(|statement| answers(|found| found.visit_stmt(statement)));
+                if forwarded && !answered {
+                    self.optional = true;
+                }
+            }
+            visit::visit_block(self, node);
+        }
+    }
+    let mut shapes = Shapes {
+        reads_request: &reads_request,
+        optional: false,
+    };
+    shapes.visit_block(block);
+    shapes.optional
+}
+
+/// The name of a function's request parameter (`ServiceRequest` or
+/// `HttpRequest`).
+pub(crate) fn request_parameter(signature: &syn::Signature) -> Option<String> {
+    signature.inputs.iter().find_map(|input| match input {
+        FnArg::Typed(typed) => {
+            let name = type_name(&typed.ty)?;
+            (name == "ServiceRequest" || name == "HttpRequest")
+                .then(|| match &*typed.pat {
+                    syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+                    _ => None,
+                })
+                .flatten()
+        }
+        FnArg::Receiver(_) => None,
+    })
+}
+
+/// The first component named in a `.wrap(..)` argument that forwards
+/// requests without a credential: a crate-defined middleware type or
+/// function, or a `wrap_fn` closure that does.
+pub(crate) fn optional_component(arg: &Expr) -> Option<String> {
+    struct Names<'a> {
+        set: &'a HashSet<String>,
+        found: Option<String>,
+    }
+    impl<'ast> Visit<'ast> for Names<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if self.found.is_none()
+                && let Some(last) = path.segments.last()
+                && self.set.contains(&last.ident.to_string())
+            {
+                self.found = Some(last.ident.to_string());
+            }
+            // `AuthMiddleware::new(..)`: the type before the constructor.
+            if self.found.is_none()
+                && let [.., owner, _] = path.segments.iter().collect::<Vec<_>>().as_slice()
+                && self.set.contains(&owner.ident.to_string())
+            {
+                self.found = Some(owner.ident.to_string());
+            }
+            visit::visit_path(self, path);
+        }
+        fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+            if self.found.is_none() {
+                let request = closure.inputs.first().and_then(|input| match input {
+                    syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+                    syn::Pat::Type(typed) => match &*typed.pat {
+                        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                let block = match &*closure.body {
+                    Expr::Block(block) => Some(block.block.clone()),
+                    other => syn::parse2::<Block>(quote::quote!({ #other })).ok(),
+                };
+                if closure.inputs.len() == 2
+                    && block.is_some_and(|block| forwards_without_credential(request.as_deref(), &block))
+                {
+                    self.found = Some("<closure>".into());
+                }
+            }
+        }
+    }
+    OPTIONAL.with(|set| {
+        let set = set.borrow();
+        let mut names = Names { set: &set, found: None };
+        names.visit_expr(arg);
+        names.found
+    })
 }
 
 fn collect_string_consts(items: &[Item], consts: &mut std::collections::HashMap<String, Option<Vec<String>>>) {
@@ -90,8 +413,15 @@ pub(crate) fn index_path_conditional<'a>(files: impl IntoIterator<Item = &'a syn
     PATH_READERS.with(|set| *set.borrow_mut() = readers.clone());
     let mut transforms: Vec<(String, String)> = Vec::new();
     let mut conditional: HashSet<String> = HashSet::new();
+    OPTIONAL.with(|set| set.borrow_mut().clear());
     for file in &files {
         collect(&file.items, &readers, &mut transforms, &mut conditional);
+    }
+    // A factory is as optional as the service it builds.
+    for (factory, service) in &transforms {
+        if OPTIONAL.with(|set| set.borrow().contains(service)) {
+            OPTIONAL.with(|set| set.borrow_mut().insert(factory.clone()));
+        }
     }
     // `impl Transform for AuthService { type Transform = AuthMiddleware<S>; }`
     // makes `AuthService` as conditional as the service it builds.
@@ -207,6 +537,11 @@ fn collect(
                     conditional.insert(function.sig.ident.to_string());
                     record_rule(&function.sig.ident.to_string(), &function.block);
                 }
+                if takes_service_request(&function.sig)
+                    && forwards_without_credential(request_parameter(&function.sig).as_deref(), &function.block)
+                {
+                    OPTIONAL.with(|set| set.borrow_mut().insert(function.sig.ident.to_string()));
+                }
             }
             Item::Mod(module) => {
                 if let Some((_, items)) = &module.content {
@@ -251,6 +586,11 @@ fn collect_impl(
                     if function.sig.ident == "call" && decides_by_path(&function.block, readers) {
                         conditional.insert(self_name.clone());
                         record_rule(&self_name, &function.block);
+                    }
+                    if function.sig.ident == "call"
+                        && forwards_without_credential(request_parameter(&function.sig).as_deref(), &function.block)
+                    {
+                        OPTIONAL.with(|set| set.borrow_mut().insert(self_name.clone()));
                     }
                 }
             }
