@@ -2282,7 +2282,7 @@ pub(crate) fn is_catch_all_segment(segment: &str) -> bool {
 }
 
 /// Static segments of a path, in order.
-fn static_segments(path: &str) -> Vec<String> {
+pub(crate) fn static_segments(path: &str) -> Vec<String> {
     path_segments(path)
         .into_iter()
         .filter(|segment| !is_dynamic_segment(segment))
@@ -2334,6 +2334,9 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
     // `sign_up`, `sign-in` and `log_out` are `signup`, `signin` and
     // `logout` written apart.
     let words: Vec<&str> = last.split(['_', '-']).collect();
+    // A step is taken by posting to it (or fetching its challenge);
+    // `DELETE /users/{id}/otp` removes a second factor and is analysed.
+    let step = matches!(route.method.as_str(), "POST" | "GET");
     let joined = super::pu::enabled("AUTHFLOW")
         && words.windows(2).any(|pair| ENDPOINTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()));
     // `/_internal/auth/login`: a mount named with a leading underscore is
@@ -2344,7 +2347,7 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
     let named = (joined
         || words
             .iter()
-            .any(|word| ENDPOINTS.contains(word) || (super::pu::enabled("AUTHFLOW") && STEPS.contains(word))))
+            .any(|word| ENDPOINTS.contains(word) || (super::pu::enabled("AUTHFLOW") && step && STEPS.contains(word))))
         && before.iter().all(|segment| prefix(segment) || ACCOUNT_CONTEXT.contains(&segment.as_str()));
     // A flow under the application's sign-in subtree
     // (`/auth/email/verify`, `/auth/create/validate`,
@@ -2359,7 +2362,7 @@ pub(crate) fn is_authentication_route(route: &Route) -> bool {
                 // whole API, not a flow.
                 && statics.get(root + 1).is_some_and(|next| !is_generic_segment(next))
                 && statics[root + 1..].iter().flat_map(|segment| segment.split(['_', '-'])).any(|word| {
-                    ENDPOINTS.contains(&word) || STEPS.contains(&word) || FLOW.contains(&word)
+                    ENDPOINTS.contains(&word) || (step && (STEPS.contains(&word) || FLOW.contains(&word)))
                 })
         });
     (named || subtree || creates_account(route)) && authenticates_structurally(route) && !kept_behind_exempt_list(route)

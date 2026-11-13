@@ -229,6 +229,12 @@ fn documented(route: &Route, finding: &Finding, routes: &[Route]) -> Option<Stri
         });
     }
     documents_security(routes)?;
+    // A documented difference is one between two requirements the
+    // handlers enforce. A handler with no evidence at all does not
+    // enforce the one its annotation declares.
+    if route.best_tier() == EvidenceTier::None {
+        return None;
+    }
     if !matches!(
         finding.category,
         FindingCategory::MissingAuthorization | FindingCategory::WeakerAuthorization | FindingCategory::DifferentAuthorization
@@ -314,11 +320,33 @@ fn named_public(route: &Route) -> Option<String> {
     let found = |words: &[String], list: &[&str]| words.iter().find(|word| list.contains(&word.as_str())).cloned();
     let (word, what) = if let Some(word) = found(&path, &AVAILABILITY).or_else(|| found(&handler, &AVAILABILITY)) {
         (word, "answers whether a name or record exists, as a sign-up form asks before there is an account")
-    } else if let Some(word) = found(&path, &STATIC).filter(|_| route.caller_use.iter().all(|feature| !feature.starts_with(LOADS))) {
+    } else if let Some(word) = found(&path, &STATIC).filter(|word| {
+        // `/static/..`, `/api/assets/..`: the application's own files.
+        // `/hosting/assets/{hash}` under a resource holds that resource's.
+        let segments = super::drift::static_segments(&route.path);
+        let before = segments
+            .iter()
+            .position(|segment| segment.to_ascii_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part == word))
+            .unwrap_or(0);
+        route.caller_use.iter().all(|feature| !feature.starts_with(LOADS))
+            && segments[..before].iter().all(|segment| super::drift::is_generic_segment(segment))
+    }) {
         (word, "serves the files of the application's own pages")
     } else if let Some(word) = found(&handler, &MACHINE)
         .or_else(|| found(&path, &MACHINE))
-        .filter(|_| super::pu::enabled("WEBHOOK") && !read)
+        // The receiver is a POST named for its sender (`stripe_webhook`).
+        // `post_webhook`, `delete_webhook` and `PATCH /webhooks/{id}`
+        // manage the application's own outgoing webhooks.
+        .filter(|_| {
+            const OPERATIONS: [&str; 14] = [
+                "get", "list", "post", "put", "patch", "delete", "create", "add", "update", "remove",
+                "register", "new", "edit", "set",
+            ];
+            super::pu::enabled("WEBHOOK")
+                && route.method == "POST"
+                && !route.path.contains('{')
+                && !handler.first().is_some_and(|first| OPERATIONS.contains(&first.as_str()))
+        })
     {
         (word, "is called by another service, which signs its request and has no account to log in with")
     } else if !read {
@@ -377,11 +405,10 @@ fn optional_login(route: &Route, finding: &Finding) -> Option<String> {
         if let Some(label) = feature.strip_prefix(super::caller_use::OPTIONAL) {
             return Some(format!("{}.ok()", label.trim_end_matches("()")));
         }
-        ["takes:", "acts:", "hands:", "compares:"]
-            .iter()
-            .find_map(|prefix| feature.strip_prefix(prefix))
-            .filter(|label| label.starts_with("Option<"))
-            .map(str::to_string)
+        // An `Option<User>` extractor. An `Option` parameter of a helper
+        // is not one: a handler that hands it `None`, or `Some(&user)`,
+        // says nothing about anonymous callers.
+        feature.strip_prefix("takes:").filter(|label| label.starts_with("Option<")).map(str::to_string)
     })?;
     // Taken and never looked at (`_user: Option<User>` on a write) is not
     // a decision about anonymous callers: the handler has to do something
@@ -421,9 +448,19 @@ fn machine_caller(route: &Route, finding: &Finding) -> Option<String> {
                 .any(|word| SECRETS.contains(&word.as_str()))
         })
     };
+    // The handler or a function it calls checks the secret. One reached
+    // many calls deep (a signature verified while parsing a stored
+    // record) is not how this route knows its sender.
+    let near = |evidence: &AuthEvidence| {
+        evidence.symbol.as_deref().is_none_or(|symbol| symbol.matches(" -> ").count() <= 2)
+    };
+    // It is named for one, too: a comparison of two values with nothing
+    // secret in its name (a content hash checked against the path) is an
+    // integrity check, not a credential.
     let secret = route.authorization.iter().find(|evidence| {
-        evidence.kind == AuthEvidenceKind::SecretCheck
-            || (evidence.kind == AuthEvidenceKind::IdentityExtraction && names_secret(evidence))
+        near(evidence)
+            && names_secret(evidence)
+            && matches!(evidence.kind, AuthEvidenceKind::SecretCheck | AuthEvidenceKind::IdentityExtraction)
     })?;
     let user = route.authorization.iter().any(|evidence| {
         matches!(
